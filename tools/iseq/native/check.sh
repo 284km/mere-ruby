@@ -22,6 +22,13 @@ keep=""
 if [ "$1" = "-k" ]; then keep="$2"; shift 2; fi
 tmp="${keep:-${TMPDIR:-/tmp}/ic_check.$$}"
 mkdir -p "$tmp"
+# (MERE may be relative to where this was started -- CI's
+#  .mere-compiler/_build/default/bin/mere.exe -- and dump.mere is compiled
+#  from this directory: the path is made absolute first)
+case "${MERE:?MERE names the Mere compiler}" in
+  /*) ;;
+  */*) MERE="$(cd "$(dirname "$MERE")" && pwd)/$(basename "$MERE")" ;;
+esac
 (cd "$here" && "$MERE" -c dump.mere > "$tmp/dump.c") && clang -O1 -w "$tmp/dump.c" -o "$tmp/dump" || { echo "check: build failed"; exit 2; }
 ruby "$here/expect.rb" "$root/lib/iseq_compiler_ext.rb" "$tmp" "$@" 2>/dev/null > "$tmp/list.tsv"
 # (the n-th file's number and path, the driver's arguments)

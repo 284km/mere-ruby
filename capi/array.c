@@ -47,7 +47,13 @@ VALUE rb_ary_cat(VALUE ary, const VALUE *items, long n) {
 VALUE rb_ary_pop(VALUE ary) { VALUE v = mr_calla(ary, "pop", 0); changed(ary); return v; }
 VALUE rb_ary_shift(VALUE ary) { VALUE v = mr_calla(ary, "shift", 0); changed(ary); return v; }
 VALUE rb_ary_unshift(VALUE ary, VALUE item) { mr_calla(ary, "unshift", 1, item); return changed(ary); }
-void rb_ary_store(VALUE ary, long index, VALUE value) { mr_calla(ary, "[]=", 2, LONG2NUM(index), value); changed(ary); }
+/* (at the end of an Array not frozen, appended with no call -- MR_ARY_APPEND,
+ *  as sqlite3's step fills a row; anything else is Array#[]=, its errors too) */
+void rb_ary_store(VALUE ary, long index, VALUE value) {
+    if (!MR_HANDLE_P(ary) || mr_without("builtin") || !mr_up(MR_ARY_APPEND, ary, (VALUE)index, value, 0, 0))
+        mr_calla(ary, "[]=", 2, LONG2NUM(index), value);
+    changed(ary);
+}
 VALUE rb_ary_entry(VALUE ary, long index) {
     long len = RARRAY_LEN(ary);
     if (index < 0) index += len;

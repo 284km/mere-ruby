@@ -1,12 +1,14 @@
 # frozen_string_literal: true
 #
-# cgi/escape, as mere-ruby answers `require "cgi/escape"`: ruby 4.0.9's
-# lib/cgi/escape.rb (Ruby's license), byte for byte, from the line below.
-# Its `require 'cgi/escape.so'` (the C extension, which only replaces these
-# methods with faster ones) is a LoadError here and is rescued by the file
-# itself. Shipped through tools/gen_pathname_lib.rb.
+# cgi/escape, as mere-ruby answers `require "cgi/escape"`: ruby 4.0.10's
+# lib/cgi/escape.rb (Ruby's license; the same as 4.0.9's), byte for byte,
+# from the line below. Its `require 'cgi/escape.so'` is ruby's C extension,
+# ext/cgi/escape, linked into this executable (capi/static_cgi_escape.c),
+# whose CGI::EscapeExt the file then aliases; a build with no C side raises
+# LoadError there, which the file rescues, as on ruby's miniruby. Shipped
+# through tools/gen_pathname_lib.rb.
 #
-# ---- ruby 4.0.9 lib/cgi/escape.rb ------------------------------------------
+# ---- ruby 4.0.10 lib/cgi/escape.rb -----------------------------------------
 # frozen_string_literal: true
 
 # Since Ruby 4.0, \CGI is a small holder for various escaping methods, included from CGI::Escape
@@ -62,11 +64,6 @@ module CGI::Escape
   #   url_encoded_string = CGI.escapeURIComponent("'Stop!' said Fred")
   #      # => "%27Stop%21%27%20said%20Fred"
   def escapeURIComponent(string)
-    # (the C extension takes a String, or what converts to one: StringValue)
-    unless string.is_a?(String)
-      raise TypeError, "no implicit conversion of #{string.nil? ? 'nil' : string.class} into String" unless string.respond_to?(:to_str)
-      string = string.to_str
-    end
     encoding = string.encoding
     buffer = string.b
     buffer.gsub!(/([^a-zA-Z0-9_.\-~]+)/) do |m|

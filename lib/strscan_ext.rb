@@ -12,6 +12,18 @@ class StringScanner
   Id = "$Id$"
   attr_reader :string
 
+  # The C extension reads String storage directly. Keep those original
+  # operations when the subject overrides or undefines its Ruby methods.
+  STRING_LENGTH = String.instance_method(:length)
+  STRING_BYTESIZE = String.instance_method(:bytesize)
+  STRING_BYTESLICE = String.instance_method(:byteslice)
+  STRING_AREF = String.instance_method(:[])
+  STRING_GETBYTE = String.instance_method(:getbyte)
+  STRING_ENCODING = String.instance_method(:encoding)
+  STRING_APPEND = String.instance_method(:<<)
+  private_constant :STRING_LENGTH, :STRING_BYTESIZE, :STRING_BYTESLICE,
+                   :STRING_AREF, :STRING_GETBYTE, :STRING_ENCODING, :STRING_APPEND
+
   def initialize(string, _dup = false, fixed_anchor: false)
     # ⚠ #to_str, not #to_s. `to_s` accepts ANY object and turns it into its
     #   inspect form, so `StringScanner.new(obj)` scanned the text
@@ -48,8 +60,8 @@ class StringScanner
   # the subject does not change while it is being scanned, and String#length
   # walks the whole string, so ask once (and again when #concat grows it).
   def __measure
-    @len = @string.length
-    @blen = @string.bytesize
+    @len = STRING_LENGTH.bind_call(@string)
+    @blen = STRING_BYTESIZE.bind_call(@string)
   end
   private :__measure
 
@@ -57,13 +69,13 @@ class StringScanner
   #  .replace("")` -- so the byte length is read live and the character
   #  length measured again when the bytes changed)
   def __sync
-    __measure if @blen != @string.bytesize
+    __measure if @blen != STRING_BYTESIZE.bind_call(@string)
   end
   private :__sync
 
   # StringScanner.allocate has no subject yet: ruby refuses to scan it
   def __init_check
-    raise ArgumentError, "uninitialized StringScanner object" if @string.nil?
+    raise ArgumentError, "uninitialized StringScanner object" if nil.equal?(@string)
   end
   private :__init_check
 
@@ -71,8 +83,8 @@ class StringScanner
   def __cp
     return @cp if @cp
     __sync
-    head = @string.byteslice(0, @pos)
-    tail = @string.byteslice(@pos, @blen - @pos)
+    head = STRING_BYTESLICE.bind_call(@string, 0, @pos)
+    tail = STRING_BYTESLICE.bind_call(@string, @pos, @blen - @pos)
     # a boundary splits no character: the two halves count what the whole does
     @cp = head.length if head.length + tail.length == @len
     @cp
@@ -96,7 +108,7 @@ class StringScanner
 
   # (inside a character it counts the partial one, as the reference does)
   def charpos
-    __cp || @string.byteslice(0, @pos).length
+    __cp || STRING_BYTESLICE.bind_call(@string, 0, @pos).length
   end
 
   def reset
@@ -117,17 +129,17 @@ class StringScanner
 
   def eos?
     __init_check
-    @pos >= @string.bytesize
+    @pos >= STRING_BYTESIZE.bind_call(@string)
   end
 
   def rest
     __init_check
-    @string.byteslice(@pos, @string.bytesize - @pos) || ""
+    STRING_BYTESLICE.bind_call(@string, @pos, STRING_BYTESIZE.bind_call(@string) - @pos) || ""
   end
 
   # ruby: "rest_size is equivalent to rest.bytesize"
   def rest_size
-    @string.bytesize - @pos
+    STRING_BYTESIZE.bind_call(@string) - @pos
   end
 
   def matched
@@ -146,12 +158,12 @@ class StringScanner
   # itself -- after #check the pointer has not moved but the match has
   def pre_match
     return nil if @matched.nil?
-    @string.byteslice(0, @mstart)
+    STRING_BYTESLICE.bind_call(@string, 0, @mstart)
   end
 
   def post_match
     return nil if @matched.nil?
-    @string.byteslice(@mend, @blen - @mend)
+    STRING_BYTESLICE.bind_call(@string, @mend, @blen - @mend)
   end
 
   # \G, not \A: the match happens AT the pointer inside the whole subject.
@@ -337,7 +349,7 @@ class StringScanner
     return __miss if hit.nil?
     start = @pos
     __took(hit, re, true)
-    ret_string ? @string.byteslice(start, @pos - start) : @pos - start
+    ret_string ? STRING_BYTESLICE.bind_call(@string, start, @pos - start) : @pos - start
   end
   private :__search
 
@@ -367,7 +379,7 @@ class StringScanner
   def getch
     return nil if eos?
     cp = __cp
-    c = cp ? @string[cp, 1] : @string.byteslice(@pos, 1)
+    c = cp ? STRING_AREF.bind_call(@string, cp, 1) : STRING_BYTESLICE.bind_call(@string, @pos, 1)
     return nil if c.nil? || c.empty?
     __took_text(c)
     @cp = cp && cp + 1
@@ -378,7 +390,7 @@ class StringScanner
   def peek(n)
     n = n.to_int unless n.is_a?(Integer)
     raise ArgumentError, "negative string size (or size too big)" if n < 0
-    @string.byteslice(@pos, n) || ""
+    STRING_BYTESLICE.bind_call(@string, @pos, n) || ""
   end
 
   def unscan
@@ -407,14 +419,14 @@ class StringScanner
   # and a pointer moved by #pos= with nothing matched shows its left
   # context too. Only at 0 is it left out.
   def inspect
-    return "#<StringScanner (uninitialized)>" if @string.nil?
+    return "#<StringScanner (uninitialized)>" if nil.equal?(@string)
     return "#<StringScanner fin>" if eos?
     r = rest
     ahead = r[0, 5].inspect
     ahead = ahead[0...-1] + "...\"" if r.length > 5
-    head = "#<StringScanner " + @pos.to_s + "/" + @string.bytesize.to_s
+    head = "#<StringScanner " + @pos.to_s + "/" + STRING_BYTESIZE.bind_call(@string).to_s
     return head + " @ " + ahead + ">" if @pos == 0
-    before = @string.byteslice(0, @pos)
+    before = STRING_BYTESLICE.bind_call(@string, 0, @pos)
     back = before.length > 5 ? before[-5, 5] : before
     shown = back.inspect
     shown = "\"..." + shown[1..-1] if before.length > 5
@@ -426,7 +438,7 @@ class StringScanner
     unless str.is_a?(String) || str.respond_to?(:to_str)
       raise TypeError, "no implicit conversion of #{str.class} into String"
     end
-    @string << str.to_str
+    STRING_APPEND.bind_call(@string, str.to_str)
     __measure
     self
   end
@@ -443,8 +455,8 @@ class StringScanner
 
   def beginning_of_line?
     return true if @pos == 0
-    return nil if @pos > @string.bytesize
-    @string.getbyte(@pos - 1) == 10
+    return nil if @pos > STRING_BYTESIZE.bind_call(@string)
+    STRING_GETBYTE.bind_call(@string, @pos - 1) == 10
   end
   alias_method :bol?, :beginning_of_line?
 
@@ -462,7 +474,7 @@ class StringScanner
   # `peek_byte` is the integer too, and consumes nothing.
   def get_byte
     return nil if eos?
-    b = @string.byteslice(@pos, 1)
+    b = STRING_BYTESLICE.bind_call(@string, @pos, 1)
     return nil if b.nil? || b.empty?
     cp = @cp
     __took_text(b)
@@ -478,7 +490,7 @@ class StringScanner
 
   def peek_byte
     return nil if eos?
-    @string.getbyte(@pos)
+    STRING_GETBYTE.bind_call(@string, @pos)
   end
 
   # --- the *_full family: one call, four answers -------------------------
@@ -517,8 +529,8 @@ class StringScanner
       when 16 then /[+-]?(0x)?[0-9a-fA-F]+/
       else raise ArgumentError, "Unsupported integer base: #{base.inspect}, expected 10 or 16"
       end
-    unless @string.encoding.ascii_compatible?
-      raise Encoding::CompatibilityError, "ASCII incompatible encoding: #{@string.encoding.name}"
+    unless STRING_ENCODING.bind_call(@string).ascii_compatible?
+      raise Encoding::CompatibilityError, "ASCII incompatible encoding: #{STRING_ENCODING.bind_call(@string).name}"
     end
     hit = __at(re, true)
     return __miss if hit.nil?

@@ -6449,6 +6449,30 @@ let core_prelude_f =
   "    end\n" ++
   "  end\n" ++
   "\n" ++
+  "  # The child's standard three are BLOCKING, as ruby makes them just before\n" ++
+  "  # exec (process.c, stdfd_clear_nonblock: \"many programs cannot deal with\n" ++
+  "  # non-blocking stdin/stdout/stderr\"). An IO.pipe's ends are non-blocking\n" ++
+  "  # here as in ruby, and a child handed one as its stdout stopped at the\n" ++
+  "  # first full pipe -- curl's \"Resource temporarily unavailable\" after 64 KB,\n" ++
+  "  # puma's test_form_data_encoding_windows. The flag is the open file\n" ++
+  "  # description's, which the parent's copy shares, so clearing it here before\n" ++
+  "  # the child starts is what ruby's child does to it after fork. Each of 0, 1\n" ++
+  "  # and 2 is the descriptor a redirect gives it (a [:child, fd] one: that\n" ++
+  "  # fd's), or this process's own when none does; a file a redirect opens is\n" ++
+  "  # opened blocking, and a closed one is nothing to clear.\n" ++
+  "  def self.__std_blocking(rdl, latel)\n" ++
+  "    src = ->(f) do\n" ++
+  "      r = rdl.find \{ |g, _| g == f }\n" ++
+  "      next f if r.nil?\n" ++
+  "      v = r[1]\n" ++
+  "      v = v.to_io if !v.is_a?(IO) && !v.is_a?(Integer) && v.respond_to?(:to_io)\n" ++
+  "      v.is_a?(Integer) ? v : v.is_a?(IO) ? v.fileno : v == :in ? 0 : v == :out ? 1 : v == :err ? 2 : nil\n" ++
+  "    end\n" ++
+  "    [0, 1, 2].map do |f|\n" ++
+  "      l = latel.find \{ |g, _| g == f }\n" ++
+  "      l ? (l[1].is_a?(Integer) ? src.(l[1]) : nil) : src.(f)\n" ++
+  "    end.compact.uniq.each \{ |fd| IO.__fdblock(fd) if fd >= 0 }\n" ++
+  "  end\n" ++
   "  # spawn's direct path: argv and the environment as proc_spawn takes them,\n" ++
   "  # the redirects as file actions. Every SOURCE is first copied to a high\n" ++
   "  # descriptor of its own and only then put in place, so a rotation\n" ++
@@ -6761,6 +6785,7 @@ let core_prelude_f =
   "    #   deadlocked). The shell path opens it in the child's own shell.\n" ++
   "    fifo = rdl.any? \{ |_, v| pth = v.is_a?(Array) ? v[0] : v; pth.is_a?(String) && File.pipe?(pth) }\n" ++
   "    raise NotImplementedError, \"a new session needs the direct spawn\" if pty_session && (shell_only || fifo)\n" ++
+  "    __std_blocking(rdl, latel)\n" ++
   "    unless shell_only || fifo\n" ++
   "      STDOUT.flush\n" ++
   "      STDERR.flush\n" ++
@@ -7070,10 +7095,10 @@ let core_prelude_f =
   "\n" ++
   "  # ⚠ THE UNIT was ignored entirely: every clock_gettime answered a float\n" ++
   "  #   second whatever was asked for, so `clock_gettime(c, :nanosecond)` -- which\n" ++
-  "  #   ruby answers with an Integer -- came back as a Float of seconds. The unit\n" ++
-  "  #   is the part of this call a caller can actually observe here, because\n" ++
-  "  #   Most clocks retain the wall reader. The process CPU clock uses the\n" ++
-  "  #   native CPU reader shared with GC::Profiler, never elapsed wall time.\n" ++
+  "  #   ruby answers with an Integer -- came back as a Float of seconds. __in_unit\n" ++
+  "  #   converts it now. Each clock reads its own kind of clock (see\n" ++
+  "  #   clock_gettime below). The process\n" ++
+  "  #   CPU clock uses the native CPU reader shared with GC::Profiler.\n" ++
   "  UNITS = [:float_second, :float_millisecond, :float_microsecond,\n" ++
   "           :second, :millisecond, :microsecond, :nanosecond].freeze\n" ++
   "\n" ++
@@ -7117,13 +7142,36 @@ let core_prelude_f =
   "  end\n" ++
   "  private_class_method :__clock_check\n" ++
   "\n" ++
+  "  # ⚠ Every clock but the process CPU one read the WALL clock, which goes\n" ++
+  "  #   back when the time is set: minitest (CLOCK_MONOTONIC) timed a test at\n" ++
+  "  #   -3.35 s. Each clock now reads its own kind of clock (the kinds are\n" ++
+  "  #   listed in tools/process_glue.c's mr_clock_read); the CLOCK_ numbers\n" ++
+  "  #   are darwin's everywhere, so the runtime is told the kind, not them.\n" ++
+  "  #   TIME_BASED_ is time(2), whole seconds; TIMES_BASED_ is times(2), in\n" ++
+  "  #   hundredths -- a monotonic reading cut to that, as on linux.\n" ++
+  "  def self.__clock_kind(clock)\n" ++
+  "    case clock\n" ++
+  "    when CLOCK_REALTIME, :GETTIMEOFDAY_BASED_CLOCK_REALTIME, :TIME_BASED_CLOCK_REALTIME then 0\n" ++
+  "    when CLOCK_MONOTONIC_RAW then 2\n" ++
+  "    when CLOCK_UPTIME_RAW, :MACH_ABSOLUTE_TIME_BASED_CLOCK_MONOTONIC then 3\n" ++
+  "    when CLOCK_THREAD_CPUTIME_ID then 4\n" ++
+  "    when CLOCK_MONOTONIC_RAW_APPROX then 5\n" ++
+  "    when CLOCK_UPTIME_RAW_APPROX then 6\n" ++
+  "    else 1\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  private_class_method :__clock_kind\n" ++
+  "\n" ++
   "  def self.clock_gettime(clock, unit = :float_second)\n" ++
   "    clock = __clock_check(clock, \"clock_gettime\")\n" ++
-  "    if clock == CLOCK_PROCESS_CPUTIME_ID\n" ++
+  "    if clock == CLOCK_PROCESS_CPUTIME_ID || (clock.is_a?(Symbol) && clock.end_with?(\"_CLOCK_PROCESS_CPUTIME_ID\"))\n" ++
   "      seconds = __process_cpu\n" ++
   "      raise NotImplementedError, 'this platform has no process CPU clock' if seconds < 0\n" ++
   "    else\n" ++
-  "      seconds = __clock_raw\n" ++
+  "      seconds = __clock_read(__clock_kind(clock))\n" ++
+  "      raise Errno::EINVAL, \"clock_gettime(#\{clock.inspect})\" if seconds < 0\n" ++
+  "      seconds = seconds.floor.to_f if clock == :TIME_BASED_CLOCK_REALTIME\n" ++
+  "      seconds = (seconds * 100).floor / 100.0 if clock == :TIMES_BASED_CLOCK_MONOTONIC\n" ++
   "    end\n" ++
   "    __in_unit(seconds, unit)\n" ++
   "  end\n" ++
@@ -7131,7 +7179,7 @@ let core_prelude_f =
   "  # ⚠ The three SYMBOL clocks have resolutions ruby documents, so they are\n" ++
   "  #   answered as documented. The numeric ones are \"observed\", and the spec\n" ++
   "  #   only requires <= 10ms; one microsecond is what a gettimeofday-based\n" ++
-  "  #   clock gives and is the honest claim for the one behind __clock_raw.\n" ++
+  "  #   clock gives and is the honest claim for the ones behind __clock_read.\n" ++
   "  # (:hertz is the resolution's reciprocal, and only getres takes it)\n" ++
   "  def self.clock_getres(clock, unit = :float_second)\n" ++
   "    __clock_check(clock, \"clock_getres\")\n" ++
@@ -9394,6 +9442,24 @@ let core_prelude_j =
   "  def self.keep_script_lines=(v)\n" ++
   "    @__ksl = v ? true : false\n" ++
   "  end\n" ++
+  // (vm_stat: ruby's counters of its inline constant caches, class variable
+  //  state and object shapes, by name or into a Hash. This interpreter keeps
+  //  none of them, and counts 0 for each; the names, the Hash filled in
+  //  place and the errors are ruby's)
+  "  def self.stat(*a)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given #\{a.size}, expected 0..1)\" if a.size > 1\n" ++
+  "    keys = %i[constant_cache_invalidations constant_cache_misses global_cvar_state next_shape_id shape_cache_size]\n" ++
+  "    arg = a.empty? ? \{} : a[0]\n" ++
+  "    case arg\n" ++
+  "    when Symbol\n" ++
+  "      raise ArgumentError, \"unknown key: #\{arg.name}\" unless keys.include?(arg)\n" ++
+  "      0\n" ++
+  "    when Hash\n" ++
+  "      keys.each \{ |k| arg[k] = 0 }\n" ++
+  "      arg\n" ++
+  "    else raise TypeError, \"non-hash or symbol given\"\n" ++
+  "    end\n" ++
+  "  end\n" ++
   // (the two thread sizes that are this interpreter's own: the VM stack size
   //  its call depth budget follows (m_state), and the machine stack a thread
   //  runs on -- a thread's root is a coroutine, and mere.toml's `stack =
@@ -9843,11 +9909,12 @@ let core_prelude_j =
   "      raise RuntimeError, \"cannot get AST for ISEQ compiled by prism\"\n" ++
   "    end\n" ++
   "    # (the node of the file's Prism tree the frame was running: see\n" ++
-  "    #  Prism.__node_id_for_location in lib/prism_ext.rb)\n" ++
+  "    #  the helper in lib/backtrace_node_id.rb)\n" ++
   "    def self.node_id_for_backtrace_location(loc)\n" ++
   "      raise TypeError, \"Thread::Backtrace::Location object expected\" unless loc.class.name == \"Thread::Backtrace::Location\"\n" ++
   "      require \"prism\"\n" ++
-  "      Prism.__node_id_for_location(loc)\n" ++
+  "      require \"mere/backtrace_node_id\"\n" ++
+  "      __node_id_for_location(loc)\n" ++
   "    end\n" ++
   "    def self.parse_file(path, **kw)\n" ++
   "      src = File.read(path)\n" ++
@@ -12797,7 +12864,7 @@ let cli_syntax_report = fn (name: str) ->
 // with the class after its first line. The eval is parse-only (cli_opt
 // "evpo": a source that parses there runs nothing); what it cannot say keeps
 // the short report.
-let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+let cli_syntax_message = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (held9: bool) ->
   let (_, _, _, iv9) = world in
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let _ = map_set cli_opt "evpo" "y" in
@@ -12806,10 +12873,17 @@ let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) ->
   let m9 = (if ok9 then ""
             else (match (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) with
                   | VNil -> ""
-                  | e9 -> (match try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil with
+                  | e9 -> (match (if held9 then exc_msg_held world e9
+                                  else try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil) with
                            | VStr h9 -> sget h9
                            | _ -> ""))) in
   let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+  m9;
+// Constructing the printer's exception uses the held parser message, so a
+// user #message override runs only when detailed_message asks it. The plain
+// printer retains its existing normal #message dispatch.
+let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+  let m9 = cli_syntax_message env world name src false in
   if str_eq m9 "" then dflt
   else (let nl9 = str_find_from m9 "\n" 0 in
         if nl9 < 0 then name ++ ": " ++ m9 ++ " (SyntaxError)"
@@ -13046,6 +13120,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "(sng:Kernel)#require_relative"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
   let _ = set_meth meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("__exception_message", EVar "msg"), Nil))) in
+  let _ = set_private "Exception#initialize" VNil in
   // An Errno class's message is the SYSTEM's text, and `.new` has to say the
   // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
   // not the class name, and with an argument it reads "<text> - <arg>". raise
@@ -13138,6 +13213,9 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
            Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (ESym "INT", Nil))),
              Cons (SIVarAssign ("__exception_message",
                      EBin ("||", EVar "msg", EStrL "Interrupt")), Nil)))) in
+  let _ = set_private "SystemCallError#initialize" VNil in
+  let _ = set_private "SignalException#initialize" VNil in
+  let _ = set_private "Interrupt#initialize" VNil in
   let _ = set_meth meths "SignalException#signo"
     (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
   // #signm is the MESSAGE, not the resolved name: `SignalException.new(2)`
@@ -13609,7 +13687,14 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
                      //  hands this to that library's configure.)
                      Cons (mkstr "host", Cons (mkstr (rcpu ++ "-" ++ rvend ++ "-" ++ ros ++ (if str_eq (mr_capi_libc ()) "" then "" else "-" ++ mr_capi_libc ())),
                      Cons (mkstr "host_alias", Cons (mkstr "",
-                     rbc_facts))))))))))))
+                     // (the OpenSSL the build linked, as ruby's configure is
+                     //  told it -- mkmf's dir_config("openssl") reads it from
+                     //  here, and an extension with TLS of its own, puma's
+                     //  MiniSSL, finds the same headers and library. No
+                     //  directory named, no argument: the prelude's '' stands.)
+                     (if str_eq (mr_capi_openssl_dir ()) "" then rbc_facts
+                      else Cons (mkstr "configure_args", Cons (mkstr ("'--with-openssl-dir=" ++ mr_capi_openssl_dir () ++ "'"),
+                      rbc_facts)))))))))))))))
                    else rbc_facts) in
   let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr ros, Cons (mkstr "arch", Cons (mkstr rarch, Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "EXECUTABLE_EXTS", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr (rlp ++ "/site_ruby/" ++ rver), Cons (mkstr "rubylibprefix", Cons (mkstr rlpgem, Cons (mkstr "rubylibdir", Cons (mkstr rld, Cons (mkstr "rubyarchdir", Cons (mkstr rad, Cons (mkstr "DLEXT", Cons (mkstr (if str_eq (sys_os ()) "darwin" then "bundle" else "so"), Cons (mkstr "UNICODE_VERSION", Cons (mkstr "17.0.0", Cons (mkstr "UNICODE_EMOJI_VERSION", Cons (mkstr "17.0", rbc_facts))))))))))))))))))))))))))))))) in
   // UNICODE_VERSION / UNICODE_EMOJI_VERSION are the REFERENCE ruby's, asked of
@@ -14021,7 +14106,18 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
              else (let (_, _, ocls9, ivars9) = world in
               let txt9 = (if has_meth world "SyntaxError" "detailed_message" then
                             (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr (map_get cli_opt "synmsg"), Nil)) false) VNil with
+                             // Ruby appends a newline to every -e fragment (ruby.c,
+                             // add_e_script). Our fragments already contain separators;
+                             // include the final newline in Prism's actual CLI input.
+                             // Its EOF diagnostics can differ from eval of the raw text.
+                             let source9 = (if str_eq name "-e" then src ++ "\n" else src) in
+                             let report9 = try_or (fn (u: unit) -> prism_report source9 name 1) "" in
+                             let frame9 = (if str_len report9 > 0 then report9
+                                           else cli_syntax_message env world name src true) in
+                             // Construct from the held parser message. Only the real
+                             // detailed_message dispatch may invoke a user's #message.
+                             let message9 = (if str_len frame9 > 0 then frame9 else map_get cli_opt "synmsg") in
+                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr message9, Nil)) false) VNil with
                              | VObj eid9 ->
                                (let _ = iv_put ivars9 (str_of_int eid9 ++ "@__path") (mkstr name) in
                                 match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message"
@@ -14149,6 +14245,8 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  of it, when it takes the whole file: main.mere's vm_file_stmts)
   let gc_mids = (if req_ok && pre_st == 0 && (if embedded then false else true) && map_has cli_opt "vm"
                  then vm_file_stmts env world noblk src name "<main>" gc_mids else gc_mids) in
+  // (ruby's warning of a top-level `return <value>`, before the script runs)
+  let _ = (if req_ok && pre_st == 0 && (if embedded then false else true) then top_ret_warn world name gc_mids else ()) in
   let gc_total = list_len gc_mids in
   let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
