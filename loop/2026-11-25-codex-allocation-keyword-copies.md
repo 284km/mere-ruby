@@ -271,3 +271,58 @@ and retain a nonempty value without publishing call origin or copying it as
 a call packet. Restore ordinary EKwHash value evaluation through EHsh.
 The additional cases remain 113 reference lines and cover side-effectful
 conversion once. The prior focused failures are not acceptance results.
+
+## Resource diagnosis and the next main integration
+
+Source 9971aa83 passes corpus 987, all 113 reference lines, on both engines
+normally and with GC stress 50. All nine focused programs pass in those four
+configurations. The complete keyword/call/hash files retain 115/0, 65/0 and
+297/1 MATCH/RED on both engines, with no newly failing case IDs. All 76
+allocation cases complete: main ccb68952 8/68, head 14/62; every sample keeps
+its normal-GC per-case outcomes.
+
+Keep all twenty predeclared GC_TIGHT=1, seed 1 samples. Sampled family RSS
+medians in KiB are evaluator 639,808 to 682,656 (+6.70%) and VM 665,968 to
+635,472 (-4.58%). The evaluator increase stops final acceptance; no full
+corpus, final instruction replay or copy-memory replay is claimed for that
+source. Do not substitute earlier favorable medians.
+
+Exact per-process attribution on that source preserves every case outcome.
+The largest child is Literal#test_hash_literal, with 100,000 entries.
+
+| Mode | Runner kernel highwater, bytes main to head | Hash-literal child kernel highwater |
+| --- | --- | --- |
+| evaluator | 416,055,296 to 416,301,056 | 310,968,320 to 310,951,936 |
+| VM | 408,829,952 to 415,301,632 | 317,325,312 to 317,112,320 |
+
+Periodic family sampling misses the short child peak: the VM main sample
+sees only 132,992 KiB for a child whose kernel highwater is 317,325,312 bytes.
+The same diagnostic has a sampled family peak of 574,720 to 758,736 KiB,
+although the child kernel highwaters are equal within a page-scale difference.
+This establishes sampling loss, not final resource acceptance. The VM runner
+single-pair increase still needs repeated measurement. Repeat five alternating
+pairs per engine with external kernel counters and no Ruby observer, retaining
+both the kernel highwaters and the sampled family metric separately.
+
+A private seven-native equality callback probe finds the same keyword-binding
+gap on main and this source, normally and under stress on both engines. It is
+a separate shared-main follow-up, not a newly fixed behavior in this PR.
+
+Before that new resource plan starts, a prospective merge finds conflicts
+with main 85da98fb. Stop only the still-queued measurement gate under the shared
+admission lock; zero executions from that plan have begun. Preserve source
+9971aa83 and its verified O2 binary as a diagnostic snapshot. No running file
+or another session process is stopped.
+
+Integrate pinned main 85da98fb. Both conflicts duplicate the moved native
+Method arms: retain the shared helpers, then port main iv_has flag lookups
+and iv_get_or Struct-slot reads into them. A normalized comparison of each
+complete moved arm with main is equal after excluding the intentional
+argument-origin preparation of this PR. Main scheduler, GC, VM, ivar API,
+native module/refinement and corpus changes remain in the integrated tree.
+
+This new integration is unbuilt and has no final acceptance. Use a fresh main
+baseline and O2 builds, replay the focused controls and requested whole files,
+then the external kernel-counter resource plan. Final copy-memory, instruction,
+full corpus/index/VM, source and record gates remain required. Keep every older
+result attached to its actual source and retain the original failed RSS plan.
