@@ -211,3 +211,83 @@ or assertion counts may be relaxed to improve the table.
 | TIME | `test_time.rb` | `TestTimeExtension#test_xmlschema_leap_second` | ABSENT | Library time suite already owned by Rails/VM time stream; notify owner. |
 | TIME | `test_time.rb` | `TestTimeExtension#test_xmlschema_nsec` | ABSENT | Library time suite already owned by Rails/VM time stream; notify owner. |
 | TIME | `test_time.rb` | `TestTimeExtension#test_zone_0000` | X | Library time suite already owned by Rails/VM time stream; notify owner. |
+
+## Focused recheck on 2026-11-26
+
+The later clean-4.0.10 report is main CI run
+[45500110863](https://github.com/284km/mere-ruby/actions/runs/45500110863)
+at c0a5f15b. The following selected-case recheck uses an ordinary O2 main
+fd5f54b0 build, the unchanged Ruby 4.0.10 files, --seed=1 and
+MERE_RUBY_GC_TIGHT=1, one file at a time. No full suite was run.
+These results distinguish passing tests, skips and resource errors; a
+skip is not treated as a fix. Some numeric fixes are already in newer
+main, so the pinned baseline's remaining numeric failures are not a
+claim about latest origin/main.
+
+| File | Selected names | Evaluator result | VM result |
+| --- | --- | --- | --- |
+| `objspace/test_objspace.rb` | Case group 1 below | 8 tests, 39 assertions, 8 failures, 0 errors, 0 skips | 8 tests, 39 assertions, 8 failures, 0 errors, 0 skips |
+| `objspace/test_ractor.rb` | `test_copy_finalizer` | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips |
+| `ruby/test_alias.rb` | `test_alias_memory_leak` | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips |
+| `ruby/test_array.rb` | `test_reject_with_callcc` | 2 tests, 0 assertions, 0 failures, 2 errors, 0 skips | 2 tests, 0 assertions, 0 failures, 2 errors, 0 skips |
+| `ruby/test_bignum.rb` | `test_aref2`, `test_convert`, `test_digits_for_invalid_base_numbers`, `test_divide`, `test_float_fdiv`, `test_interrupt_during_to_s`, `test_to_f`, `test_to_s2` | 8 tests, 57 assertions, 5 failures, 0 errors, 0 skips | 8 tests, 57 assertions, 5 failures, 0 errors, 0 skips |
+| `ruby/test_box.rb` | `test_prelude_gems_and_loaded_features` | 1 tests, 4 assertions, 1 failures, 0 errors, 0 skips | 1 tests, 4 assertions, 1 failures, 0 errors, 0 skips |
+| `ruby/test_eval.rb` | `test_outer_local_variable_under_gc_compact_stress` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_hash.rb` | `test_replace_memory_leak` | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips |
+| `ruby/test_integer.rb` | `test_pow` | 1 tests, 36 assertions, 0 failures, 0 errors, 0 skips | 1 tests, 36 assertions, 0 failures, 0 errors, 0 skips |
+| `ruby/test_io.rb` | `test_autoclose_false_closed_by_finalizer`, `test_autoclose_true_closed_by_finalizer`, `test_copy_stream_no_busy_wait`, `test_select_memory_leak` | 4 tests, 0 assertions, 0 failures, 1 errors, 3 skips | 4 tests, 0 assertions, 0 failures, 1 errors, 3 skips |
+| `ruby/test_io_buffer.rb` | `test_bug_21210` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_method.rb` | `test_hash_does_not_change_after_compaction` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_object.rb` | `test_copied_ivar_memory_leak`, `test_max_shape_variation_with_performance_warnings`, `test_remove_instance_variable_re_embed` | 3 tests, 8 assertions, 2 failures, 0 errors, 0 skips | 3 tests, 8 assertions, 2 failures, 0 errors, 0 skips |
+| `ruby/test_optimization.rb` | `test_string_freeze_saves_memory` | 1 tests, 1 assertions, 1 failures, 0 errors, 0 skips | 1 tests, 1 assertions, 1 failures, 0 errors, 0 skips |
+| `ruby/test_proc.rb` | `test_hash_does_not_change_after_compaction` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_process.rb` | `test_warmup_frees_pages`, `test_warmup_precompute_string_coderange`, `test_warmup_promote_all_objects_to_oldgen`, `test_warmup_run_major_gc_and_compact` | 4 tests, 7 assertions, 2 failures, 2 errors, 0 skips | 4 tests, 7 assertions, 2 failures, 2 errors, 0 skips |
+| `ruby/test_set.rb` | `test_compare_by_identity_compact` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_settracefunc.rb` | `test_lots_of_enabled_tracepoints_ractor_gc`, `test_tp_ractor_local_untargeted`, `test_tracepoint_bmethod_memory_leak`, `test_tracepoint_memory_leak` | 4 tests, 2 assertions, 1 failures, 3 errors, 0 skips | 4 tests, 2 assertions, 1 failures, 3 errors, 0 skips |
+| `ruby/test_string_memory.rb` | `test_byteslice_postfix_twice` | 1 tests, 1 assertions, 1 failures, 0 errors, 0 skips | 1 tests, 1 assertions, 1 failures, 0 errors, 0 skips |
+| `ruby/test_syntax.rb` | `test_invalid_symbol_in_hash_memory_leak` | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips |
+| `ruby/test_weakkeymap.rb` | `test_compaction` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `ruby/test_weakmap.rb` | `test_compaction` | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips | 1 tests, 0 assertions, 0 failures, 0 errors, 1 skips |
+| `rubygems/test_gem_ext_cargo_builder.rb` | `test_build_cdylib`, `test_custom_name`, `test_full_integration`, `test_rubygems_cfg_passed_to_rustc` | 4 tests, 10 assertions, 2 failures, 2 errors, 0 skips | 4 tests, 10 assertions, 2 failures, 2 errors, 0 skips |
+| `rubygems/test_require.rb` | `test_activate_via_require_respects_loaded_files` | 1 tests, 11 assertions, 1 failures, 0 errors, 0 skips | 1 tests, 11 assertions, 1 failures, 0 errors, 0 skips |
+| `socket/test_addrinfo.rb` | `test_marshal_memory_leak` | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips | 1 tests, 0 assertions, 0 failures, 1 errors, 0 skips |
+
+Confirmed ownership boundaries to report to the owner:
+
+- The continuation cases require real resumption of an escaped execution
+  frame; the runtime explicitly rejects it with NotImplementedError.
+  This belongs to execution/VM continuation support, not an Array reject guard.
+- ObjectSpace allocation paths, mortal symbol counts, typed-data accounting,
+  compaction/generation/embedding/coderange assertions and the two capacity
+  assertions depend on actual native allocation/GC representation. Missing
+  metadata must not be fabricated to mimic CRuby heap counters.
+- Ractor-local TracePoint remains semantic (expected one callback, got zero).
+  The three other TracePoint cases and alias/hash/IO/syntax/Addrinfo RSS cases
+  hit their unchanged runtime budgets. They are not measured memory leaks.
+- The require activation succeeds; the remaining assertion is canonicalization
+  of the configured native rubylibdir versus LOAD_PATH (packaging/configuration).
+- Cargo initially fails on the reference as well: Cargo 1.80.1 cannot parse
+  Ruby's edition-2024 workspace. Existing Cargo 1.99.1 fixes that environment
+  issue but exposes the fixture's default temporary directory inside the Ruby
+  workspace. A follow-up uses the suite's own GEM_TEST_TMPDIR option to isolate
+  builds outside it, unchanged tests on both sides. Its final results are pending.
+- Box prelude loaded features is separate from class identity: the child is
+  missing the actual bundled_gems.rb load. Do not add a fake loaded-feature entry.
+- Bignum to_s interruption requires a scheduler/safepoint investigation: its
+  existing decimal representation makes conversion immediate. No artificial
+  pause, GMP version, relaxed budget, or expected RuntimeError is introduced.
+
+Further cause-specific work remains open. This recheck does not mark the
+batch complete and does not replace each fix's own full corpus/gates evidence.
+
+Exact selected names for the compact table above:
+
+- Case group 1 (`objspace/test_objspace.rb`):
+  `test_count_symbols`,
+  `test_count_tdata_objects`,
+  `test_dump_all`,
+  `test_load_allocation_path_compile_file`,
+  `test_load_allocation_path_load`,
+  `test_memsize_of`,
+  `test_memsize_of_iseq`,
+  `test_trace_object_allocations`.
