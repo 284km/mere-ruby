@@ -25,7 +25,8 @@ ruby's own loop (enum.c `group_by_i`): `h[k]`, then `h[k] = [x]` for a new key o
 - A String key is stored as a frozen copy, as `[]=` stores one (it was the block's String itself, not frozen).
 - `break v` in the block answers v, as partition's does (it was stored as a key and the loop went on).
 
-The first version sent every key through `[]` and `[]=`: +75% instructions on 20,000 group_bys of 10 elements. With a plain key by the index it was still +5% -- all of it from new keys: `hpush_new`, and the read after it folding the Hash's queue, cost 2.4 times the old list's work on 10 keys. The list for small tables is what removed that.
+The first version sent every key through `[]` and `[]=`: +75% instructions on 20,000 group_bys of 10 elements.
+With a plain key by the index it was still +5% -- all of it from new keys: `hpush_new`, and the read after it folding the Hash's queue, cost 2.4 times the old list's work on 10 keys. The list for small tables is what removed that.
 
 ## Checked
 
@@ -39,7 +40,8 @@ Both binaries built with the Mere CI uses (9dec2ff6). Instructions retired, `MER
 |---|---|---|---|
 | 100 elements, 2,000 times | -13% | -17% | -36% |
 
-Against ruby, on the evaluator, the VM and with `MERE_RUBY_NO_HASH_INDEX=1`: String keys (frozen copies, an unfrozen key changed after), a Struct key with its own `#hash` / `#eql?`, `1`, `1.0` and `1r` as three keys, `0.0` and `-0.0`, nil and false, an Array key among Integer ones, a table that spills past 16 keys, `break`, and the Enumerator without a block.
+Against ruby, on the evaluator, the VM and with `MERE_RUBY_NO_HASH_INDEX=1`:
+String keys (frozen copies, an unfrozen key changed after), a Struct key with its own `#hash` / `#eql?`, `1`, `1.0` and `1r` as three keys, `0.0` and `-0.0`, nil and false, an Array key among Integer ones, a table that spills past 16 keys, `break`, and the Enumerator without a block.
 
 eager_test with ar5 (`-v --seed`, the default collector), the whole file (minitest's `-e` does not exclude, so this is all 199):
 
