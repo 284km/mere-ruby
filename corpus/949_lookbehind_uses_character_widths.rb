@@ -3,6 +3,21 @@ pattern = /\b(?<!\w['’`()])\p{Lower}/
 ["fred's", "fred’s", "d’Artagnan", "ab(c)d", "x`y"].each do |word|
   p word.gsub(pattern) { |letter| letter.upcase }
 end
+# A Unicode escape list emits one flat run, even for multiple characters.
+p /(?<=\u{65E5 672C})x/.match("日本x")&.begin(0)
+p /(?<=\u{65E5 61})x/.match("日ax")&.begin(0)
+p /(?<!\u{65E5 672C})x/.match("日本x")&.begin(0)
+[
+  [/(?<=\u{61 65E5})x/, "a日x"],
+  [/(?<!\u{61 65E5})x/, "a日x"],
+  [/(?<=\u{65E5 672C 8A9E})x/, "日本語x"],
+  [/(?<!\u{65E5 672C 8A9E})x/, "日本語x"],
+  [/(?<=\u{1F600 65E5})x/, "😀日x"],
+  [/(?<=\u{65E5 1F600})x/, "日😀x"],
+  [/(?<=\A\xE6\x97\xA5)x/, "日x"],
+  [/(?<!\A\xE6\x97\xA5)x/, "日x"],
+  [/(?<=[ab]\xE6\x97\xA5)x/, "a日x"]
+].each { |regexp, string| p regexp.match(string)&.begin(0) }
 [
   [/(?<=表)a/, "表a"],
   [/(?<!表)a/, "表a"],
