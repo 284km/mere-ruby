@@ -50,6 +50,13 @@ Step 2c (#332) came to main while this was in review. Its write, when the cache 
 With the owner key that is some other owner's key: the object kept its old shape, and objects made after it read wrong values. It goes through `iv_rec_put (oid * 8)` now, and `tools/iv_door_check.sh` fails on any `map_set obj_iv` outside m_state.
 Corpus 1067 is the case: 100 objects that set `@z` after `@x` and `@y` through a cache filled by the first, beside a String and an Array with variables. With the bare id, on the VM, 50 objects' `x` summed to 40349 (1275 in ruby) and `@z` went unlisted.
 
+## A ruby2_keywords Hash's copy (#242)
+
+#242 came to main after that. It copies a ruby2_keywords Hash for `Method#call` (`r2k_hash_copy`) and took the Hash's variables from the table's keys, listed per Hash in `hash_ivar_names`.
+Here a Hash's variables are in its area, so the copy came back with none. It goes through `iv_k_copy_all` now, which also copies a Hash still in the table.
+`hash_ivar_names` was kept by `iv_put`, the sweep and `remove_instance_variable` for that copy alone; it is gone.
+The branch was pushed before #242 came, so main is merged into it rather than rebased under it.
+
 ## Checked
 
 Both binaries built with the Mere CI uses (9dec2ff6); the base is main 89ad241c (2b).
@@ -105,4 +112,4 @@ Instructions retired, the median of 3 runs taken in turn, `MERE_RUBY_GC_TIGHT=1`
   - 214, 512, 524, 656, 659, 676 and 988 run past 600 s on main as well (512 takes 695 s on main, and its output is ruby's).
   - 917 counted 118 of its 120 connections once: each worker stops after 3 s. Alone, 3 runs gave 120 each here and 120, 115, 120 on main.
 
-After the rebase onto main 018c0564, 980 files with `MERE_RUBY_SHAPES_CHECK=1`, the evaluator and the VM, the hash index on and off: 980/980, no write around the door (1066 and 1067 among them).
+After the rebase onto main 018c0564 (and with main 7a733b48 merged, below), 980 files with `MERE_RUBY_SHAPES_CHECK=1`, the evaluator and the VM, the hash index on and off: 980/980, no write around the door (1066 and 1067 among them).
