@@ -1080,12 +1080,18 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       let _ = gc_mark_val live xl9 in gc_mark_val live tree9) else ()) in
                    vec_push gc_obj_pend id) else ())
   | VStr id -> let k = id * 8 + 1 in
-               (if gc_live_mark live k then gc_handle_class "str:" id else ())
+               (if gc_live_mark live k
+                then (let _ = gc_handle_class "str:" id in
+                      // (its variables, when it has some: the drain walks the area)
+                      if map_len iv_hng > 0 && map_has iv_hng k then vec_push gc_obj_pend (0 - k) else ())
+                else ())
   | VArr id -> let k = id * 8 + 2 in
                (if (if gc_live_mark live k then false else true) then ()
                 // every element, the queued ones (and the Vec form's) too,
                 // read where they are: marking builds no list (note 278)
-                else let _ = gc_handle_class "arr:" id in arr_each_val id (fn (x: Val) -> gc_mark_val live x))
+                else let _ = gc_handle_class "arr:" id in
+                     let _ = (if map_len iv_hng > 0 && map_has iv_hng k then vec_push gc_obj_pend (0 - k) else ()) in
+                     arr_each_val id (fn (x: Val) -> gc_mark_val live x))
   | VHsh id -> let k = id * 8 + 3 in
                (if (if gc_live_mark live k then false else true) then ()
                 // read where the pairs are -- the list, the values the index
@@ -1093,7 +1099,9 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                 // fold here copies the hash into hash_store's arena, which a
                 // loop on the stack pins, so a collection every 64k queues
                 // left a copy of every live hash each time (note 303)
-                else let _ = gc_handle_class "hsh:" id in                      let _ = gc_mark_vals live (hsettled id) in
+                else let _ = gc_handle_class "hsh:" id in
+                     let _ = (if map_len iv_hng > 0 && map_has iv_hng k then vec_push gc_obj_pend (0 - k) else ()) in
+                     let _ = gc_mark_vals live (hsettled id) in
                      // (its default and default proc live as long as it does,
                      //  and no longer: rooted from the tables, every
                      //  `Hash.new { }` ever made kept its block, note 441)
@@ -1254,28 +1262,43 @@ let gc_internal_ivar = fn live -> fn (key: str) -> fn (v: Val) ->
   let _ = gc_mark_val live v in
   if str_index_of key "@~m_" >= 0 || str_index_of key "@~um_" >= 0
   then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ();
-// A SHAPED object's variables, where they are kept (note 559 step 2b): the
+// THE SLOTS b .. b+n-1 of a slab, each one's value marked (a removed
+// variable's mark is no value). Shared by an object's area (gc_mark_area)
+// and, from note 560 B step 3, a frame's head; what a slot means besides --
+// a class's name to keep -- is the caller's to read.
+let gc_mark_slots = fn live -> fn slab -> fn (b: int) -> fn (n: int) ->
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else
+      (let v = vec_get slab (b + i) in
+       let _ = (if iv_is_absent v then () else gc_mark_val live v) in
+       go (i + 1)) in
+  go 0;
+// A SHAPED owner's variables, where they are kept (note 559 step 2b): the
 // slots of its area, walked with its shape's names beside them -- a ~m_ or
 // ~um_ name holds a class's name, as gc_internal_ivar reads off a key. A
-// removed variable's mark is no value. (An object in the table is marked
-// through the owner chains of gc_fixpoint.)
-let gc_mark_area = fn live -> fn (o: int) ->
-  if map_has obj_iv o then
-    (let r = map_get obj_iv o in
+// removed variable's mark is no value. `ok` is the owner key (an object's id
+// times 8; a String's, an Array's, a Hash's plus 1, 2, 3). (An owner in the
+// table is marked through the owner chains of gc_fixpoint.)
+let gc_mark_area = fn live -> fn (ok: int) ->
+  if map_has obj_iv ok then
+    (let r = map_get obj_iv ok in
      if r <= 0 then ()
      else
        (let b = iv_rec_base r in
-        let rec walk = fn (t: int) ->
-          if t <= 0 then ()
-          else
-            (let v = vec_get iv_slab (b + sh_len t - 1) in
-             let _ = (if iv_is_absent v then ()
-                      else (let _ = gc_mark_val live v in
-                            let nm = vec_get iv_nm (sh_name t) in
-                            if str_starts_with nm "~m_" || str_starts_with nm "~um_"
-                            then (match v with VStr h -> gc_class_text (sget h) | _ -> ()) else ())) in
-             walk (sh_parent t)) in
-        walk (iv_rec_shape r)))
+        let s = iv_rec_shape r in
+        if s <= 0 then ()
+        else
+          (let _ = gc_mark_slots live iv_slab b (sh_len s) in
+           let rec walk = fn (t: int) ->
+             if t <= 0 then ()
+             else
+               (let nm = vec_get iv_nm (sh_name t) in
+                let _ = (if str_starts_with nm "~m_" || str_starts_with nm "~um_"
+                         then (match vec_get iv_slab (b + sh_len t - 1) with VStr h -> gc_class_text (sget h) | _ -> ())
+                         else ()) in
+                walk (sh_parent t)) in
+           walk s)))
   else ();
 // an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
 // 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
@@ -1475,8 +1498,11 @@ let gc_fixpoint = fn metadata -> fn ivars -> fn live -> fn (stacks: int list) ->
       (let rec each = fn (i: int) ->
          if i >= stop then ()
          else (let o = vec_get gc_obj_pend i in
-               let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
-               let _ = gc_mark_area live o in
+               // (a String's, an Array's or a Hash's owner key, negated: its
+               //  area; an object's id: its chain in the table and its area)
+               let _ = (if o < 0 then gc_mark_area live (0 - o)
+                        else (let _ = (if map_has head o then mark_chain (map_get head o) else ()) in
+                              gc_mark_area live (o * 8))) in
                each (i + 1)) in
        let _ = each start in drain stop (rounds + 1)) in
   let names_vec = gc_native_names in
@@ -2448,22 +2474,26 @@ let gc_collect = fn env -> fn world ->
     //  area back to the free list. A dead object in the table -- obj_iv's -1 --
     //  had its keys found by the walk above; its record goes too)
     let dOI = vec_new () in
+    //  (keyed by owner key, which IS the live set's key: a dead String's
+    //  area must go back, as its handle's slot is reused by the next String,
+    //  which would read the old one's variables)
     let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
-      if gc_live_has live (o * 8) then () else vec_push dOI o) in
+      if gc_live_has live o then () else vec_push dOI o) in
     let rec drop_oi = fn (i: int) ->
       if i >= vec_len dOI then ()
       else
         (let o = vec_get dOI i in
          let r = map_get obj_iv o in
          let _ = (if r > 0 then
-                    (let _ = (match iv_get_or ivars o "__f_fd" VNil with
+                    (let _ = (match iv_k_get_or ivars o "__f_fd" VNil with
                               | VInt fd9 ->
-                                (if fd9 > 2 && (if truthy (iv_get_or ivars o "__f_keep_fd" VNil) then false else true)
+                                (if fd9 > 2 && (if truthy (iv_k_get_or ivars o "__f_keep_fd" VNil) then false else true)
                                  then vec_push dFD fd9 else ())
                               | _ -> ()) in
                      iv_rec_free r)
                   else ()) in
          let _ = map_delete obj_iv o in
+         let _ = (if o % 8 != 0 && map_has iv_hng o then map_delete iv_hng o else ()) in
          drop_oi (i + 1)) in
     let _ = drop_oi 0 in
     let rec close_fds = fn (i: int) ->
@@ -2493,7 +2523,7 @@ let gc_collect = fn env -> fn world ->
     let _ = (if nc then () else map_compact ivars) in
     // (the shaped objects' records, and the slab: a value written over is a
     //  copy left in the slab's arena, as in the table's -- Mere's vec_set)
-    let _ = (if nc then () else (let _ = map_compact obj_iv in vec_compact iv_slab)) in
+    let _ = (if nc then () else (let _ = map_compact obj_iv in let _ = map_compact iv_hng in vec_compact iv_slab)) in
     // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     let dIX = vec_new () in
     let _ = map_iter iv_idx (fn (k: str) -> fn (v: str) ->
@@ -2574,10 +2604,6 @@ let gc_collect = fn env -> fn world ->
     let rec dropHK = fn (i: int) -> (if i >= vec_len dHK then () else (let _ = hpend_drop (vec_get dHK i) in dropHK (i + 1))) in
     let _ = dropHK 0 in
     let _ = gc_drop_i hash_store dHK in
-    let rec dropHiv = fn (i: int) ->
-      if i >= vec_len dHK then () else
-        (let _ = map_delete hash_ivar_names ("hsh:" ++ str_of_int (vec_get dHK i)) in dropHiv (i + 1)) in
-    let _ = (if map_len hash_ivar_names == 0 then () else dropHiv 0) in
     // ⚠ and the pairs queued for a hash but not yet folded in -- as reachable
     // as the hash itself (gc_mark_val marks them in the queue), and a dead
     // hash's queue goes with it.
@@ -3184,7 +3210,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        then map_get consts (anc_const_key world "Object" n)
        else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
        // (...and a path whose head is now defined is read as one)
-       else if str_contains n "::" && map_has consts (const_head n) then eval_e env world blk (EConst n)
+       else if str_contains n "::" && map_has consts (const_head n) then
+         scoped_namespace_tail env world blk
+           (eval_e env world blk (EConst ("::" ++ const_head n))) (const_tail n)
        // (a path whose head names nothing: the head is the error, as ruby
        //  reads `::Nope::Thing` left to right -- "uninitialized constant Nope")
        else if str_contains n "::" then eval_e env world blk (EConst ("::" ++ const_head n))
@@ -3192,6 +3220,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
     else if str_contains name "::" then
+      if vec_get box_st 0 == 1 then
+        (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") else cur_lex ()) in
+         let key9 = const_walk_head env world blk cref9 (const_head name) in
+         let value9 = (if str_eq key9 "" then eval_e env world blk (EConst (const_head name))
+                       else (let _ = const_read_note world key9 in map_get consts key9)) in
+         scoped_namespace_tail env world blk value9 (const_tail name))
+      else
       // the scope operator is exactly what `private_constant` closes off; the
       // lexical name (the `else` branch below) still reads it.
       (if map_has private_consts name then
@@ -3404,7 +3439,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let cm9 = owner_anc world (ancestors_of world ("(sng:" ++ ow9 ++ ")")) "const_missing" in
          if (if str_eq cm9 "" || str_eq cm9 "Module" then false else true)
          then invoke_val_c env world blk (VClass ow9) "const_missing" (Cons (VSym name, Nil)) false
-         else raise_uninit_const world ow9 name ("uninitialized constant " ++ ow9 ++ "::" ++ name))
+         else raise_uninit_const world ow9 name ("uninitialized constant " ++ cls_display world ow9 ++ "::" ++ name))
       else if map_has consts name then (let _ = const_read_note world name in map_get consts name)
       // an autoload registered ANYWHERE along the lexical nesting, or at top
       // level. Only the innermost cref and the bare name were tried, so a
@@ -3442,7 +3477,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         invoke_val_c env world blk (VClass (match (if map_has consts cref then map_get consts cref else VNil) with VClass rc9 -> rc9 | _ -> cref))
           "const_missing" (Cons (VSym name, Nil)) false
       else raise_uninit_const world (if str_eq cref "" then "Object" else cref) name
-             ("uninitialized constant " ++ (if str_eq cref "" then name else cref ++ "::" ++ name))
+             ("uninitialized constant " ++ (if str_eq cref "" then name else cls_display world cref ++ "::" ++ name))
   // (a top-level constant is keyed by its bare name: `Object::A ||= 10` and
   //  `::A ||= 10` read it there, and reassigned one that was defined)
   | EConstOrNil name ->
@@ -7550,13 +7585,9 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
      //  ...unless it already is one: frozen, a String, and no ivars)
      | VStr h9 when str_eq slot "/" ->
        (let (_, _, _, iv9) = world in
-        let pfx9 = hng_key v ++ "@" in
-        let ivs9 = map_new () in
-        let _ = (if sfrozen_get h9 && vec_get hiv_made 0 > 0 then
-                   map_iter iv9 (fn (k9: str) -> fn (x9: Val) ->
-                     if str_len k9 > str_len pfx9 && str_eq (substring k9 0 (str_len pfx9)) pfx9 then map_set ivs9 "y" 1 else ())
-                 else ()) in
-        if sfrozen_get h9 && str_eq (dispatch_cls_of world v) "String" && (if map_has ivs9 "y" then false else true)
+        // (whether it has any: the door, iv_k_has_any -- a walk of every
+        //  variable only for a String in the table)
+        if sfrozen_get h9 && str_eq (dispatch_cls_of world v) "String" && (if iv_k_has_any iv9 (hiv_ok v) then false else true)
         then (let _ = gvar_write world slot v in ())
         else (match mkstr_e (sget h9) (senc_get h9) with
               | VStr n9 -> (let _ = sfrozen_set n9 in let _ = gvar_write world slot (VStr n9) in ())
@@ -15482,6 +15513,24 @@ and const_walk = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (name: str
 // the first segment: lexically scoped, top level, or still only an autoload.
 // "" means it could not be resolved at all.
 and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head: str) ->
+  // Internal box identities are not textual namespace prefixes. Search each
+  // actual lexical scope for a constant OR autoload before going outward.
+  let nested9 = (if vec_get box_st 0 == 1 then
+                   (let nesting9 = (if lv_has env "__nest" then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "")
+                                    else if lv_has env "__meth" then "" else cur_nest ()) in
+                    let rec scopes9 = fn (ns9: str list) ->
+                      match ns9 with
+                      | Nil -> ""
+                      | Cons (scope9, rest9) ->
+                        if str_eq scope9 "" then scopes9 rest9 else
+                        (let key9 = (if str_eq scope9 "Object" then head else scope9 ++ "::" ++ head) in
+                         let _ = (if autoload_busy_other key9 then (let _ = autoload_fire env world blk key9 in ()) else ()) in
+                         if map_has consts key9 then key9
+                         else if map_has autoloads key9 && autoload_fire env world blk key9 && map_has consts key9 then key9
+                         else scopes9 rest9) in
+                    scopes9 (str_split nesting9 (chr 10)))
+                 else "") in
+  if (if str_eq nested9 "" then false else true) then nested9 else
   let _ = (if autoload_busy_other head then (let _ = autoload_fire env world blk head in ()) else ()) in
   // (an autoload registered in a scope nearer than the constant the walk
   //  found is read first, as ruby asks each scope for a constant or an
@@ -19672,15 +19721,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     (let _ = bi_skip_take name in
      let cp = prim_method recv name args in
      let (_, _, _, ivars9) = world in
-     let oldp = hng_key recv ++ "@" in
-     let newp = hng_key cp ++ "@" in
-     let tmp9 = map_new () in
-     let _ = (if str_eq (hng_key cp) "" || vec_get hiv_made 0 == 0 then () else
-                map_iter ivars9 (fn (k: str) -> fn (v: Val) ->
-                  if str_len k > str_len oldp && str_eq (substring k 0 (str_len oldp)) oldp
-                  then map_set tmp9 (newp ++ substring k (str_len oldp) (str_len k)) v
-                  else ())) in
-     let _ = map_iter tmp9 (fn (k: str) -> fn (v: Val) -> iv_put ivars9 k v) in
+     // (its variables, through the door: the area whole, note 559 step 2b')
+     let _ = (if hiv_ok cp < 0 then () else iv_k_copy_all ivars9 (hiv_ok recv) (hiv_ok cp)) in
      // a subclass tag rides along -- but dup does NOT copy a singleton (its
      // tag strips back to the base class); clone keeps it. A user
      // initialize_copy hook runs with the original either way.
@@ -20986,15 +21028,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                       // the subclass tag and the instance variables ride along
                       let _ = (let hk9 = hng_key (VHsh h9) in
                                if map_has hng_store hk9 then hng_put (hng_key cp9) (map_get hng_store hk9) else ()) in
-                      let oldp9 = hng_key (VHsh h9) ++ "@" in
-                      let newp9 = hng_key cp9 ++ "@" in
-                      let tmp9 = map_new () in
-                      let _ = (if vec_get hiv_made 0 == 0 then () else
-                               map_iter iv9k (fn (k9: str) -> fn (v9: Val) ->
-                                if str_len k9 > str_len oldp9 && str_eq (substring k9 0 (str_len oldp9)) oldp9
-                                then map_set tmp9 (newp9 ++ substring k9 (str_len oldp9) (str_len k9)) v9
-                                else ())) in
-                      let _ = map_iter tmp9 (fn (k9: str) -> fn (v9: Val) -> iv_put iv9k k9 v9) in
+                      let _ = iv_k_copy_all iv9k (hiv_ok (VHsh h9)) (hiv_ok cp9) in
                       map_set r2k_marks (str_of_int d9) VNil)
                    | _ -> ()) in
           cp9)
@@ -34080,9 +34114,9 @@ and flush_files_at_exit = fn world ->
              else ())) in
   // (and a shaped object's, by the name's slot)
   let _ = map_iter obj_iv (fn (o: int) -> fn (r: int) ->
-            if r <= 0 then ()
-            else (match iv_get_or ivars o "__f_buf" VNil with
-                  | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int o) VNil else ())
+            if r <= 0 || o % 8 != 0 then ()
+            else (match iv_k_get_or ivars o "__f_buf" VNil with
+                  | VStr h -> (if str_len (sget h) > 0 then map_set ids (str_of_int (o / 8)) VNil else ())
                   | _ -> ())) in
   map_iter ids (fn (k: str) -> fn (v: Val) ->
     (let _ = try_or (fn (u: unit) -> file_flush_obj world (int_of_str k)) () in ()))
@@ -37736,7 +37770,18 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      //   `File.new(p).instance_variables` answered five names where ruby
      //   answers [], and YAML.dump wrote them out as the object's state.
      //   A program's own `@__x` is hidden with them -- a cost, named here.
-     if (str_len name == 18 && str_eq name "instance_variables") then
+     // (a String's, an Array's or a Hash's go through the door, by its owner
+     //  key, while it is shaped -- note 559 step 2b'; in the table they are
+     //  under `base`, below)
+     let hok = hiv_ok recv in
+     let hshaped = hok >= 0 && iv_rec_k hok != 0 - 1 in
+     if (str_len name == 18 && str_eq name "instance_variables") && hshaped then
+       (let rec vis9 = fn (ns9: str list) ->
+          (match ns9 with
+           | Nil -> (Nil : Val list)
+           | Cons (n9, t9) -> (if ivar_is_internal n9 0 then vis9 t9 else Cons (VSym ("@" ++ n9), vis9 t9))) in
+        arr_new (vis9 (iv_k_names hok)))
+     else if (str_len name == 18 && str_eq name "instance_variables") then
        (let pfx = base ++ "@" in
         let plen = str_len pfx in
         let tmp = map_new () in
@@ -37762,24 +37807,33 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
            // ...and so does one that CAN hold them once it is frozen: a frozen
            // String, Array, Hash or Binding took the write
            else if val_is_frozen recv then raise_exc world "FrozenError" ("can't modify frozen " ++ cls_display world cls ++ ": " ++ inspect recv)
+           else if (str_len name == 24 && str_eq name "remove_instance_variable") && hshaped then
+             (if iv_k_has ivars0 hok nm9
+              then (let old9 = iv_k_get_or ivars0 hok nm9 VNil in let _ = iv_k_del ivars0 hok nm9 in old9)
+              else raise_exc_iv world "NameError" ("instance variable @" ++ nm9 ++ " not defined")
+                     (Cons (("__name", VSym ("@" ++ nm9)), Cons (("__recv", recv), Nil))))
            else if (str_len name == 24 && str_eq name "remove_instance_variable") then
              (let k9 = base ++ "@" ++ nm9 in
               if map_has ivars0 k9
               then (let old9 = map_get ivars0 k9 in
-                    let _ = map_delete ivars0 k9 in
-                    let _ = (match recv with VHsh _ -> hash_ivar_remove base nm9 | _ -> ()) in old9)
+                    let _ = map_delete ivars0 k9 in old9)
               // (the NameError names the receiver and the variable, as ruby's does)
               else raise_exc_iv world "NameError" ("instance variable @" ++ nm9 ++ " not defined")
                      (Cons (("__name", VSym ("@" ++ nm9)), Cons (("__recv", recv), Nil))))
            else (match args with
-                 | Cons (_, Cons (value, _)) -> let _ = iv_put ivars0 (base ++ "@" ++ nm9) value in value
+                 | Cons (_, Cons (value, _)) ->
+                   (let _ = (if hok >= 0 then iv_k_set ivars0 hok nm9 value else iv_put ivars0 (base ++ "@" ++ nm9) value) in value)
                  | _ -> VNil))
         | _ -> VNil)
      else
        (match args with
         | Cons (v, _) ->
-          (let k = base ++ "@" ++ ivar_name_val env world v in
+          (let nm9 = ivar_name_val env world v in
+           let k = base ++ "@" ++ nm9 in
            if str_eq base "" then (if (str_len name == 26 && str_eq name "instance_variable_defined?") then VBool false else VNil)
+           else if hok >= 0 then
+             (if (str_len name == 26 && str_eq name "instance_variable_defined?") then VBool (iv_k_has ivars0 hok nm9)
+              else iv_k_get_or ivars0 hok nm9 VNil)
            else if (str_len name == 26 && str_eq name "instance_variable_defined?") then VBool (map_has ivars0 k)
            else if map_has ivars0 k then map_get ivars0 k else VNil)
         | _ -> VNil))
@@ -38681,19 +38735,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     (match recv with
      | VStr h ->
        (let (m9i, s9i, o9i, iv9i) = world in
-        let pfx = "str:" ++ str_of_int h ++ "@" in
-        let found = map_new () in
-        let _ = (if vec_get hiv_made 0 == 0 then () else
-                 map_iter iv9i (fn (k: str) -> fn (v: Val) ->
-          (if str_len k > str_len pfx && str_eq (substring k 0 (str_len pfx)) pfx
-           then map_set found "y" VNil else ()))) in
+        // (whether it has variables: the door. It made a Map at every call,
+        //  and walked every variable of the program once any String, Array
+        //  or Hash had had one -- sqlite3's C asks -@ of each column's name)
+        let found9 = iv_k_has_any iv9i (hiv_ok recv) in
         // (a SUBCLASS's unfrozen string is not interned: it is a frozen
         //  dup of its own class -- rb_str_uminus asks BARE_STRING_P)
         if map_has hng_store (hng_key recv) && (if sfrozen_get h then false else true) then
           (match invoke_val_c env world noblk recv "dup" Nil false with
            | VStr d9 -> (let _ = sfrozen_set d9 in VStr d9)
            | o9 -> o9)
-        else if map_has found "y" then prim_method recv "-@" args
+        else if found9 then prim_method recv "-@" args
         else str_fstring recv)
      | _ -> recv)
   else if ((str_len name == 4 && str_eq name "gsub") || (str_len name == 5 && str_eq name "gsub!"))
@@ -40983,18 +41035,9 @@ and r2k_hash_copy = fn world -> fn (id9: int) ->
                           else tag9 in
               hng_put newkey9 base9)
            else ()) in
-  let oldprefix9 = oldkey9 ++ "@" in
-  let newprefix9 = newkey9 ++ "@" in
-  let _ = (if not (map_has hash_ivar_names oldkey9) then () else
-             region R2KCOPY {
-               let rec copy_ivars9 = fn (names9: str list) -> match names9 with
-                 | Nil -> ()
-                 | Cons (name9, rest9) ->
-                   (let key9 = oldprefix9 ++ name9 in
-                    let _ = copy_ivars9 rest9 in
-                    if map_has ivars9 key9 then iv_put ivars9 (newprefix9 ++ name9) (map_get ivars9 key9) else ()) in
-               copy_ivars9 (map_get hash_ivar_names oldkey9)
-             }) in
+  // (its variables, through the door: the area whole, or a Hash in the
+  //  table's keys -- note 559 step 2b')
+  let _ = iv_k_copy_all ivars9 (hiv_ok (VHsh id9)) (hiv_ok copy9) in
   let _ = (if map_has kwarg_marks (str_of_int id9) then map_delete kwarg_marks (str_of_int id9) else ()) in
   copy9
 and r2k_replace_tail = fn (args9: Val list) -> fn (tail9: Val) ->
@@ -52299,6 +52342,32 @@ and triv_store_args = fn (params: str list) -> fn (args: Val list) ->
         && (match a9 with VHsh _ -> false | _ -> true)
         && triv_store_args pt9 at9)
      | Nil -> false)
+// The instance variable a method's body only reads and answers, or "": the
+// body attr_reader makes ([SReturn (EIVar x)]), the parser's of `def x = @x`
+// and `def x; @x; end` (after the marks of its line and file), and the ISeq
+// VM's whose program is `getinstancevariable; leave` of a program still
+// loaded (its generation). Nothing of these can raise or run Ruby.
+and triv_reader_iv = fn (body: Stmt list) ->
+  match body with
+  | Cons (SReturn (EIVar iv), Nil) -> iv
+  | Cons (SExpr (EIVar iv), Nil) -> iv
+  | Cons (SLine _, rest) -> triv_reader_iv rest
+  | Cons (SLineQ _, rest) -> triv_reader_iv rest
+  | Cons (SFile _, rest) -> triv_reader_iv rest
+  // (the program's length first, from vm_code: almost every method has more
+  //  than two instructions, and the tree and the 14-field record are read
+  //  only for one that has two)
+  | Cons (SVm (id, gen), Nil) ->
+    (let (_, _, vcn) = vec_get vm_code id in
+     if vcn != 2 then ""
+     else
+       (let (code, na, _, vcb, _) = vm_prog id in
+        if vc code (vcb + 0) 0 == 22 && vc code (vcb + 1) 0 == 50 then
+          (let (_, _, kind, g, _, _, _, _, _, _, _, _, _, _) = vec_get vm_meta id in
+           if g != gen || kind != 2 then ""
+           else (let n = vec_get na vcb in if str_len n > 1 then substring n 1 (str_len n) else ""))
+        else ""))
+  | _ -> ""
 // (is `body` `@x ||= <literal>` alone, with the line and file marks and the
 //  local-declaration mark around it? The variable's name and the literal's
 //  value, or "" when it is not)
@@ -52528,15 +52597,21 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
   // `node.first_lineno` cost: 2.8 µs, sixty times in each node test_ast
   // walks. A block given, a TracePoint, Coverage's method table or a Ractor
   // (whose ivars are checked) take the full path.
-  | Meth (Nil, Nil, Cons (SReturn (EIVar iv9), Nil))
+  // (...and a reader written as a method, `def x = @x` or `def x; @x; end`:
+  //  its body is the parser's or the ISeq VM's, not attr_reader's, and it
+  //  read the same variable through a frame of its own -- 22,000
+  //  instructions a call where attr_reader's took 2,000: triv_reader_iv)
+  | Meth (Nil, Nil, body9)
       when (match args with Nil -> true | _ -> false)
            && (match recv with VObj _ -> true | _ -> false)
+           && (let iv9 = triv_reader_iv body9 in
+               str_len iv9 > 0 && (if str_eq (char_at iv9 0) "@" then false else true))
            && (match blk with (true, _, _, _) -> false | _ -> true)
            && (if map_len hook_flags == 0 then true
                else if hook_tp_on () then false else true)
-           && vec_get cov_st 0 != 2 && map_len ractor_thr == 0
-           && (if str_len iv9 > 0 && str_eq (char_at iv9 0) "@" then false else true) ->
-    (let (_, _, _, ivars9) = world in
+           && vec_get cov_st 0 != 2 && map_len ractor_thr == 0 ->
+    (let iv9 = triv_reader_iv body9 in
+     let (_, _, _, ivars9) = world in
      // (the attribute reader cache is asking about this very call: attr_ic)
      let _ = (if vec_get attr_ic_st 3 == 1 then
                 (match recv with
@@ -53146,7 +53221,24 @@ and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm
   //  scope holds: activerecord's test models have `module Namespaced; class
   //  Company < ::Company; end; class Firm < ::Company; end; end`, and Firm
   //  became a subclass of Namespaced::Company)
-  if str_len nm > 2 && str_eq (substring nm 0 2) "::" then named_class_of_al env world blk "" (substring nm 2 (str_len nm))
+  if vec_get box_st 0 == 1 && str_contains nm "::" then
+    // Follow actual namespace values, including const_missing results, before
+    // deriving the internal class identity. Keep an absolute head rooted.
+    (let root9 = str_starts_with nm "::" in
+     let path9 = (if root9 then substring nm 2 (str_len nm) else nm) in
+     let head9 = const_head path9 in
+     let (_, parents9, _, _) = world in
+     // A runtime superclass can already be an internal identity, including
+     // the root marker inserted by SClassExpr. It is not a constant read.
+     let value9 = (if is_anon_cls head9 && (map_has parents9 head9 || map_has modules head9) then VClass head9
+                   else if root9 then eval_e env world blk (EConst ("::" ++ head9))
+                   else (let key9 = const_walk_head env world blk cref head9 in
+                         if str_eq key9 "" then eval_e env world blk (EConst head9)
+                         else map_get consts key9)) in
+     match scoped_namespace_tail env world blk value9 (const_tail path9) with
+     | VClass actual9 -> actual9
+     | other9 -> (let _ = raise_exc world "TypeError" (inspect_w env world other9 ++ " is not a class/module") in nm))
+  else if str_len nm > 2 && str_eq (substring nm 0 2) "::" then named_class_of_al env world blk "" (substring nm 2 (str_len nm))
   else
   let r = named_class_of cref nm in
   if near_autoload_fire env world blk cref nm then named_class_of cref nm
@@ -58669,18 +58761,19 @@ and pack_cv = fn env -> fn world -> fn (assoc: int) -> fn (kind: str) -> fn (v: 
 //   String's handle, and the packed result carries the Strings in a hidden
 //   ivar that #dup copies like any other.
 and pack_ptr_of = fn (h: int) -> 4096 + h * 16
-and pack_assoc_key = fn (h: int) -> hng_key (VStr h) ++ "@__pk_assoc"
+// (the Strings a 'p' or 'P' pack points at, kept on the packed String as
+//  its variable __pk_assoc: through the door, which has it in a slot)
 and pack_ptr_back = fn world -> fn (h: int) -> fn (t: int) ->
   let (_, _, _, iv) = world in
-  let k = pack_assoc_key h in
-  if (if map_has iv k then false else true) then prim_raise "ArgumentError" "no associated pointer"
+  let ok = hiv_ok (VStr h) in
+  if (if iv_k_has iv ok "__pk_assoc" then false else true) then prim_raise "ArgumentError" "no associated pointer"
   else
     (let rec find = fn (xs: Val list) ->
        (match xs with
         | Nil -> prim_raise "ArgumentError" "non associated pointer"
         | Cons (VStr h2, rest) -> (if pack_ptr_of h2 == t then VStr h2 else find rest)
         | Cons (_, rest) -> find rest) in
-     match map_get iv k with VArr aid -> find (deref aid) | _ -> find Nil)
+     match iv_k_get_or iv ok "__pk_assoc" VNil with VArr aid -> find (deref aid) | _ -> find Nil)
 // the format: StringValue, and whether its escapes are written as \u
 and pack_fmt_of = fn env -> fn world -> fn (v: Val) ->
   match pack_cv env world 0 "str" v with
@@ -58741,7 +58834,7 @@ and pack_call = fn env -> fn world -> fn (xs: Val list) -> fn (args: Val list) -
        (match res with
         | VStr rh -> (match deref assoc with
                       | Nil -> res
-                      | _ -> (let (_, _, _, iv) = world in let _ = iv_put iv (pack_assoc_key rh) (VArr assoc) in res))
+                      | _ -> (let (_, _, _, iv) = world in let _ = iv_k_set iv (hiv_ok (VStr rh)) "__pk_assoc" (VArr assoc) in res))
         | _ -> res) in
      let buf = (match rest with
                 | Cons (VHsh hid, _) ->
@@ -64186,11 +64279,16 @@ and scope_frame_pop = fn (cd: int) ->
   cur_meth_back cd
 // `<class:Name>` / `<module:Name>`: the last segment of the name
 and scope_label_of = fn (cls: str) ->
+  // Box classes keep an internal identity, but frames use the actual name
+  // assigned by their constant binding, without invoking an overridden #name.
+  let name9 = (if map_has anon_name cls then
+                 (match map_get anon_name cls with VStr h9 -> sget h9 | _ -> cls)
+               else cls) in
   let rec last = fn (i: int) -> fn (from: int) ->
-    if i + 1 >= str_len cls then from
-    else if str_eq (char_at cls i) ":" && str_eq (char_at cls (i + 1)) ":" then last (i + 2) (i + 2)
+    if i + 1 >= str_len name9 then from
+    else if str_eq (char_at name9 i) ":" && str_eq (char_at name9 (i + 1)) ":" then last (i + 2) (i + 2)
     else last (i + 1) from in
-  let short = substring cls (last 0 0) (str_len cls) in
+  let short = substring name9 (last 0 0) (str_len name9) in
   (if map_has modules cls then "<module:" else "<class:") ++ short ++ ">"
 
 // run f with the nesting the env carries (a method's frame, a block written in
@@ -67911,15 +68009,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                       if str_eq existing super0 then false else true) then
                let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ written9) in ()
              else ()) in
-    // ⚠ ...and IN A BOX a name another box's class already has is a NEW
-    //   class (Ruby::Box): the box does not see that one (bx_note_const kept
-    //   its constant out), and the table keys a class by its name. Made as
-    //   `Foo = Class.new` would be -- an anonymous internal name, `Foo` to
-    //   show -- so both stay what they are.
-    if (if already then false else true)
-       && (removed9
-           || (vec_get box_st 0 == 1
-               && (map_has sup name || map_has modules name || map_has bx_int ("m:" ++ name) || map_has bx_int ("b:" ++ name)))) then
+    // Every new box-owned class has its own internal namespace, including
+    // the first class with a display name. A removed constant also starts
+    // a fresh identity outside boxes, preserving references to the old class.
+    if (if already then false else true) && (removed9 || vec_get box_st 0 == 1) then
       (let internal = fresh_anon (if is_module then "AnonModule_" else "AnonClass_") in
        let _ = (if is_module then map_set modules internal VNil
                 else set_sup sup internal (if str_eq super0 "" then "Object" else super0)) in
@@ -67927,10 +68020,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        let _ = name_anon name (VClass internal) in
        let _ = const_added_hook world name in
        let _ = (if is_module then () else call_inherited world env (if str_eq super0 "" then "Object" else super0) internal) in
-       let saved_lex = cur_lex () in
-       let _ = set_lex internal in
-       let r = try_or (fn (u: unit) -> (let _ = cls_home_note env in register_class world internal body)) (FRaise VNil) in
-       let _ = set_lex saved_lex in
+       let r = try_or (fn (u: unit) -> with_env_nest env (fn (u9: unit) ->
+         let _ = cls_home_note env in register_class_lex world internal body)) (FRaise VNil) in
        (match r with
         | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception")
         | _ -> r))
@@ -72502,6 +72593,13 @@ and vm_ivar_get = fn env -> fn world -> fn blk -> fn (n: str) ->
 // (MERE_RUBY_SHAPES=0, too complex), self not an object, a frozen one. A
 // shape's slot count is at most 4,096 (sh_child), so a slot fits in 12 bits;
 // a shape past 2^24 is not cached.
+// (a Ractor is asked of ractor_thr: while one runs, every read and write goes
+//  through the door. After all have ended, a method may still be running on
+//  an object Ractor#send(move: true) took: ruby raises MovedError at the next
+//  call on that self, mere-ruby does not -- moved_guard refuses a call on a
+//  moved receiver named explicitly, and the evaluator reads and writes a
+//  moved self's ivars as the cache does. So the cache adds no gap of its own;
+//  #332's review)
 and vm_ivar_ok = fn (n: str) ->
   map_len hook_flags == 0 && map_len ractor_thr == 0
   && (if str_len n > 1 && ord (char_at n 1) == 64 then false else true)
@@ -72544,7 +72642,7 @@ and vm_ivar_write = fn env -> fn world -> fn blk -> fn st -> fn cd -> fn (pc: in
                    else if sh_len s1 <= iv_rec_cap r then
                      (let _ = iv_slots_add 1 in
                       let _ = vec_set iv_slab (b + i) v in
-                      let _ = map_set obj_iv oid (r - s0 + s1) in true)
+                      let _ = iv_rec_put (oid * 8) (r - s0 + s1) in true)
                    else false)
                 else false) in
      if hit then ()
