@@ -100,3 +100,4 @@ begin
 rescue ArgumentError => error
   p [:native_argument_error, error.message]
 end
+p [:native_parameters, Struct.new(:a).instance_method(:initialize).parameters]
