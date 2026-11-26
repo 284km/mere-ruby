@@ -227,3 +227,28 @@ flagged_input[:a] = 9
 flagged_result = flagged_capture.call
 p [:flagged_copy_snapshot, flagged_result, flagged_result.last.equal?(flagged_input), Hash.ruby2_keywords_hash?(flagged_result.last), Hash.ruby2_keywords_hash?(flagged_input)]
 p [:flagged_keyword_peeling, anonymous_keywords(*flagged_source)]
+
+# Peeling keywords from a spread requires its positional slice, even when
+# the caller's original Array is frozen. Explicit keywords after a spread
+# leave that Array intact and keep their existing borrowing behavior.
+def anonymous_keyword_capture(*, **) = proc { [*] }
+def anonymous_keyword_isolation(*, **) = Ractor.shareable_proc { [*] }
+[[3, flagged_input], [3, flagged_input].freeze,
+ [flagged_input], [flagged_input].freeze].each_with_index do |source, index|
+  p [:peeled_keyword_positions, index, anonymous_keywords(*source)]
+  p [:peeled_keyword_capture, index, anonymous_keyword_capture(*source).call]
+  check_anonymous_isolation([:peeled_keyword_isolation, index]) do
+    anonymous_keyword_isolation(*source)
+  end
+end
+keyword_snapshot_source = [3, flagged_input]
+keyword_snapshot = anonymous_keyword_capture(*keyword_snapshot_source)
+keyword_snapshot_source << :later
+GC.start
+p [:peeled_keyword_snapshot, keyword_snapshot.call]
+check_anonymous_isolation(:explicit_keywords_after_frozen_spread) do
+  anonymous_keyword_isolation(*[3].freeze, a: 9)
+end
+check_anonymous_isolation(:explicit_keywords_after_empty_frozen_spread) do
+  anonymous_keyword_isolation(*[].freeze, a: 9)
+end

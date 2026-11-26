@@ -205,3 +205,23 @@ native Hash-copy entry alongside the parent Method ivar API port and runtime
 updates. The parent passes its focused controls; this source is unbuilt.
 Its own Ractor/callback, allocation, RSS, instruction and full corpus checks
 remain required. No dependent runtime overlaps parent allocation measurements.
+
+## Keyword peeling after the frame-door integration
+
+Merge parent 4f4694ec and main d4414ac2. The fresh dc130ec6 O2 replay
+matches all 127 corpus 987 lines normally and under stress on both engines,
+but corpus 995 exposes a positional borrowing regression. For a flagged
+Hash h, anonymous_keywords(*[3, h]) returns [[3, h], {a: 9}] instead of
+Ruby's [[3], {a: 9}]. A separate minimal probe confirms the same difference
+on both engines; parent 44819352 and clean Ruby agree. Captured rest and
+Ractor isolation diagnostics also retain the Hash incorrectly.
+
+The source Array cannot be borrowed after its final Hash is peeled into
+keywords. Keep the already bound positional slice in native storage instead.
+Explicit keywords following the spread still permit the original borrowing
+path. This changes only anonymous-rest provenance handling, with no work on
+ordinary calls and no unused Ruby Array. Corpus 995 adds frozen and unfrozen
+sources, a keyword-only spread, captured snapshots across GC, isolation text
+and frozen explicit-keyword controls. The fixed source is unbuilt and needs
+fresh both-engine focus, file/resource/performance and full corpus acceptance
+before publication; the failing dc130ec6 binary and C remain preserved.
