@@ -55,3 +55,19 @@ end
   expression = Regexp.new("(?<!a)x".encode(encoding))
   p [encoding, ("x" * 256).encode(encoding).scan(expression).size]
 end
+
+# Each decoder's non-ASCII boundary must capture one complete character.
+[
+  ["CP949", "\x81\x81" * 5],
+  ["CP949", "\x81\x81" * 5 + "\x81\x41"],
+  ["EUC-TW", "\xA1\xA1" * 3],
+  ["GB18030", "\x81\x40" * 3],
+  ["GB18030", "\x81\x30\x81\x30" * 3],
+  ["CESU-8", "\xE8\xA1\xA8" * 3],
+  ["CESU-8", "\xED\xA0\x80\xED\xB0\x80" * 3]
+].each do |encoding, bytes|
+  prefix = bytes.force_encoding(encoding)
+  expression = Regexp.new("(?<=(.))x".force_encoding(encoding))
+  match = expression.match(prefix + "x")
+  p [encoding, prefix.valid_encoding?, match&.begin(0), match && match[1].bytes]
+end
