@@ -1,3 +1,16 @@
+# Follow-up review: keyword declarations without keyword arguments
+
+The review of 457a91b3 found that borrowing an unaccompanied positional
+Array is incorrect when the target declares keyword parameters, including
+an anonymous or named keyword rest. Ruby snapshots this rest even when no
+keyword Hash is peeled. Retain the existing immutable native snapshot for
+this path; explicit keywords after the spread keep their separate borrowing
+behavior. The change is confined to the existing anonymous-splat slow path.
+Corpus 995 adds source append/replacement across GC and frozen-source
+isolation controls for anonymous/named keyword rest, a named keyword, and
+**nil. Both engines and final-head acceptance are pending. The PR is draft
+again; the earlier results below apply to the earlier runtime only.
+
 # Anonymous rest arguments in native frame storage
 
 Validated runtime `bd5d4b09a835919f4d1ba657ad5d4ea6e62865fd`, compared with main `6d8a416dec9f1e56f6594c077014fbd90789e719`. This integrates
