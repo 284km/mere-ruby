@@ -87,18 +87,89 @@ static struct mr_mirror *mirror_at(long number, int create) {
     return table[number];
 }
 
-static uint64_t hash_bytes(const void *p, size_t n, uint64_t seed) {
-    const unsigned char *s = p;
+/* What a struct's body hashed to tells whether C wrote into it (write_back).
+ * Four lanes over each 32 bytes, so the multiplications do not wait on each
+ * other: one lane was a chain of dependent multiplies, about 1.5 ms for 8 MiB,
+ * and a String C reads is hashed twice per call (when fetched and when the
+ * call ends). copy_hash is the same hash taken while the bytes are copied. */
+struct hash_lanes { uint64_t lane[4]; };
+static inline uint64_t mix(uint64_t h, uint64_t k) {
+    h = (h ^ k) * 0xFF51AFD7ED558CCDULL;
+    return h ^ (h >> 32);
+}
+static void hash_start(struct hash_lanes *s, size_t n, uint64_t seed) {
+    uint64_t h = seed ^ (n * 0x9E3779B97F4A7C15ULL);
+    s->lane[0] = h;
+    s->lane[1] = h ^ 0x6A09E667F3BCC908ULL;
+    s->lane[2] = h ^ 0xBB67AE8584CAA73BULL;
+    s->lane[3] = h ^ 0x3C6EF372FE94F82BULL;
+}
+static inline void hash_block(struct hash_lanes *s, const unsigned char *p) {
+    uint64_t k[4];
+    memcpy(k, p, 32);
+    s->lane[0] = mix(s->lane[0], k[0]);
+    s->lane[1] = mix(s->lane[1], k[1]);
+    s->lane[2] = mix(s->lane[2], k[2]);
+    s->lane[3] = mix(s->lane[3], k[3]);
+}
+/* (the last n < 32 bytes) */
+static uint64_t hash_end(struct hash_lanes *s, const unsigned char *p, size_t n) {
+    uint64_t h = mix(mix(mix(s->lane[0], s->lane[1]), s->lane[2]), s->lane[3]);
+    while (n >= 8) {
+        uint64_t k;
+        memcpy(&k, p, 8);
+        h = mix(h, k);
+        p += 8; n -= 8;
+    }
+    while (n--) h = (h ^ *p++) * 0x100000001B3ULL;
+    return h ^ (h >> 29);
+}
+/* (under 32 bytes, one lane: the four cost more than they save there, and a
+ *  C call that reads many short Strings hashes each at every crossing) */
+static inline __attribute__((always_inline)) uint64_t hash_short(const unsigned char *s, size_t n, uint64_t seed) {
     uint64_t h = seed ^ (n * 0x9E3779B97F4A7C15ULL);
     while (n >= 8) {
         uint64_t k;
         memcpy(&k, s, 8);
-        h = (h ^ k) * 0xFF51AFD7ED558CCDULL;
-        h ^= h >> 32;
+        h = mix(h, k);
         s += 8; n -= 8;
     }
     while (n--) h = (h ^ *s++) * 0x100000001B3ULL;
     return h ^ (h >> 29);
+}
+static uint64_t hash_long(const unsigned char *s, size_t n, uint64_t seed) {
+    struct hash_lanes h;
+    hash_start(&h, n, seed);
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) hash_block(&h, s + i);
+    return hash_end(&h, s + i, n - i);
+}
+static inline __attribute__((always_inline)) uint64_t hash_bytes(const void *p, size_t n, uint64_t seed) {
+    return n < 32 ? hash_short(p, n, seed) : hash_long(p, n, seed);
+}
+/* Copy n bytes to dst unless dst already holds them, and answer
+ * hash_bytes(src, n, seed). *changed: whether dst was written -- on entry,
+ * whether it must be (dst holds something else). One pass over src. */
+static uint64_t copy_hash(unsigned char *dst, const unsigned char *src, size_t n, uint64_t seed, int *changed) {
+    if (n < 32) {
+        if (!*changed && memcmp(dst, src, n)) *changed = 1;
+        if (*changed) memcpy(dst, src, n);
+        return hash_short(src, n, seed);
+    }
+    struct hash_lanes h;
+    hash_start(&h, n, seed);
+    int ch = *changed;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        if (!ch && memcmp(dst + i, src + i, 32)) ch = 1;
+        if (ch) memcpy(dst + i, src + i, 32);
+        hash_block(&h, src + i);
+    }
+    size_t rest = n - i;
+    if (rest && !ch && memcmp(dst + i, src + i, rest)) ch = 1;
+    if (rest && ch) memcpy(dst + i, src + i, rest);
+    *changed = ch;
+    return hash_end(&h, src + i, rest);
 }
 /* ---- the slot a String's struct is allocated in ------------------------------ */
 /* CRuby allocates a String's struct in a slot of one of five sizes -- 40, 80,
@@ -263,7 +334,11 @@ static int str_resize(struct mr_mirror *m, long len, int term) {
     return 1;
 }
 
-static uint64_t body_hash(struct mr_mirror *m) {
+/* (inlined where it is used: write_back runs it for every touched struct at
+ *  every crossing, and a call there, with the length tested again inside,
+ *  cost about five instructions each time -- hold_locals(20000), PR #284's
+ *  review) */
+static inline __attribute__((always_inline)) uint64_t body_hash(struct mr_mirror *m) {
     if (m->body == T_STRING)
         return hash_bytes(str_ptr(m), (size_t)m->as.string.len, 1);
     return hash_bytes(m->as.array.as.heap.ptr, sizeof(VALUE) * (size_t)m->as.array.as.heap.len, 2);
@@ -275,6 +350,8 @@ static uint64_t body_hash(struct mr_mirror *m) {
  *  marked object holds the interpreter marks itself.) */
 static int marking;
 int mr_capi_mark_unasked(void) { return marking && !mr_capi_calling(); }
+/* (a collection is marking: a dmark is running, inside a C call or not) */
+int mr_capi_marking(void) { return marking; }
 static struct mr_mirror *refresh_head(struct mr_mirror *m, VALUE obj) {
     if (m->head_epoch == mr_epoch) return m;
     VALUE packed = mr_up1(MR_DESCRIBE, obj);
@@ -453,6 +530,31 @@ void mr_mirror_frozen_by_c(VALUE obj) {
     if (m) m->frozen_by_c = 1;
 }
 
+/* A String's bytes, from the interpreter, into its struct. The buffer is
+ * the String as far as C can tell, also past its length: what C wrote
+ * there (to reveal with rb_str_set_len later) stays, and so does everything
+ * when the interpreter has the very bytes the buffer holds. Only a String
+ * that changed is copied in, and ends in its encoding's terminator. A new
+ * buffer is as long as the String, or as the room the interpreter asked
+ * for (String.new(capacity:)). The bytes are compared, copied and hashed
+ * in one pass (copy_hash). */
+static void str_take(struct mr_give_to *to, const char *bytes, long len) {
+    struct mr_mirror *m = mirror_at(to->number, 1);
+    int term = str_term(m);
+    if (m->body != T_STRING && !str_embedded(m)) {
+        m->as.string.as.heap.ptr = NULL;
+        m->as.string.as.heap.aux.capa = 0;
+    }
+    string_room(m, len > m->reserve ? len : m->reserve, term, m->heap_only ? ROOM_HEAP : ROOM_EXACT);
+    m->reserve = 0;
+    m->heap_only = 0;
+    int changed = !(m->body == T_STRING && m->as.string.len == len);
+    m->hash = copy_hash((unsigned char *)str_ptr(m), (const unsigned char *)bytes, (size_t)len, 1, &changed);
+    if (changed) memset(str_ptr(m) + len, 0, (size_t)term);
+    m->as.string.len = len;
+    m->body = T_STRING;
+}
+
 void *rb_mere_string(VALUE obj) {
     struct mr_mirror *m = mr_mirror_of(obj);
     if ((m->as.basic.flags & 0x1f) != T_STRING) goto wrong;
@@ -465,30 +567,16 @@ void *rb_mere_string(VALUE obj) {
         touch(m, obj);
         return &m->as.string;
     }
+    /* (the bytes go into the struct while the request runs: str_take) */
+    struct mr_give_to to = { str_take, MR_NUMBER(obj), 0 };
+    mr_give_next(&to);
     mr_up1(MR_STR_GET, obj);
-    const mere_bytes *b = mr_got_bytes();
-    long len = (long)b->len;
-    int term = str_term(m);
-    /* The buffer is the String as far as C can tell, also past its length:
-     * what C wrote there (to reveal with rb_str_set_len later) stays, and
-     * so does everything when the interpreter has the very bytes the
-     * buffer holds. Only a String that changed is copied in, and ends in
-     * its encoding's terminator. A new buffer is as long as the String, or
-     * as the room the interpreter asked for (String.new(capacity:)). */
-    if (m->body != T_STRING && !str_embedded(m)) {
-        m->as.string.as.heap.ptr = NULL;
-        m->as.string.as.heap.aux.capa = 0;
+    m = mirror_at(MR_NUMBER(obj), 1);
+    if (!to.taken) {
+        /* (...or they came in transit) */
+        const mere_bytes *b = mr_got_bytes();
+        str_take(&to, (const char *)b->data, (long)b->len);
     }
-    string_room(m, len > m->reserve ? len : m->reserve, term, m->heap_only ? ROOM_HEAP : ROOM_EXACT);
-    m->reserve = 0;
-    m->heap_only = 0;
-    if (!(m->body == T_STRING && m->as.string.len == len && !memcmp(str_ptr(m), b->data, (size_t)len))) {
-        memcpy(str_ptr(m), b->data, (size_t)len);
-        memset(str_ptr(m) + len, 0, (size_t)term);
-    }
-    m->as.string.len = len;
-    m->body = T_STRING;
-    m->hash = body_hash(m);
     m->body_epoch = mr_epoch;
     touch(m, obj);
     return &m->as.string;

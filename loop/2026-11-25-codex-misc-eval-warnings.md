@@ -98,3 +98,33 @@ Neither fresh log contains a disk-write error.
 Only one corpus sweep from this session runs at a time. Future heavy jobs
 reserve a shared admission slot after counting other sessions, with a
 machine-wide limit of two and a capacity check before starting.
+
+
+## Current-main integration
+
+The integration with main fd5f54b0 retains its EOF-assignment and
+hash-pattern diagnostic requests alongside the explicit original-source
+ISeq path. Fresh ordinary O2 r4 acceptance completes both full sweeps:
+run_corpus.sh --both and MERE_RUBY_VM=1 run_corpus.sh --both each pass
+949/949 programs, hash indexing ON and OFF, exit 0. Both use SHA-256
+f31c583d541aeaf461d79d4d6c5030285e1b23e36826a934a0a7a8e162332a76.
+Corpus 1108, 664, 990 and 1023 separately match stdout/stderr/status on
+both engines against clean Ruby 4.0.10 through tools/ref_ruby.sh.
+
+The unchanged original Syntax and ISeq selections are rerun against a
+matching fd5f54b0 main build. Results remain 5 tests / 246 assertions for
+Syntax on all phases, reference ISeq 4 / 12 versus main/candidate 4 / 13,
+all passing. The same Tempfile prerequisite is loaded on all Syntax phases.
+Max RSS bytes, GC_TIGHT=1 and fixed --seed=1, /usr/bin/time -l:
+
+| File | Main evaluator | r4 evaluator | Main VM | r4 VM |
+| --- | ---: | ---: | ---: | ---: |
+| test_syntax | 198754304 | 195510272 | 204570624 | 201506816 |
+| test_iseq | 225787904 | 225165312 | 229392384 | 229146624 |
+
+All eight source gates, bracket depth 155/1024, full and explicit record
+hygiene, and both unstaged/staged diff whitespace checks pass on the
+integrated tree. The completed record and code integration are pushed
+together; no record-only push. No full unit/Rails suite is run. Workflow
+changes inherited from the already merged main are not author changes to
+this PR; no new workflow behavior is introduced here.

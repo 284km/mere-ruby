@@ -46,6 +46,13 @@ static VALUE *words;
 static long words_cap, words_put;
 static mere_bytes *bytes_out;       /* C -> interpreter */
 static long bytes_out_cap;
+/* (what C has put in transit for the request it is preparing: words_put
+ *  words, and the bytes and the name when these are set. A request reads
+ *  them before it does anything else and nothing is kept across one, so
+ *  mr_up clears these when a request has been answered, and only what is
+ *  live is set aside around a write-back or a safepoint -- the bytes of a
+ *  64 KB String C made long ago were copied at every one of them.) */
+static int bytes_out_live, text_out_live;
 static mere_bytes *bytes_in;        /* interpreter -> C */
 static long bytes_in_cap;
 static char *text_out, *text_in;
@@ -113,12 +120,34 @@ static mere_bytes *bytes_need(mere_bytes **buffer, long *cap, long n) {
 void mr_put_bytes(const void *p, long n) {
     mere_bytes *b = bytes_need(&bytes_out, &bytes_out_cap, n);
     if (n > 0) memcpy(b->data, p, (size_t)n);
+    bytes_out_live = 1;
 }
 mere_bytes *mr_capi_bytes(void) { return bytes_out ? bytes_out : bytes_need(&bytes_out, &bytes_out_cap, 0); }
 int mr_capi_give(mere_bytes *given) {
     mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, given->len);
     if (given->len > 0) memcpy(b->data, given->data, (size_t)given->len);
     b->data[given->len] = 0;
+    return 0;
+}
+/* MR_STR_GET's answer: the interpreter's own bytes, for as long as the
+ * request lasts. They go straight to where the request said (mirror.c puts
+ * a String's struct there: one pass that copies and hashes) -- before, they
+ * were copied out of the interpreter's String into a bytes, from that into
+ * this transit buffer, and from here into the struct. */
+static struct mr_give_to *give_next, *give_to;
+void mr_give_next(struct mr_give_to *to) { give_next = to; }
+int mr_capi_give_str(const char *s, CapiWord len) {
+    long n = (long)len.mu_w;
+    if (give_to) {
+        struct mr_give_to *to = give_to;
+        give_to = NULL;
+        to->take(to, s, n);
+        to->taken = 1;
+        return 0;
+    }
+    mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, n);
+    if (n > 0) memcpy(b->data, s, (size_t)n);
+    b->data[n] = 0;
     return 0;
 }
 const mere_bytes *mr_got_bytes(void) { return bytes_in ? bytes_in : bytes_need(&bytes_in, &bytes_in_cap, 0); }
@@ -131,7 +160,7 @@ static void text_set(char **buffer, long *cap, const char *text) {
     }
     memcpy(*buffer, text, (size_t)n);
 }
-void mr_put_text(const char *text) { text_set(&text_out, &text_out_cap, text); }
+void mr_put_text(const char *text) { text_set(&text_out, &text_out_cap, text); text_out_live = 1; }
 char *mr_capi_text(void) { return text_out ? text_out : ""; }
 int mr_capi_say(const char *text) { text_set(&text_in, &text_in_cap, text); return 0; }
 const char *mr_got_text(void) { return text_in ? text_in : ""; }
@@ -153,18 +182,21 @@ void mr_transit_save(struct mr_transit *t, long nwords) {
         memcpy(t->words, words, sizeof(VALUE) * (size_t)t->nwords);
     }
     t->bytes = NULL;
-    if (bytes_out) {
+    if (bytes_out && bytes_out_live) {
         t->bytes = malloc(sizeof(mere_bytes) + (size_t)bytes_out->len + 1);
         if (!t->bytes) mr_fatal("out of memory");
         memcpy(t->bytes, bytes_out, sizeof(mere_bytes) + (size_t)bytes_out->len);
     }
-    t->text = text_out ? strdup(text_out) : NULL;
+    t->text = text_out && text_out_live ? strdup(text_out) : NULL;
     t->dbl = dbl;
 }
 void mr_transit_restore(struct mr_transit *t) {
     if (t->words) { mr_put_words(t->nwords, t->words); free(t->words); }
+    else words_put = 0;
     if (t->bytes) { mr_put_bytes(t->bytes->data, (long)t->bytes->len); free(t->bytes); }
+    else bytes_out_live = 0;
     if (t->text) { mr_put_text(t->text); free(t->text); }
+    else text_out_live = 0;
     dbl = t->dbl;
 }
 
@@ -206,7 +238,8 @@ static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
         [MR_ARY_NEW] = "an Array allocation", [MR_BREAK] = "a break", [MR_BACKREF] = "$~",
         [MR_DEFINE_GVAR] = "a global variable definition", [MR_RX_DEPTH] = "the Regexp depth",
         [MR_RAT_RAW] = "a Rational allocation", [MR_NOTIMPL] = "rb_f_notimplement",
-        [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read" };
+        [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read",
+        [MR_SAFEPOINT] = "a safepoint", [MR_FREEZE] = "a freeze", [MR_ARY_APPEND] = "an Array write" };
     const char *tail = "only a header, a String, an Array and an ivar can be read then";
     if (op == MR_SEND) {
         long len = 0;
@@ -228,6 +261,10 @@ static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
 }
 VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     struct mr_frame *frame = cur;
+    /* (where a String read's bytes go, for this request alone: not for the
+     *  requests a safepoint's collection makes before it -- a dmark's) */
+    struct mr_give_to *to = op == MR_STR_GET ? give_next : NULL;
+    give_next = NULL;
     /* (a dmark run by a collection between C calls asks the collector's
      *  reader, which answers the reads that change nothing -- a header, a
      *  String's bytes, an Array's elements, an object's ivar -- from the
@@ -237,7 +274,10 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
         if (gc_reader_set && (op == MR_DESCRIBE || op == MR_STR_GET || op == MR_ARY_GET || op == MR_IVAR_READ)) {
             CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
             stats[ST_UP]++;
-            return (VALUE)gc_reader.fn(gc_reader.env, request);
+            give_to = to;
+            VALUE answer = (VALUE)gc_reader.fn(gc_reader.env, request);
+            give_to = NULL;
+            return answer;
         }
         mr_fatal(dmark_refusal(op, b, e));
     }
@@ -246,10 +286,49 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
     }
     if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
+    /* A safepoint before the requests that make something -- a String's
+     * bytes fetched, a call, a new String -- so that a long C call that only
+     * calls back through the C API is collected in as it goes: puma's HTTP
+     * parser joins a repeated header with rb_str_cat at every callback, and
+     * with no Ruby statement in the call there was no safepoint at all; 16 x
+     * 1024 headers held 4.5 GB. What C holds is rooted as under any Ruby
+     * method C calls: this stack is read for VALUEs (its C frames, the outer
+     * calls'), an Array's fetched elements and a dmark's are asked, and
+     * C's own writes were put back just above. What this request has put in
+     * transit is set aside around it. (Not for MR_STR_SET / MR_ARY_SET: those
+     * are the write-back itself, in the middle of a flush; nor while a
+     * collection is marking, whose dmark asked this.) */
+    /* (The interpreter answers the safepoint with how many of them to pass
+     * over before it is asked again: 31, its own one-in-32 of a statement
+     * boundary, or under MERE_RUBY_GC_STRESS=N 16 * N - 1. Asking at every
+     * one cost a round trip and a copy of the transit each time, whether a
+     * collection was due or not -- with GC.disable, join_in_c(3000) took
+     * twice main's time before the safepoint.) */
+    static long safepoints_to_pass;
+    if ((op == MR_STR_GET || op == MR_SEND || op == MR_STR_NEW) && !mr_capi_marking()) {
+        if (safepoints_to_pass > 0) safepoints_to_pass--;
+        else {
+            struct mr_transit saved;
+            mr_transit_save(&saved, -1);
+            CapiReq point = { MR_SAFEPOINT, 0, 0, 0, 0, 0 };
+            frame->raised = 0;
+            long long pass = frame->up.fn(frame->up.env, point);
+            if (cur != frame) mr_fatal("the calls in progress are out of step");
+            frame->raised = 0;
+            safepoints_to_pass = pass > 0 ? (long)pass : 0;
+            mr_transit_restore(&saved);
+        }
+    }
     CapiReq request = { op, (long long)a, (long long)b, (long long)c, (long long)d, (long long)e };
     stats[ST_UP]++;
     frame->raised = 0;
+    if (op == MR_STR_GET) give_to = to;
     long long answer = frame->up.fn(frame->up.env, request);
+    give_to = NULL;
+    /* (the transit was read: nothing in it is live any more) */
+    words_put = 0;
+    bytes_out_live = 0;
+    text_out_live = 0;
     if (cur != frame) mr_fatal("the calls in progress are out of step");
     if (!reads_only(op)) mr_epoch++;
     if (frame->raised) {
@@ -519,6 +598,31 @@ int mr_capi_open(const char *path) {
     return (int)library_count++;
 }
 
+/* An extension linked into this executable (capi/static_ext.c), by the
+ * feature `require` names: its library number, as mr_capi_open answers, or -1
+ * when there is no such extension. Its path is the feature; it has no handle
+ * (its symbols are this executable's). */
+int mr_capi_static_open(const char *feature) {
+    const struct mr_static_ext *e = mr_static_exts;
+    while (e->feature && strcmp(e->feature, feature)) e++;
+    if (!e->feature) {
+        mr_put_text("no such extension is linked into mere-ruby");
+        return -1;
+    }
+    for (long i = 0; i < library_count; i++)
+        if (!libraries[i].handle && !strcmp(libraries[i].path, feature)) return (int)i;
+    if (library_count == library_cap) {
+        library_cap = library_cap ? library_cap * 2 : 16;
+        libraries = realloc(libraries, sizeof(*libraries) * (size_t)library_cap);
+        if (!libraries) mr_fatal("out of memory");
+    }
+    libraries[library_count].path = strdup(feature);
+    libraries[library_count].handle = NULL;
+    libraries[library_count].init = e->init;
+    stats[ST_LIBRARIES] = library_count + 1;
+    return (int)library_count++;
+}
+
 /* ---- running C -------------------------------------------------------------- */
 extern void mr_capi_boot(void);
 static int booted;
@@ -642,7 +746,7 @@ void *rb_ext_resolve_symbol(const char *feature, const char *symbol) {
         const char *dot = strrchr(path, '.');
         size_t stem = dot ? (size_t)(dot - path) : strlen(path);
         if (stem >= n && !strncmp(path + stem - n, feature, n) && (stem == n || path[stem - n - 1] == '/'))
-            return dlsym(libraries[i].handle, symbol);
+            return dlsym(libraries[i].handle ? libraries[i].handle : RTLD_DEFAULT, symbol);
     }
     VALUE name = rb_str_new(feature, (long)n);
     VALUE loaded = mr_call(mr_ruby("->(name) { $LOADED_FEATURES.any? { |f| f == name + '.so' || f == name + '.rb' || f.end_with?('/' + name + '.rb') } }"),
@@ -678,6 +782,21 @@ char *mr_capi_exe(void) {
 char *mr_capi_libc(void) {
 #ifdef __GLIBC__
     return "gnu";
+#else
+    return "";
+#endif
+}
+
+/* The OpenSSL installation this interpreter was linked against, where the
+ * build named one (tools/build.sh: OPENSSL_PREFIX, or Homebrew's openssl@3):
+ * "" when the compiler found OpenSSL on its own paths or through pkg-config.
+ * RbConfig says it as ruby's configure would have been told it,
+ * --with-openssl-dir, which is what mkmf's dir_config("openssl") reads -- an
+ * extension that brings its own TLS (puma's MiniSSL) then builds against the
+ * OpenSSL the interpreter's own openssl library uses. */
+char *mr_capi_openssl_dir(void) {
+#ifdef MR_OPENSSL_DIR
+    return MR_OPENSSL_DIR;
 #else
     return "";
 #endif

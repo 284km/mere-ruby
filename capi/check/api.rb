@@ -22,6 +22,20 @@ end
 A = ApiFixture
 check(said == '')
 
+# Native flags never call a Ruby predicate, including during mirror refresh.
+[-> { Class.new }, -> { Module.new }, -> { Object.new }, -> { +'' },
+ -> { [] }, -> { {} }, -> { proc {} }, -> { binding }].each do |factory|
+  owner = factory.call
+  $frozen_flag_queries = 0
+  owner.define_singleton_method(:frozen?) { $frozen_flag_queries += 1; false }
+  check(!A.frozen_flags(owner, 0))
+  owner.freeze
+  check(A.frozen_flags(owner, 0))
+  check(A.frozen_flags(factory.call, 1))
+  check(A.frozen_flags(factory.call, 2) { |value| value.freeze })
+  check($frozen_flag_queries == 0)
+end
+
 # C's constant APIs also accept hidden cache names, as io-console's
 # IO.console does. Ruby's own constant lookup must continue to reject them.
 class HiddenConstParent; end
@@ -98,6 +112,9 @@ check([s1, s2] == ['Xbc', 'Ybc'])
 class OverArray < Array
   def push(*) = :intercepted
   def [](*) = :intercepted
+  def []=(*)
+    :intercepted
+  end
 end
 class OverString < String
   def <<(other) = :intercepted
@@ -129,6 +146,40 @@ check(oh.fetch(:k) == 1)
 oo = OverObject.new
 A.freeze(oo)
 check(oo.frozen?)
+# rb_ary_store and rb_obj_freeze are ruby's operations, with no method called
+# (an Array at its end is appended and a String, an Array or a Hash frozen by
+# a flag here; anything else is the builtin's call): at the end, past it
+# (nil between), in the middle, from the end, too far from the end, on a
+# frozen Array; a subclass's #[]= and #freeze are not called
+check(A.store([1, 2], 2, 3) == [1, 2, 3] && A.store([1], 3, 4) == [1, nil, nil, 4])
+check(A.store([1, 2, 3], 1, :b) == [1, :b, 3] && A.store([1, 2, 3], -1, :z) == [1, 2, :z])
+e = raises(IndexError) { A.store([1, 2], -3, 0) }
+check(e.message == 'index -3 too small for array; minimum: -2')
+e = raises(FrozenError) { A.store([1, 2].freeze, 2, 3) }
+check(e.message == "can't modify frozen Array: [1, 2]")
+ox = OverArray.new
+check(A.store(ox, 0, :a).to_a == [:a] && A.store(ox, 1, :b).to_a == [:a, :b])
+fa = [1]
+fh = { a: 1 }
+fs = +'s'
+A.freeze(fa); A.freeze(fh); A.freeze(fs)
+check(fa.frozen? && fh.frozen? && fs.frozen?)
+e = raises(FrozenError) { fs << 'x' }
+check(e.message == "can't modify frozen String: \"s\"")
+list, len, last, frozen = A.row(5)
+check(list == [0, 'text', 2, 'text', 4] && len == 5 && last == 4 && frozen && list.frozen?)
+check(list[1].frozen? && A.row(0) == [[], 0, nil, true])
+# rb_default_internal_encoding answers what Encoding.default_internal was
+# last set to, nil when it was cleared
+verbose = $VERBOSE
+$VERBOSE = nil
+before = Encoding.default_internal
+Encoding.default_internal = 'ISO-8859-1'
+check(A.default_internal == Encoding::ISO_8859_1)
+Encoding.default_internal = nil
+check(A.default_internal.nil?)
+Encoding.default_internal = before
+$VERBOSE = verbose
 check(A.kind_of(oo, String) == false)
 single = [1]
 def single.push(*) = :intercepted
@@ -290,6 +341,13 @@ check(A.class_of(SubString.new('x')) == SubString)
 check(A.class_of(SubArray.new([1])) == SubArray)
 check(A.class_of(SubHash.new) == SubHash)
 check(A.class_of('plain') == String && A.class_of([]) == Array && A.class_of({}) == Hash)
+# CLASS_OF of a class is its metaclass, which CRuby makes with every class,
+# and a class variable of a module it includes is read through it
+# (cgi/escape's @@accept_charset)
+module CvarM; @@cv = :from_module; end
+class CvarC; include CvarM; end
+check(A.class_of(CvarC) == CvarC.singleton_class && A.class_of(CvarC).singleton_class?)
+check(A.cvar_of_class_of(CvarC, '@@cv') == :from_module)
 # (what io-console and prism asked for: ruby_version is RUBY_VERSION; the
 #  write IO of a plain IO is itself; nothing is pending before a read, and
 #  what a partial read left buffered is)
@@ -674,4 +732,40 @@ check(A.capacity(s) == 5000 && s == 'abc')
 buf = String.new
 File.open(__FILE__) { |f| f.read(70000, buf) }
 check(A.capacity(buf) == 70000 && buf == File.binread(__FILE__))
+# What C holds only in its locals survives every collection the requests it
+# makes can run (mr_up's safepoint): a String and an Array C made, across
+# 120 Strings made and dropped and 120 calls -- and the same with the call
+# paused halfway in a Fiber while the program makes garbage and collects.
+digits = (0...120).sum { |i| i.to_s.size }
+names = (0...8).map { |i| "e#{i}" }
+held, ary, sum = A.hold_locals(120)
+check(held == 'held-string' && ary == names && sum == digits)
+paused = Fiber.new { A.hold_locals(120) { |i| Fiber.yield(i) } }
+check(paused.resume == 60)
+junk = (0...200).map { |i| ('x' * 4096) + i.to_s }
+junk = nil
+GC.start
+held, ary, sum = paused.resume
+check(held == 'held-string' && ary == names && sum == digits && !paused.alive?)
+# What C writes into a frozen String's buffer is that String's bytes, as in
+# ruby: the write-back raised FrozenError out of the C call instead
+s = (+'abc').freeze
+seen, same = A.write_frozen(s)
+check(seen == 'Zbc' && same.equal?(s) && s == 'Zbc' && s.frozen?)
+# A long C call that makes its garbage through the C API alone is collected
+# in as it goes, as ruby's malloc limit collects in it: with no Ruby
+# statement in it there was no safepoint here, and puma's parser held
+# gigabytes until it returned (mr_up's safepoint)
+joined, collections = A.join_in_c(400)
+check(joined == (['test'] * 400).join(', ') && collections > 0)
+# What C was lent stays where it was and as it was across the collections in
+# the middle of the call that was lent it, and what C holds only in its
+# locals outlives them: a String past any struct's room (its own buffer)
+# and one in the struct, each with collections in the call
+[+('lent' * 25_000), +'short'].each do |s|
+  rest = s[1..]
+  same, intact, held, ary, seen, collections = A.lent_across_collections(s, 400)
+  check(same && intact && held == 'held-only-in-c' && ary == %w[a b] && collections > 0)
+  check(seen == 'W' + rest && s == 'W' + rest)
+end
 puts "api contracts: #{$count} passed"

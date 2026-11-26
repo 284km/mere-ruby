@@ -65,8 +65,11 @@ enum mr_op {
     MR_RAT_RAW = 29,    /* a: numerator, b: denominator (Integers) -> that Rational, not reduced */
     MR_NOTIMPL = 30,    /* a: class, b: 0 its method, 1 its singleton's, 2 both; text: name -- rb_f_notimplement */
     MR_SYM_STATE = 31,  /* a: String or Symbol -> 0 not a Symbol, 1 a dynamic one, 2 pinned down */
-    MR_IVAR_READ = 32   /* a: an object; text: an ivar's name -> its value, read from the table with no
+    MR_IVAR_READ = 32,  /* a: an object; text: an ivar's name -> its value, read from the table with no
                          * dispatch -- the collector's reader only (a dmark between C calls) */
+    MR_SAFEPOINT = 33,  /* (nothing) -- a collection may run here, when one is due (mr_up); -> how many to pass over */
+    MR_FREEZE = 34,     /* a: object -> 1 frozen, 2 a String frozen now, 0 not a String/Array/Hash (send #freeze) */
+    MR_ARY_APPEND = 35  /* a: Array, b: index, c: value -> 1 stored at the end, 0 (send #[]=) */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
@@ -94,6 +97,11 @@ void mr_put_words(long n, const VALUE *words);
 VALUE mr_word(long i);
 void mr_put_bytes(const void *p, long n);
 const mere_bytes *mr_got_bytes(void);
+/* Where the next request's answer goes when it is a String's bytes
+ * (MR_STR_GET): `take` gets the interpreter's own bytes while the request
+ * runs, instead of a copy in transit; `taken` says it was called. */
+struct mr_give_to { void (*take)(struct mr_give_to *, const char *, long); long number; int taken; };
+void mr_give_next(struct mr_give_to *to);
 void mr_put_text(const char *text);
 const char *mr_got_text(void);
 void mr_put_dbl(double d);
@@ -137,6 +145,7 @@ int mr_without(const char *what);
 int mr_capi_calling(void);
 /* Whether a dmark is running with no C call in progress: nobody to ask (mirror.c). */
 int mr_capi_mark_unasked(void);
+int mr_capi_marking(void);
 /* An API this C side does not provide: NotImplementedError, never a guess. */
 RBIMPL_ATTR_NORETURN() void mr_unsupported(const char *what);
 
@@ -153,6 +162,10 @@ extern unsigned long mr_epoch;
 /* The String's bytes changed on the interpreter's side by this C's own
  * request: nothing to write back, and the struct is stale. */
 void mr_mirror_forget(VALUE obj);
+/* extensions linked into this executable (static_ext.c) */
+struct mr_static_ext { const char *feature; void (*init)(void); };
+extern const struct mr_static_ext mr_static_exts[];
+int mr_capi_static_open(const char *feature);
 void mr_mirror_frozen_by_c(VALUE obj);
 
 long mr_string_capacity(VALUE str);
