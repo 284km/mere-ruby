@@ -131,3 +131,14 @@ origin retirement, plus the complete Method ivar API port and new main
 runtime changes. The parent focused controls pass; this combined ownership
 source remains unbuilt and needs its own complete validation before a push.
 Only source and git work takes place during parent allocation measurements.
+
+## Current main and anonymous-rest dependency
+
+Integrate main 6d8a416d and anonymous-rest source bd5d4b09. Keep the current
+frame-area argument slot, native ivar doors and both independent argument
+provenance protocols. PR 251 is a dependency until it merges. Earlier
+893-program, allocation, instruction and RSS figures are historical; they
+are not acceptance of this combined source. Rebuild and validate the complete
+994/995/987 regressions and bare-super review controls, affected whole files
+on both engines, allocation alone, controlled RSS and instruction profiles,
+then the serial full corpus and VM sweep before the next batched push.
