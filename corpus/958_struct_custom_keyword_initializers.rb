@@ -44,6 +44,7 @@ end
 [DirectKeywordStruct, SuperKeywordStruct, RestKeywordStruct, HashArgumentStruct,
  FalseKeywordStruct, TrueKeywordStruct, NilKeywordStruct].each do |klass|
   p [klass.name, klass.new(a: 1, b: 2).to_a]
+  p [:bracket, klass.name, klass[a: 3, b: 4].to_a]
 end
 
 class InheritedKeywordStruct < DirectKeywordStruct
