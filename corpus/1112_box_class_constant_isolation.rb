@@ -87,6 +87,59 @@ child = <<~'CODE'
   eval(labels)
   first.eval(labels)
   second.eval(labels)
+  lexical_eval = <<~'RUBY'
+    module LexOuter1112
+      X = :outer
+      module Scoped; end
+      def self.make
+        eval('class Inner; p [X, Module.nesting.map(&:name)]; end')
+      end
+      def self.make_bound
+        eval('module BoundInner; p [X, Module.nesting.map(&:name)]; end', binding)
+      end
+      def self.make_qualified
+        eval('class Scoped::Qualified; p [X, Module.nesting.map(&:name)]; end')
+      end
+      def self.make_raising
+        begin
+          eval('class Raised; p X; raise "scope"; end')
+        rescue RuntimeError
+          eval('p [X, Module.nesting.map(&:name)]')
+        end
+      end
+    end
+    LexOuter1112.make
+    LexOuter1112.make_bound
+    LexOuter1112.make_qualified
+    LexOuter1112.make_raising
+    p Module.nesting.map(&:name)
+  RUBY
+  eval(lexical_eval)
+  first.eval(lexical_eval)
+  second.eval(lexical_eval)
+  missing = <<~'RUBY'
+    begin
+      module PublicOuter1112
+        class PublicInner
+          Absent
+        end
+      end
+    rescue NameError => error
+      p [error.name, error.receiver.name, error.message.lines.first.chomp,
+         error.backtrace_locations.first.label]
+    end
+    begin
+      class PublicOuter1112::BasicInner < BasicObject
+        Object
+      end
+    rescue NameError => error
+      p [error.name, error.receiver.name, error.message.lines.first.chomp,
+         error.backtrace_locations.first.label]
+    end
+  RUBY
+  eval(missing)
+  first.eval(missing)
+  second.eval(missing)
 CODE
 print IO.popen([{'RUBY_BOX' => '1'}, RbConfig.ruby, '-W0', '-e', child, err: File::NULL], &:read)
 p $?.exitstatus

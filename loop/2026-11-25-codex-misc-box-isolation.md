@@ -114,3 +114,51 @@ the following completed r12 acceptance uses the final label-corrected binary.
 
 All three review corrections, expanded regression and completed record are
 pushed together. No full unit/Rails suite or workflow change.
+
+## Follow-up review: eval nesting and bare constant error owners
+
+The new internal-identity registration path now uses with_env_nest on the
+actual caller environment before register_class_lex pushes the new class.
+This preserves a method or binding's saved lexical identities for string
+eval and restores the enclosing nesting when a class body raises. It uses
+the same existing scope helper as ordinary class registration.
+
+Bare-constant NameErrors now render the actual owner's stored/display
+name, including the BasicObject lookup path. The receiver remains the real
+owner identity. The earlier class/module frame-label correction is kept.
+
+Corpus 1112 adds method eval, explicit binding, qualified class opening,
+exception restoration and nested bare-constant messages in the main box
+and two child boxes. All 68 rows match clean Ruby 4.0.10 on both engines,
+including parent RUBY_BOX=1 and hash index ON/OFF. Corpus 1057 (72 rows),
+1061 (44), 1062 (22) and parent-Box lexical-autoload corpus 736 also match.
+Only the exact executable prefix of the experimental warning is normalized.
+
+Unchanged original ruby/test_box.rb selections pass 4 tests / 53 assertions
+on reference and both candidates; matching main f4303e14 has 4 / 8, one
+Timeout::State::GET_TIME error. Additional unchanged ruby/test_eval.rb
+selections eval_basic, eval_binding_basic, module_eval_string_basic and
+instance_eval_string_basic pass 4 / 145 on reference, main and both
+candidates. Each file runs separately with RUBY_BOX=1 and --seed=1.
+
+| Tight-GC max RSS bytes | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Box four selections | 33947648 | 241631232 | 279216128 | 256229376 | 279592960 |
+| Eval four selections | 26017792 | 172769280 | 167084032 | 174637056 | 168984576 |
+
+The Box candidate completes 45 extra assertions and additional library
+loading; those process maxima are not a matched-workload growth claim.
+Final ordinary O2 SHA-256:
+eb761784e8fd2defec956d3d9bb1499c97ec91a7b38d8c018688a46badefb79b.
+All eight source gates, bracket depth, full/explicit record_hygiene and
+whitespace checks pass before this completed focused-record update.
+Final r13 acceptance uses this exact binary:
+
+- sh run_corpus.sh --both: 965/965 PASS, hash index ON/OFF, exit 0.
+- MERE_RUBY_VM=1 sh run_corpus.sh --both: 965/965 PASS, ON/OFF, exit 0.
+- All eight source gates and generated-C bracket depth PASS.
+- Full and explicit completed-loop record_hygiene and whitespace PASS.
+
+These final r13 sweeps validate the eval-nesting and bare-error corrections;
+earlier r12 sweeps remain historical. Code, expanded corpus and completed
+record are pushed together. No full unit/Rails suite or workflow change.
