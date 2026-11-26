@@ -277,3 +277,299 @@ def isolate_no_kw_995(*, **nil) = Ractor.shareable_proc { [*] }
   check_anonymous_isolation([:keyword_method_frozen_value, kind]) { isolate.call(*[1].freeze) }
   check_anonymous_isolation([:keyword_method_nil, kind]) { isolate.call(*nil) }
 end
+
+# A literal **{} snapshots even for plain rest; **empty and **nil retain
+# the source. Potentially mutating keyword expressions snapshot too.
+def report_snapshot_995(label)
+  value = yield
+  p [label, value]
+rescue => error
+  p [label, error.class, error.message]
+end
+def matrix_plain_995(*) = proc { [*] }
+def iso_plain_995(*) = Ractor.shareable_proc { [*] }
+report_snapshot_995([:plain, :no_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_plain_995(*source)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:plain, :no_keywords, :isolation]) do
+  empty = {}
+  value = iso_plain_995(*[].freeze)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:plain, :empty_literal]) do
+  source = [1]; empty = {}
+  kept = matrix_plain_995(*source, **{})
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:plain, :empty_literal, :isolation]) do
+  empty = {}
+  value = iso_plain_995(*[].freeze, **{})
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:plain, :empty_variable]) do
+  source = [1]; empty = {}
+  kept = matrix_plain_995(*source, **empty)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:plain, :empty_variable, :isolation]) do
+  empty = {}
+  value = iso_plain_995(*[].freeze, **empty)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:plain, :nil_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_plain_995(*source, **nil)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:plain, :nil_keywords, :isolation]) do
+  empty = {}
+  value = iso_plain_995(*[].freeze, **nil)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:plain, :literal_keyword]) do
+  source = [1]; empty = {}
+  kept = matrix_plain_995(*source, option: 1)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:plain, :literal_keyword, :isolation]) do
+  empty = {}
+  value = iso_plain_995(*[].freeze, option: 1)
+  [value.class, Ractor.shareable?(value)]
+end
+def matrix_anon_kw_995(*, **) = proc { [*] }
+def iso_anon_kw_995(*, **) = Ractor.shareable_proc { [*] }
+report_snapshot_995([:anon_kw, :no_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_anon_kw_995(*source)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:anon_kw, :no_keywords, :isolation]) do
+  empty = {}
+  value = iso_anon_kw_995(*[].freeze)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:anon_kw, :empty_literal]) do
+  source = [1]; empty = {}
+  kept = matrix_anon_kw_995(*source, **{})
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:anon_kw, :empty_literal, :isolation]) do
+  empty = {}
+  value = iso_anon_kw_995(*[].freeze, **{})
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:anon_kw, :empty_variable]) do
+  source = [1]; empty = {}
+  kept = matrix_anon_kw_995(*source, **empty)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:anon_kw, :empty_variable, :isolation]) do
+  empty = {}
+  value = iso_anon_kw_995(*[].freeze, **empty)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:anon_kw, :nil_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_anon_kw_995(*source, **nil)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:anon_kw, :nil_keywords, :isolation]) do
+  empty = {}
+  value = iso_anon_kw_995(*[].freeze, **nil)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:anon_kw, :literal_keyword]) do
+  source = [1]; empty = {}
+  kept = matrix_anon_kw_995(*source, option: 1)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:anon_kw, :literal_keyword, :isolation]) do
+  empty = {}
+  value = iso_anon_kw_995(*[].freeze, option: 1)
+  [value.class, Ractor.shareable?(value)]
+end
+def matrix_named_kw_995(*, option: 0) = proc { [*] }
+def iso_named_kw_995(*, option: 0) = Ractor.shareable_proc { [*] }
+report_snapshot_995([:named_kw, :no_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_named_kw_995(*source)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_kw, :no_keywords, :isolation]) do
+  empty = {}
+  value = iso_named_kw_995(*[].freeze)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_kw, :empty_literal]) do
+  source = [1]; empty = {}
+  kept = matrix_named_kw_995(*source, **{})
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_kw, :empty_literal, :isolation]) do
+  empty = {}
+  value = iso_named_kw_995(*[].freeze, **{})
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_kw, :empty_variable]) do
+  source = [1]; empty = {}
+  kept = matrix_named_kw_995(*source, **empty)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_kw, :empty_variable, :isolation]) do
+  empty = {}
+  value = iso_named_kw_995(*[].freeze, **empty)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_kw, :nil_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_named_kw_995(*source, **nil)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_kw, :nil_keywords, :isolation]) do
+  empty = {}
+  value = iso_named_kw_995(*[].freeze, **nil)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_kw, :literal_keyword]) do
+  source = [1]; empty = {}
+  kept = matrix_named_kw_995(*source, option: 1)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_kw, :literal_keyword, :isolation]) do
+  empty = {}
+  value = iso_named_kw_995(*[].freeze, option: 1)
+  [value.class, Ractor.shareable?(value)]
+end
+def matrix_named_rest_995(*, **options) = proc { [*] }
+def iso_named_rest_995(*, **options) = Ractor.shareable_proc { [*] }
+report_snapshot_995([:named_rest, :no_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_named_rest_995(*source)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_rest, :no_keywords, :isolation]) do
+  empty = {}
+  value = iso_named_rest_995(*[].freeze)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_rest, :empty_literal]) do
+  source = [1]; empty = {}
+  kept = matrix_named_rest_995(*source, **{})
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_rest, :empty_literal, :isolation]) do
+  empty = {}
+  value = iso_named_rest_995(*[].freeze, **{})
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_rest, :empty_variable]) do
+  source = [1]; empty = {}
+  kept = matrix_named_rest_995(*source, **empty)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_rest, :empty_variable, :isolation]) do
+  empty = {}
+  value = iso_named_rest_995(*[].freeze, **empty)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_rest, :nil_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_named_rest_995(*source, **nil)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_rest, :nil_keywords, :isolation]) do
+  empty = {}
+  value = iso_named_rest_995(*[].freeze, **nil)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:named_rest, :literal_keyword]) do
+  source = [1]; empty = {}
+  kept = matrix_named_rest_995(*source, option: 1)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:named_rest, :literal_keyword, :isolation]) do
+  empty = {}
+  value = iso_named_rest_995(*[].freeze, option: 1)
+  [value.class, Ractor.shareable?(value)]
+end
+def matrix_no_kw_995(*, **nil) = proc { [*] }
+def iso_no_kw_995(*, **nil) = Ractor.shareable_proc { [*] }
+report_snapshot_995([:no_kw, :no_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_no_kw_995(*source)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:no_kw, :no_keywords, :isolation]) do
+  empty = {}
+  value = iso_no_kw_995(*[].freeze)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:no_kw, :empty_literal]) do
+  source = [1]; empty = {}
+  kept = matrix_no_kw_995(*source, **{})
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:no_kw, :empty_literal, :isolation]) do
+  empty = {}
+  value = iso_no_kw_995(*[].freeze, **{})
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:no_kw, :empty_variable]) do
+  source = [1]; empty = {}
+  kept = matrix_no_kw_995(*source, **empty)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:no_kw, :empty_variable, :isolation]) do
+  empty = {}
+  value = iso_no_kw_995(*[].freeze, **empty)
+  [value.class, Ractor.shareable?(value)]
+end
+report_snapshot_995([:no_kw, :nil_keywords]) do
+  source = [1]; empty = {}
+  kept = matrix_no_kw_995(*source, **nil)
+  source << 2; source[0] = 9; GC.start
+  kept.call
+end
+report_snapshot_995([:no_kw, :nil_keywords, :isolation]) do
+  empty = {}
+  value = iso_no_kw_995(*[].freeze, **nil)
+  [value.class, Ractor.shareable?(value)]
+end
+
+def keyword_source_mutation_995(source, result)
+  source << 2
+  source[0] = 9
+  GC.start
+  result
+end
+keyword_callback_source = [1]
+keyword_callback_capture = matrix_anon_kw_995(*keyword_callback_source, **keyword_source_mutation_995(keyword_callback_source, {}))
+p [:keyword_splat_callback_snapshot, keyword_callback_capture.call, keyword_callback_source]
+keyword_value_source = [1]
+keyword_value_capture = matrix_named_kw_995(*keyword_value_source, option: keyword_source_mutation_995(keyword_value_source, 1))
+p [:keyword_value_callback_snapshot, keyword_value_capture.call, keyword_value_source]

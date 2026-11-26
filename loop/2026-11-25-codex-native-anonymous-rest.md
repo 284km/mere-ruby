@@ -1,3 +1,13 @@
+The first follow-up build matched the 94-line corpus and the exact direct
+review witnesses, but an additional 48-control private matrix exposed empty
+keyword distinctions. A literal **{} snapshots the Array; an empty variable
+or **nil can retain it. Follow compile.c's existing expression classification
+for keyword key/value/splat evaluation, reusing the block-pass predicate and
+the existing empty-keyword note. Keep snapshots as native immutable slices.
+The matrix and keyword-expression mutation/GC witnesses are now in corpus
+995. This iteration is unbuilt; earlier partial focus passes are not final
+acceptance, and no new code push is made before the complete checks pass.
+
 # Follow-up review: keyword declarations without keyword arguments
 
 The review of 457a91b3 found that borrowing an unaccompanied positional
