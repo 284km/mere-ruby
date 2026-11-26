@@ -1,3 +1,6 @@
+# (frozen string literals: tools/gen_psych_lib.rb puts the magic comment at the
+#  top of the embedded source. An empty scalar's value is +'', as libyaml's is
+#  not frozen.)
 # YAML event parsing has its own state; loading Ruby objects is a separate visitor.
 module Psych
   class SyntaxError < Exception
@@ -274,7 +277,7 @@ module Psych
     end
 
     def __empty(at, anchor = nil, tag = nil)
-      __event(:scalar, ['', anchor, tag, tag.nil?, false, 1], at, at)
+      __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], at, at)
     end
 
     def __scan
@@ -439,7 +442,7 @@ module Psych
         value = value.join
         value = value.sub(/\n*\z/, '') if modifiers.include?('-')
         value = value.sub(/\n*\z/, "\n") unless modifiers.include?('-') || modifiers.include?('+') || value.empty?
-        value = '' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
+        value = +'' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
         return [:scalar, value, start, __at, style]
       end
       __error('found character that cannot start any token') if ['`', '@', '%', "\t"].include?(c)
@@ -501,7 +504,7 @@ module Psych
         token = __peek
       end
       if property_end && ([:eof, :document, :end_document].include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))
-        return __event(:scalar, ['', anchor, tag, tag.nil?, false, 1], start, property_end)
+        return __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], start, property_end)
       end
       if token[0] == :sequence || token[0] == :mapping
         opener = __take
