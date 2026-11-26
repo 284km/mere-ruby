@@ -14,6 +14,14 @@ This changes what the door does. An object's variables are no longer keys `"<id>
 - **Free lists**: an area given back (a dead object's, at the collector's sweep, or one an object outgrew) is emptied and put on its size's free list; the next area of that size reuses it. The free list is threaded through the areas themselves: an empty area's first slot holds the next one.
 - **What never shrinks**: the slab's length is its high-water mark (the free lists reuse it; nothing returns it). The shape tree, the name numbers (`iv_nm`) and the remembered slots are never given back either. That is what the bounds below are for.
 
+### A class's counts are swept with the class
+
+Two tables beside the shapes are kept by the class's name: `sh_cls_var` (the variations it has made) and `sh_cls_cap` (its area size).
+The shape bound does not bound them: `k = Class.new; k.new.instance_variable_set(:@x, 1)` a turn adds a key and no shape.
+`gc_sweep_classes` drops a dead class's keys from both, as it does from the class's other tables (#322's review).
+`run_corpus.sh` runs `tools/shape_class_tables_check.rb` first, with `MERE_RUBY_STORE_STATS=1`: 3,000 classes made and dropped must leave at most 300 keys in each.
+Without the sweep `sh_cls_cap` held 6,004; with it 34.
+
 ## Removing a variable
 
 `remove_instance_variable` leaves a mark in the slot (`iv_absent`, a Proc with handle -1, which no Ruby value is) and the shape as it was. Every reader asks `iv_slot_read`, which reads the mark as "not there"; the listing and the collector's marking skip it.

@@ -35,7 +35,20 @@ case "$errno_out" in
              echo "an Errno class has no strerror text -- see errno_desc in main.mere"
              exit 1;;
 esac
-# A second self-check: every global map that holds object handles is a GC root
+# A class's counts beside the shapes (sh_cls_var, sh_cls_cap) are kept by its
+# name and nothing bounds them but the collector: 3,000 classes made and
+# dropped, each with objects of two shapes, and an object's singleton class
+# each turn, must leave a few hundred keys at most. Before the sweep dropped
+# them (note 559 step 2b, #322's review) every class left its keys for good.
+shape_out="$(MERE_RUBY_STORE_STATS=1 env ${mere_rubylib:+RUBYLIB="$mere_rubylib"} "$MR_BIN" tools/shape_class_tables_check.rb 2>&1 >/dev/null || true)"
+for row in sh_cls_var sh_cls_cap; do
+  n="$(printf '%s\n' "$shape_out" | awk -v r="$row" '$1 == r { print $2 }')"
+  if [ -z "$n" ] || [ "$n" -gt 300 ]; then
+    echo "$row holds ${n:-no row} keys after 3,000 dropped classes (tools/shape_class_tables_check.rb): a dead class's keys are not swept"
+    exit 1
+  fi
+done
+# Another self-check: every global map that holds object handles is a GC root
 # (or is named, with its reason, in tools/gc_roots_allow.txt). The table that
 # was missing from the roots on 2026-09-03 cost `require "bundler"` two weeks.
 # MR_C, when the caller has just emitted one, so this reads the tree it is
