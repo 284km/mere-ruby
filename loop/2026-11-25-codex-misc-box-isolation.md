@@ -53,3 +53,64 @@ remain outside this class-identity fix; no feature entry is fabricated.
 The integration and completed record are pushed together after the local
 checks. No full unit or Rails suite, reference gem installation or workflow
 change. Main commits after the pinned integration are not claimed tested.
+
+## Review corrections: actual scoped and absolute constant identity
+
+Absolute qualified paths resolve their actual root head and then follow
+that receiver's namespace. Relative scoped reads walk actual lexical
+identities before textual map-name shortcuts, including lexical autoloads.
+An internal anonymous superclass identity from SClassExpr is already a
+resolved Class; it is not looked up as a named root constant. The ordinary
+non-Box path is unchanged. No guessed constant or cross-Box class sharing.
+
+Expanded corpus 1112 has 29 rows. It and lifetime controls 1057, 1061,
+1062 match stdout, stderr and status on both engines. 1112 and lexical
+autoload corpus 736 also match with the parent process in RUBY_BOX=1,
+evaluator/VM and hash index ON/OFF, including real warning lines.
+
+Unchanged original ruby/test_box.rb, four class/constant selections,
+fixed --seed=1 and tight GC: reference and candidate both engines
+4 tests / 53 assertions PASS; main f4303e14 both engines 4 / 8, one error.
+
+| Max RSS bytes | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original Box selection | 33734656 | 242237440 | 282902528 | 255328256 | 279511040 |
+
+The candidate actually completes all 53 assertions, while main stops
+early at the known error, so these are process maxima rather than a
+same-workload heap delta. Final ordinary O2 SHA-256 and full corpus
+acceptance are recorded after the pending sweeps. Earlier 965 totals
+from the pre-review binary do not validate this revision.
+
+## Review correction: public class and module frame labels
+
+The additional Minor is fixed too. Class-body frame labels use the actual
+constant-assigned name stored for the internal identity, without invoking
+an overridden Module#name. The module/class tag still comes from the actual
+identity. Corpus 1112 now has 44 rows, including class/module frame labels,
+name, inspect and missing-constant messages, in the main box and two child
+boxes. Its stdout, stderr and status match clean Ruby on both engines.
+The 1057/1061/1062 lifetime controls pass again, and 1112/736 also match with
+RUBY_BOX=1 on both engines and hash indexing ON/OFF.
+
+Unchanged original Box selections still pass 4 tests / 53 assertions on
+reference and both candidates; main f4303e14 has 4 / 8 and one error.
+Tight GC, --seed=1, max RSS bytes:
+
+| Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| ---: | ---: | ---: | ---: | ---: |
+| 33718272 | 241483776 | 281853952 | 255737856 | 277790720 |
+
+Different completed assertion counts mean these are process maxima, not a
+same-workload heap-growth claim. Current ordinary O2 SHA-256:
+b82c81d6f3153dc78edc2ab1c2be6b11ec3f990b2a143bf31a2047066ecb1bdf.
+The r11 sweeps passed 965/965 on both engines before this final label fix;
+the following completed r12 acceptance uses the final label-corrected binary.
+
+- `sh run_corpus.sh --both`: 965/965, hash index ON/OFF, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: 965/965, ON/OFF, exit 0.
+- Eight source gates, generated-C bracket depth, full and explicit loop
+  record_hygiene, and whitespace checks: PASS.
+
+All three review corrections, expanded regression and completed record are
+pushed together. No full unit/Rails suite or workflow change.

@@ -3095,7 +3095,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        then map_get consts (anc_const_key world "Object" n)
        else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
        // (...and a path whose head is now defined is read as one)
-       else if str_contains n "::" && map_has consts (const_head n) then eval_e env world blk (EConst n)
+       else if str_contains n "::" && map_has consts (const_head n) then
+         scoped_namespace_tail env world blk
+           (eval_e env world blk (EConst ("::" ++ const_head n))) (const_tail n)
        // (a path whose head names nothing: the head is the error, as ruby
        //  reads `::Nope::Thing` left to right -- "uninitialized constant Nope")
        else if str_contains n "::" then eval_e env world blk (EConst ("::" ++ const_head n))
@@ -3103,6 +3105,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
     else if str_contains name "::" then
+      if vec_get box_st 0 == 1 then
+        (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") else cur_lex ()) in
+         let key9 = const_walk_head env world blk cref9 (const_head name) in
+         let value9 = (if str_eq key9 "" then eval_e env world blk (EConst (const_head name))
+                       else (let _ = const_read_note world key9 in map_get consts key9)) in
+         scoped_namespace_tail env world blk value9 (const_tail name))
+      else
       // the scope operator is exactly what `private_constant` closes off; the
       // lexical name (the `else` branch below) still reads it.
       (if map_has private_consts name then
@@ -15206,6 +15215,24 @@ and const_walk = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (name: str
 // the first segment: lexically scoped, top level, or still only an autoload.
 // "" means it could not be resolved at all.
 and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head: str) ->
+  // Internal box identities are not textual namespace prefixes. Search each
+  // actual lexical scope for a constant OR autoload before going outward.
+  let nested9 = (if vec_get box_st 0 == 1 then
+                   (let nesting9 = (if lv_has env "__nest" then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "")
+                                    else if lv_has env "__meth" then "" else cur_nest ()) in
+                    let rec scopes9 = fn (ns9: str list) ->
+                      match ns9 with
+                      | Nil -> ""
+                      | Cons (scope9, rest9) ->
+                        if str_eq scope9 "" then scopes9 rest9 else
+                        (let key9 = (if str_eq scope9 "Object" then head else scope9 ++ "::" ++ head) in
+                         let _ = (if autoload_busy_other key9 then (let _ = autoload_fire env world blk key9 in ()) else ()) in
+                         if map_has consts key9 then key9
+                         else if map_has autoloads key9 && autoload_fire env world blk key9 && map_has consts key9 then key9
+                         else scopes9 rest9) in
+                    scopes9 (str_split nesting9 (chr 10)))
+                 else "") in
+  if (if str_eq nested9 "" then false else true) then nested9 else
   let _ = (if autoload_busy_other head then (let _ = autoload_fire env world blk head in ()) else ()) in
   // (an autoload registered in a scope nearer than the constant the walk
   //  found is read first, as ruby asks each scope for a constant or an
@@ -52542,16 +52569,25 @@ and named_class_of_al = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (nm
   //  scope holds: activerecord's test models have `module Namespaced; class
   //  Company < ::Company; end; class Firm < ::Company; end; end`, and Firm
   //  became a subclass of Namespaced::Company)
-  if str_len nm > 2 && str_eq (substring nm 0 2) "::" then named_class_of_al env world blk "" (substring nm 2 (str_len nm))
+  if vec_get box_st 0 == 1 && str_contains nm "::" then
+    // Follow actual namespace values, including const_missing results, before
+    // deriving the internal class identity. Keep an absolute head rooted.
+    (let root9 = str_starts_with nm "::" in
+     let path9 = (if root9 then substring nm 2 (str_len nm) else nm) in
+     let head9 = const_head path9 in
+     let (_, parents9, _, _) = world in
+     // A runtime superclass can already be an internal identity, including
+     // the root marker inserted by SClassExpr. It is not a constant read.
+     let value9 = (if is_anon_cls head9 && (map_has parents9 head9 || map_has modules head9) then VClass head9
+                   else if root9 then eval_e env world blk (EConst ("::" ++ head9))
+                   else (let key9 = const_walk_head env world blk cref head9 in
+                         if str_eq key9 "" then eval_e env world blk (EConst head9)
+                         else map_get consts key9)) in
+     match scoped_namespace_tail env world blk value9 (const_tail path9) with
+     | VClass actual9 -> actual9
+     | other9 -> (let _ = raise_exc world "TypeError" (inspect_w env world other9 ++ " is not a class/module") in nm))
+  else if str_len nm > 2 && str_eq (substring nm 0 2) "::" then named_class_of_al env world blk "" (substring nm 2 (str_len nm))
   else
-  // A box gives each nested module an independent internal identity. Follow
-  // every constant binding before treating a qualified display name as a
-  // class key (the VM's include path also asks this resolver).
-  let boxed9 = (if vec_get box_st 0 == 1 && str_contains nm "::"
-                then const_walk env world blk cref nm else VNil) in
-  match boxed9 with
-  | VClass actual9 -> actual9
-  | _ ->
   let r = named_class_of cref nm in
   if near_autoload_fire env world blk cref nm then named_class_of cref nm
   else
@@ -63493,11 +63529,16 @@ and scope_frame_pop = fn (cd: int) ->
   cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "")
 // `<class:Name>` / `<module:Name>`: the last segment of the name
 and scope_label_of = fn (cls: str) ->
+  // Box classes keep an internal identity, but frames use the actual name
+  // assigned by their constant binding, without invoking an overridden #name.
+  let name9 = (if map_has anon_name cls then
+                 (match map_get anon_name cls with VStr h9 -> sget h9 | _ -> cls)
+               else cls) in
   let rec last = fn (i: int) -> fn (from: int) ->
-    if i + 1 >= str_len cls then from
-    else if str_eq (char_at cls i) ":" && str_eq (char_at cls (i + 1)) ":" then last (i + 2) (i + 2)
+    if i + 1 >= str_len name9 then from
+    else if str_eq (char_at name9 i) ":" && str_eq (char_at name9 (i + 1)) ":" then last (i + 2) (i + 2)
     else last (i + 1) from in
-  let short = substring cls (last 0 0) (str_len cls) in
+  let short = substring name9 (last 0 0) (str_len name9) in
   (if map_has modules cls then "<module:" else "<class:") ++ short ++ ">"
 
 // run f with the nesting the env carries (a method's frame, a block written in
