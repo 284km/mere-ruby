@@ -1163,7 +1163,23 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
 // with everything it held; now a frame is reached through what holds it --
 // a live proc, a binding, a stack -- and lv_cap's that nothing reached are
 // given back after the mark (gc_sweep_captured).
+// A FRAME'S HEAD (note 560 B), where an env keeps it in an area: the slots'
+// values marked (fh_mark_vals), and the slots that hold a class's name --
+// __defcls 4, __cref 6, __nest 7, __cvcls 8 -- given to the class marking as
+// the Map's entries of those names are below (fh_mark_cls)
+and fh_mark_vals = fn live -> fn e ->
+  if map_has e "__fh" then gc_mark_slots live fh_slab (fh_b e) fh_n else ()
+and fh_mark_cls = fn e ->
+  if map_has e "__fh" then
+    (let b = fh_b e in
+     let cls = fn (v: Val) -> (match v with VStr h -> gc_class_text (sget h) | VClass c -> gc_class_mark c | _ -> ()) in
+     let _ = cls (vec_get fh_slab (b + 4)) in
+     let _ = cls (vec_get fh_slab (b + 6)) in
+     let _ = cls (vec_get fh_slab (b + 7)) in
+     cls (vec_get fh_slab (b + 8)))
+  else ()
 and gc_mark_env = fn live -> fn e ->
+  let _ = fh_mark_cls e in
   let _ = map_iter e (fn (key: str) -> fn (v: Val) ->
     if str_eq key "__rf" then (match v with VInt id -> gc_ref_mark id | _ -> ())
     // (a frame the ISeq VM runs a program in names the program's tree)
@@ -1174,8 +1190,9 @@ and gc_mark_env = fn live -> fn e ->
   | VInt n -> (let k = n * 8 + 6 in
                if (if gc_live_mark live k then false else true) then ()
                else (                     let _ = map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
+                     let _ = fh_mark_vals live e in
                      if map_has lv_up n then gc_mark_env live (map_get lv_up n) else ()))
-  | _ -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
+  | _ -> (let _ = map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in fh_mark_vals live e)
 // a parameter list's yield-block markers (`yblk_marker ++ pid`, proc_as_block):
 // each names a proc whose proc_yblk entry the tuple will read
 and gc_mark_yblk_params = fn live -> fn (ps: str list) ->
@@ -1931,7 +1948,7 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   // (...and the parent links of a suspended fiber's active blocks, likewise)
   let _ = (if (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) == 1 then ()
            else if fbx then map_iter lv_up (fn (k: int) -> fn (benv) ->
-                              if map_has fb_rc_eid k then () else map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
+                              if map_has fb_rc_eid k then () else (let _ = map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in fh_mark_vals live benv))
            // ...except the links of the captured frames that have left the
            // stack (lv_cap): those are reached through what holds them
            else map_iter lv_up (fn (k: int) -> fn (benv) ->
@@ -2520,6 +2537,8 @@ let gc_collect = fn env -> fn world ->
     // (the shaped objects' records, and the slab: a value written over is a
     //  copy left in the slab's arena, as in the table's -- Mere's vec_set)
     let _ = (if nc then () else (let _ = map_compact obj_iv in let _ = map_compact iv_hng in vec_compact iv_slab)) in
+    // (the frames' heads' slab likewise: note 560 B)
+    let _ = (if nc then () else vec_compact fh_slab) in
     // (...and a dead owner's names in ivar_names_of's index, iv_idx)
     let dIX = vec_new () in
     let _ = map_iter iv_idx (fn (k: str) -> fn (v: str) ->
@@ -3025,7 +3044,7 @@ let fb_reclaim = fn env -> fn world ->
        let inq = map_new () in
        let _ = map_iter fb_state (fn (i: int) -> fn (st: int) -> if map_has cand i then () else map_set inq i 1) in
        let _ = map_set inq 0 1 in
-       let mark_env = fn (e) -> map_iter e (fn (k: str) -> fn (v: Val) -> gc_mark_val live v) in
+       let mark_env = fn (e) -> (let _ = map_iter e (fn (k: str) -> fn (v: Val) -> gc_mark_val live v) in fh_mark_vals live e) in
        let mark_queued = fn (u: unit) ->
          let _ = map_iter inq (fn (o: int) -> fn (u2: int) ->
            let _ = fb_stack_envs o (fn (e) ->
@@ -3217,7 +3236,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // through the lexical scope (cref) first, then top level.
     else if str_contains name "::" then
       if vec_get box_st 0 == 1 then
-        (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") else cur_lex ()) in
+        (let cref9 = (if fh_cref_lv_has env then (match fh_cref_lv_get env with VStr h9 -> sget h9 | _ -> "") else cur_lex ()) in
          let key9 = const_walk_head env world blk cref9 (const_head name) in
          let value9 = (if str_eq key9 "" then eval_e env world blk (EConst (const_head name))
                        else (let _ = const_read_note world key9 in map_get consts key9)) in
@@ -15476,8 +15495,8 @@ and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head
   // Internal box identities are not textual namespace prefixes. Search each
   // actual lexical scope for a constant OR autoload before going outward.
   let nested9 = (if vec_get box_st 0 == 1 then
-                   (let nesting9 = (if lv_has env "__nest" then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "")
-                                    else if lv_has env "__meth" then "" else cur_nest ()) in
+                   (let nesting9 = (if fh_nest_lv_has env then (match fh_nest_lv_get env with VStr h9 -> sget h9 | _ -> "")
+                                    else if fh_meth_lv_has env then "" else cur_nest ()) in
                     let rec scopes9 = fn (ns9: str list) ->
                       match ns9 with
                       | Nil -> ""
@@ -15641,7 +15660,7 @@ and autoload_fire0 = fn env -> fn world -> fn blk -> fn (key: str) ->
                             (let _ = (if main_sng_has world "require" || (let (mt9, _, _, _) = world in map_has mt9 "require")
                                       then (let _ = invoke_val_c env world blk VMain "require" (Cons (mkstr path, Nil)) false in FNext VNil)
                                       else (let require_env9 = map_new () in
-                                            let _ = map_iter env (fn (k9: str) -> fn (v9: Val) -> map_set require_env9 k9 v9) in
+                                            let _ = env_iter env (fn (k9: str) -> fn (v9: Val) -> map_set require_env9 k9 v9) in
                                             let _ = fh_self_set require_env9 VMain in
                                             exec_stmt require_env9 world blk (SRequire (false, EStrL path)))) in true)) false in
         let _ = autoload_settle world key in
@@ -33716,7 +33735,7 @@ and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn 
   // goes to, the visibility -- nearest first; and the names it could see
   let seen9 = map_new () in
   let rec walk = fn en -> fn (d: int) ->
-    (let _ = map_iter en (fn (n9: str) -> fn (v9: Val) ->
+    (let _ = env_iter en (fn (n9: str) -> fn (v9: Val) ->
                if str_eq n9 "__eid" || str_eq n9 "__captured" || map_has e9 n9 then ()
                else if str_starts_with n9 "__" || str_eq n9 "self" then map_set e9 n9 v9
                else if lv_name_hidden n9 then ()
@@ -33943,7 +33962,7 @@ and sig_raise_main = fn world -> fn (e: Val) ->
 // the yield is written in (a lambda's own frame carries a __fid of its own,
 // marked __rxlam, which is its `return`'s target and not the block's)
 and yield_home_fid = fn env ->
-  let (found, f) = lv_owner env "__fid" in
+  let (found, f) = fh_fid_owner env in
   if (if found then false else true) then VInt 0
   else if map_has f "__rxlam" then
     (match (if map_has f "__eid" then map_get f "__eid" else VNil) with
@@ -51395,7 +51414,8 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
                      | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> blk_env_get cenv)
                      | _ -> frame_pool_get ())
                   else frame_pool_get ()) in
-     let _ = fh_fid_set frame (VInt (next_fid ())) in
+     let fb9 = fh_area_new frame in
+     let _ = fh_put fb9 1 (VInt (next_fid ())) in
      // (what the call reads of the method's tables: its record, mrec_top_get)
      let (_, rmnm9, rmtx9, rcal9, rcref9, _, rcreftx9, rcv9, rnest9, _, _, rdmm9, rsrc0, rsrc2, rlbl9, rlid9) = mrec_top_get name in
      let _ = (if map_len r2k_methods > 0 && map_has r2k_methods ("Object#" ++ name) then map_set frame "__r2k" VNil else ()) in
@@ -51403,23 +51423,23 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      //  __method__ and a TracePoint's method_id -- and the one it was called
      //  by, __callee__)
      let mnm9 = rmnm9 in
-     let _ = fh_meth_set frame rmtx9 in
-     let _ = (match rcal9 with VNil -> () | v9 -> fh_callee_set frame v9) in
+     let _ = fh_put fb9 2 rmtx9 in
+     let _ = (match rcal9 with VNil -> () | v9 -> fh_put fb9 3 v9) in
      // Whether THIS call was given a block. `block_given?` asks about the
      // enclosing METHOD frame, and Ruby's rule reaches it through any number
      // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
      // true, because the block asks about m. Reading the `blk` threaded
      // through evaluation answered about the innermost block call instead.
-     let _ = fh_has_blk_set frame (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
+     let _ = fh_put fb9 11 (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
      // top-level methods run with main as self (their @ivars live there).
-     let _ = fh_self_set frame (if fh_self_lv_has env then fh_self_lv_get env else VMain) in
+     let _ = fh_put fb9 0 (if fh_self_lv_has env then fh_self_lv_get env else VMain) in
      // ⚠ the stored value carries BOTH (see lex_pack): the frame gets the cref
     // in the slot its ten readers already know, and the nesting in one of its
     // own. Unpacked here, once, rather than at each reader.
     let crefv9 = rcref9 in
-    let _ = fh_cref_set frame rcreftx9 in
-    let _ = (match rcv9 with VNil -> () | v9 -> fh_cvcls_set frame v9) in
-    let _ = (match rnest9 with VNil -> () | v9 -> fh_nest_set frame v9) in
+    let _ = fh_put fb9 6 rcreftx9 in
+    let _ = (match rcv9 with VNil -> () | v9 -> fh_put fb9 8 v9) in
+    let _ = (match rnest9 with VNil -> () | v9 -> fh_put fb9 7 v9) in
     // the refinements the method was WRITTEN under (see ref_enter_meth)
     let rfprev9 = (if ref_on () then ref_enter_meth frame crefv9 else 0 - 1) in
      let vs9 = map_has super_call_pend "v" in
@@ -52605,7 +52625,9 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                     | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> blk_env_get cenv)
                     | _ -> frame_pool_get ())
                  else frame_pool_get ()) in
-    let _ = fh_fid_set frame (VInt (next_fid ())) in
+    // (its head's area: fh_area_new; frame_done gives it back with the frame)
+    let fb9 = fh_area_new frame in
+    let _ = fh_put fb9 1 (VInt (next_fid ())) in
     let _ = (if map_len r2k_methods > 0 && map_has r2k_methods dk then map_set frame "__r2k" VNil else ()) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
@@ -52618,7 +52640,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
                     (if map_has dm_had_blk dk
                      then map_get dm_had_blk dk else VBool false))
              else ()) in
-    let _ = fh_self_set frame recv in
+    let _ = fh_put fb9 0 recv in
     // a method body has no instance_eval definee in force: its `def` goes to
     // self's class. A define_method frame is a scope-chain CHILD, so without
     // this it would read the defining block's definee through the chain.
@@ -52633,18 +52655,18 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // an aliased method resumes above its ORIGIN, not above the aliasing class.
     let dc = rdc9 in
     let mnm = rmnm9 in
-    let _ = fh_defcls_set frame (VClass dc) in
-    let _ = fh_defidx_set frame (VInt (if str_eq dc defcls then defidx9 else 0 - 1)) in
-    let _ = fh_meth_set frame rmtx9 in
+    let _ = fh_put fb9 4 (VClass dc) in
+    let _ = fh_put fb9 5 (VInt (if str_eq dc defcls then defidx9 else 0 - 1)) in
+    let _ = fh_put fb9 2 rmtx9 in
     // __callee__ answers the name the method was CALLED by; only an alias
     // makes it differ from __meth (the name it was defined under).
-    let _ = (match rcal9 with VNil -> () | v9 -> fh_callee_set frame v9) in
+    let _ = (match rcal9 with VNil -> () | v9 -> fh_put fb9 3 v9) in
     // Whether THIS call was given a block. `block_given?` asks about the
     // enclosing METHOD frame, and Ruby's rule reaches it through any number
     // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
     // true, because the block asks about m. Reading the `blk` threaded
     // through evaluation answered about the innermost block call instead.
-    let _ = fh_has_blk_set frame (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
+    let _ = fh_put fb9 11 (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
     // lexical scope (cref) for bare-constant resolution in the body.
     // ...the same split as the top-level path: the cref in the slot its readers
     // know, the captured Module.nesting in one of its own (see lex_pack).
@@ -52654,9 +52676,9 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     //   proc's own env through the parent link, and writing "" here hid it --
     //   `FLOAT_VALUES` inside test_sprintf_comb's procs was a NameError
     let keep_proc_cref = (if from_pool then false else (if rhcref9 then false else true)) in
-    let _ = (if keep_proc_cref then () else fh_cref_set frame rcreftx9) in
-    let _ = (match rcv9 with VNil -> () | v9 -> fh_cvcls_set frame v9) in
-    let _ = (match rnest9 with VNil -> () | v9 -> fh_nest_set frame v9) in
+    let _ = (if keep_proc_cref then () else fh_put fb9 6 rcreftx9) in
+    let _ = (match rcv9 with VNil -> () | v9 -> fh_put fb9 8 v9) in
+    let _ = (match rnest9 with VNil -> () | v9 -> fh_put fb9 7 v9) in
     // the refinements the method was WRITTEN under, not the caller's: a
     // refinement is lexical (see ref_enter_meth)
     let rfprev8 = (if ref_on () then ref_enter_meth frame crefv8 else 0 - 1) in
@@ -52689,11 +52711,11 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
     // current value, and never writes to the Array. Building it per call was a
     // counter bump, an id, and a copy of the list into arr_store's region on
     // every method call in the program.
-    let _ = fh_params_set frame rpv9 in
+    let _ = fh_put fb9 10 rpv9 in
     let vs9 = map_has super_call_pend "v" in
     let _ = (if vs9 then map_delete super_call_pend "v" else ()) in
     let _ = bind_params_body frame world blk name params defaults args body in
-    let _ = (if share_rest_args then fh_args_set frame (map_get frame (splat_name params)) else ()) in
+    let _ = (if share_rest_args then fh_put fb9 9 (map_get frame (splat_name params)) else ()) in
     let _ = (match blk with (true, _, _, _) -> (if vs9 then () else unused_blk_warn world dk defcls name params body) | _ -> ()) in
     let _ = (if rcfn9 || capi_dm_body dk then rx_cfunc_frame frame else ()) in
     // `$~` (and with it $1..$9, $&, $`, $') belongs to the frame that matched:
@@ -55231,7 +55253,7 @@ and method_body_flow_lbl = fn frame -> fn world -> fn blk -> fn (body: Stmt list
   let _ = (if lid >= 0 then vec_set cur_fm 1 lid else cur_meth_set mlabel9) in
   // mark this frame live so a break targeting it (via a block's home) can find
   // it; once the body has unwound to here (any outcome) the frame is done.
-  let fidk = (if fh_fid_has frame then (match fh_fid_get frame with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
+  let fidk = fh_fid_num frame in
   let _ = if fidk < 0 then () else fb_frame_mark fidk in
   let _ = map_set fb_env_at cd frame in
   let _ = fb_wm_call (cd - 1) in
