@@ -326,9 +326,24 @@ unless defined?(::Ripper)
       def parse(raise_errors: false)
         source = @source.to_s
         result = Prism.lex_compat(source, filepath: @filename, line: @lineno, version: "current")
-        @errors = result.errors.map do |error|
-          loc = error.location
-          Elem.new([loc.start_line, loc.start_column], :on_parse_error, "", 0, error.message)
+        errors = result.errors
+        if errors.empty?
+          @errors = []
+        else
+          # Recovery is a cold native parser path. Valid lexing uses the
+          # original public producer and does not scan recovery markers.
+          recover = errors.any? do |error|
+            error.type == :heredoc_term ||
+              (error.type == :unexpected_token_ignore && error.location.slice == "}")
+          end
+          if recover && Prism.respond_to?(:__ripper_lex_compat)
+            result = Prism.__ripper_lex_compat(source, filepath: @filename, line: @lineno, version: "current")
+            errors = result.errors
+          end
+          @errors = errors.map do |error|
+            loc = error.location
+            Elem.new([loc.start_line, loc.start_column], :on_parse_error, "", 0, error.message)
+          end
         end
         if raise_errors and !@errors.empty?
           raise SyntaxError, @errors.map(&:message).join(" ;")
