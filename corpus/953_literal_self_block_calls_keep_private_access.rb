@@ -35,11 +35,11 @@ module RefineForwarder953
   end
 end
 using RefineForwarder953
-class Forwarder953
+Forwarder953.class_eval(<<~'RUBY')
   def refined
     self.target(:argument, key: 3) { :refined_block }
   end
-end
+RUBY
 p [:refinement, Forwarder953.new.refined]
 
 forwarder = Forwarder953.new
