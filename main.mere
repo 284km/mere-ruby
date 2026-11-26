@@ -3966,19 +3966,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                   && (if protected_ok_m env world cls9 name then false else true)) then VNil
            else if has_meth world cls9 name then mkstr "method"
            else if (let _ = rt_dep_warn world rv cls9 in responds_real world rv name) then mkstr "method"
-           // Store-backed subclasses and singleton objects have the same
-           // missing-method protocol as ordinary objects. Ask the hook with
-           // public visibility, after the rb_check_funcall response gate.
-           else if has_meth world cls9 "respond_to_missing?"
-                   && (if has_meth world cls9 "respond_to?" then
+           // Both the response gate and missing-method hook are Ruby code.
+           // defined? swallows their exceptions just as it does a receiver
+           // exception; throw/break/return must still leave this expression.
+           else if has_meth world cls9 "respond_to_missing?" then
+             (let found9 = defined_eval_guard world (fn (u: unit) ->
+               VBool ((if has_meth world cls9 "respond_to?" then
                          (let extra9 = (match lookup_meth world cls9 "respond_to?" with
                                        | Meth (ps9, ds9, _) -> if takes_include_all ps9 ds9 then Cons (VBool true, Nil) else Nil) in
                           truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) rv
                                     "respond_to?" (Cons (VSym "respond_to_missing?", extra9)) false))
                        else true)
                    && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) rv
-                                "respond_to_missing?" (Cons (VSym name, Cons (VBool false, Nil))) false)
-           then mkstr "method"
+                                "respond_to_missing?" (Cons (VSym name, Cons (VBool false, Nil))) false))) in
+              match found9 with VBool true -> mkstr "method" | _ -> VNil)
            else VNil))
      | EScopedRead (recv, cn) ->
        // defined?(recv::Const): the receiver may raise or be a non-class
@@ -73879,22 +73880,41 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
 // flow signal (throw/break/next/return) so `defined?(throw(:x).foo)` performs
 // the throw normally instead of swallowing it.
 and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
+  defined_eval_guard world (fn (u: unit) -> eval_e env world blk recv)
+// One exception boundary for receiver evaluation and rb_check_funcall-style
+// hook probes. The failure sentinel is distinct from a legitimate nil value.
+and defined_eval_guard = fn world -> fn probe ->
   let (_, _, _, iv9) = world in
   let sx9 = (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) in
-  let spm9 = (if map_has prim_missing "i" then map_get prim_missing "i" else VNil) in
-  let rv = try_or (fn (u: unit) -> eval_e env world blk recv) (VSym "__mere_defined_fail__") in
-  // a pending flow signal (flow_sig still holds "k") means the receiver did a
-  // throw/break/next; re-fail so it propagates instead of being swallowed.
-  if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) && map_has flow_sig "k"
-  then (let m = "mere-ruby: (unhandled flow signal inside defined?)" in
-        let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
-  // (an exception it swallowed is no exception any more: what it left
-  //  behind was reported with the next real one, at exit)
-  else if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then
-    (let _ = (match sx9 with VNil -> (if map_has iv9 "$exc" then map_delete iv9 "$exc" else ()) | _ -> iv_put iv9 "$exc" sx9) in
-     let _ = (match spm9 with VNil -> (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) | _ -> map_set prim_missing "i" spm9) in
-     rv)
-  else rv
+  let bang9 = (if map_has globals "!" then map_get globals "!" else VNil) in
+  // A bare rescue can still hold a pair whose frames live only in raise_bt.
+  // Save all pending-raise data before Ruby code overwrites it. The held
+  // array roots these values across GC and is owned by this invocation, so
+  // a nested defined? cannot release its caller's saved exception state.
+  let bt9 = map_new () in
+  let pm9 = map_new () in
+  let held9 = arr_new (Cons (sx9, Cons (bang9, Nil))) in
+  let save9 = fn target -> fn (k9: str) -> fn (v9: Val) ->
+    (let _ = map_set target k9 v9 in
+     match held9 with VArr a9 -> arr_set a9 (Cons (v9, deref a9)) | _ -> ()) in
+  let _ = map_iter raise_bt (save9 bt9) in
+  let _ = map_iter prim_missing (save9 pm9) in
+  let result9 = iter_held held9 (fn (u: unit) ->
+    let rv = try_or probe (VSym "__mere_defined_fail__") in
+    // Keep non-local control flow and its pending exception bookkeeping.
+    if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) && map_has flow_sig "k"
+    then (let m = "mere-ruby: (unhandled flow signal inside defined?)" in
+          let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
+    else if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then
+      (let _ = (match sx9 with VNil -> (if map_has iv9 "$exc" then map_delete iv9 "$exc" else ()) | _ -> iv_put iv9 "$exc" sx9) in
+       let _ = (match bang9 with VNil -> map_delete globals "!" | _ -> map_set globals "!" bang9) in
+       let _ = map_clear raise_bt in
+       let _ = map_iter bt9 (fn (k9: str) -> fn (v9: Val) -> map_set raise_bt k9 v9) in
+       let _ = map_clear prim_missing in
+       let _ = map_iter pm9 (fn (k9: str) -> fn (v9: Val) -> map_set prim_missing k9 v9) in
+       FNext rv)
+    else FNext rv) in
+  match result9 with FNext v9 -> v9 | _ -> VNil
 
 // a break unwinding to a specific method frame (its block's home). The nearest
 // method_body_flow whose frame id matches returns v; others keep propagating.
