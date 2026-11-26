@@ -48,6 +48,9 @@ static VALUE append(VALUE self, VALUE str, VALUE other) { (void)self; rb_str_app
 static VALUE length(VALUE self, VALUE str) { (void)self; return LONG2NUM(rb_str_strlen(str)); }
 static VALUE freeze(VALUE self, VALUE obj) { (void)self; rb_obj_freeze(obj); return Qnil; }
 static VALUE store(VALUE self, VALUE ary, VALUE index, VALUE value) { (void)self; rb_ary_store(ary, NUM2LONG(index), value); return ary; }
+/* What sqlite3's callback frame asks on every prepare and step. */
+static VALUE thread_current(VALUE self) { (void)self; return rb_thread_current(); }
+static VALUE thread_aref(VALUE self, VALUE thread, VALUE key) { (void)self; return rb_thread_local_aref(thread, SYM2ID(key)); }
 /* A row as sqlite3's step makes one: an Array of the capacity, its elements
  * stored in order, a String frozen with rb_obj_freeze, the row frozen; and
  * what C reads of it after (its length, its last element, its flags). */
@@ -615,6 +618,8 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "freeze", freeze, 1);
     rb_define_singleton_method(mod, "store", store, 3);
     rb_define_singleton_method(mod, "row", row, 1);
+    rb_define_singleton_method(mod, "thread_current", thread_current, 0);
+    rb_define_singleton_method(mod, "thread_aref", thread_aref, 2);
     rb_define_singleton_method(mod, "default_internal", default_internal, 0);
     rb_define_singleton_method(mod, "aset", aset, 3);
     rb_define_singleton_method(mod, "kind_of", kind_of, 2);
