@@ -1,0 +1,112 @@
+diff --git a/vendor/prism/include/prism.h b/vendor/prism/include/prism.h
+index c468db18..6f4b280f 100644
+--- a/vendor/prism/include/prism.h
++++ b/vendor/prism/include/prism.h
+@@ -204,6 +204,7 @@ PRISM_EXPORTED_FUNCTION void pm_serialize_parse_comments(pm_buffer_t *buffer, co
+  * @param data The optional data to pass to the lexer.
+  */
+ PRISM_EXPORTED_FUNCTION void pm_serialize_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const char *data);
++PRISM_EXPORTED_FUNCTION void pm_serialize_ripper_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const char *data);
+
+ /**
+  * Parse and serialize both the AST and the tokens represented by the given
+diff --git a/vendor/prism/include/prism/parser.h b/vendor/prism/include/prism/parser.h
+index 95d7aac7..cacaefd5 100644
+--- a/vendor/prism/include/prism/parser.h
++++ b/vendor/prism/include/prism/parser.h
+@@ -651,6 +651,9 @@ struct pm_parser {
+     /** The current state of the lexer. */
+     pm_lex_state_t lex_state;
+
++    /** Private Ripper recovery; ordinary Prism serialization leaves it false. */
++    bool ripper_lex_compat;
++
+     /** Tracks the current nesting of (), [], and {}. */
+     int enclosure_nesting;
+
+diff --git a/vendor/prism/src/prism.c b/vendor/prism/src/prism.c
+index 801747db..6b2ea241 100644
+--- a/vendor/prism/src/prism.c
++++ b/vendor/prism/src/prism.c
+@@ -9822,6 +9822,29 @@ parser_lex(pm_parser_t *parser) {
+             // We'll check if we're at the end of the file. If we are, then we
+             // need to return the EOF token.
+             if (parser->current.end >= parser->end) {
++                /* In the private Ripper stream, let the still-live parser
++                 * unwind an unfinished interpolation before its heredoc's
++                 * normal EOF recovery resumes the real declaration cursor.
++                 * Locals, parameter scopes and parsing context remain live.
++                 * The empty EOF marker is internal and is not source text. */
++                if (parser->ripper_lex_compat && parser->lex_modes.current->mode == PM_LEX_EMBEXPR) {
++                    size_t index = parser->lex_modes.index;
++                    pm_lex_mode_t *mode = parser->lex_modes.current;
++                    bool heredoc = false;
++                    while (index > 0) {
++                        index--;
++                        mode = index < PM_LEX_STACK_SIZE ? &parser->lex_modes.stack[index] : mode->prev;
++                        if (mode->mode == PM_LEX_HEREDOC) { heredoc = true; break; }
++                    }
++                    if (heredoc) {
++                        const uint8_t *diagnostic_start = parser->current.start;
++                        if (diagnostic_start > parser->start && diagnostic_start[-1] == '\n') diagnostic_start--;
++                        pm_parser_err(parser, diagnostic_start, parser->current.end, PM_ERR_EMBEXPR_END);
++                        parser->enclosure_nesting--;
++                        lex_mode_pop(parser);
++                        LEX(PM_TOKEN_EMBEXPR_END);
++                    }
++                }
+                 // If we hit EOF, but the EOF came immediately after a newline,
+                 // set the start of the token to the newline.  This way any EOF
+                 // errors will be reported as happening on that line rather than
+@@ -10207,6 +10230,13 @@ parser_lex(pm_parser_t *parser) {
+
+                 // }
+                 case '}':
++                    // Like CRuby's tSTRING_DEND, a zero-nesting right brace
++                    // keeps its actual pre-closer state and enclosure stacks.
++                    if (parser->ripper_lex_compat && parser->brace_nesting == 0 &&
++                        parser->lex_modes.current->mode != PM_LEX_EMBEXPR) {
++                        parser->brace_nesting--;
++                        LEX(PM_TOKEN_EMBEXPR_END);
++                    }
+                     parser->enclosure_nesting--;
+                     pm_do_loop_stack_pop(parser);
+
+diff --git a/vendor/prism/src/serialize.c b/vendor/prism/src/serialize.c
+index 08ffb813..3c6bf1fa 100644
+--- a/vendor/prism/src/serialize.c
++++ b/vendor/prism/src/serialize.c
+@@ -2243,6 +2243,33 @@ pm_serialize_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const
+     pm_options_free(&options);
+ }
+
++PRISM_EXPORTED_FUNCTION void
++pm_serialize_ripper_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const char *data) {
++    pm_options_t options = { 0 };
++    pm_options_read(&options, data);
++
++    pm_parser_t parser;
++    pm_parser_init(&parser, source, size, &options);
++    parser.ripper_lex_compat = true;
++
++    pm_lex_callback_t lex_callback = (pm_lex_callback_t) {
++        .data = (void *) buffer,
++        .callback = serialize_token,
++    };
++
++    parser.lex_callback = &lex_callback;
++    pm_node_t *node = pm_parse(&parser);
++
++    // Append 0 to mark end of tokens.
++    pm_buffer_append_byte(buffer, 0);
++
++    pm_serialize_metadata(&parser, buffer);
++
++    pm_node_destroy(&parser, node);
++    pm_parser_free(&parser);
++    pm_options_free(&options);
++}
++
+ /**
+  * Parse and serialize both the AST and the tokens represented by the given
+  * source to the given buffer.
