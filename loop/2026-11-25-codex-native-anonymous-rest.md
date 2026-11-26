@@ -198,3 +198,10 @@ allocation file, controlled RSS and coercion-source loops, retired instruction
 counts, all source gates/record hygiene, full corpus ON/OFF and VM counts.
 Treat PR 242 as a dependency until it is merged; earlier independent-head
 results do not establish this combined tree's correctness or resource use.
+
+Integrate parent source 8f0bd866 and main 85da98fb without manual conflict
+resolution. Keep the independent Array-origin slots, refusal marker and raw
+native Hash-copy entry alongside the parent Method ivar API port and runtime
+updates. The parent passes its focused controls; this source is unbuilt.
+Its own Ractor/callback, allocation, RSS, instruction and full corpus checks
+remain required. No dependent runtime overlaps parent allocation measurements.
