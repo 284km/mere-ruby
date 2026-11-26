@@ -44,7 +44,10 @@ if [ -z "$ossl_prefix" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/
   ossl_prefix="$(brew --prefix openssl@3 2>/dev/null)" || exit 2
 fi
 if [ -n "$ossl_prefix" ]; then
-  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto
+  # (-DMR_OPENSSL_DIR: RbConfig says the directory as configure's
+  #  --with-openssl-dir, for an extension's mkmf -- capi/core.c)
+  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto \
+    "-DMR_OPENSSL_DIR=\"$ossl_prefix\""
 elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists 'openssl >= 3.0'; then
   # shellcheck disable=SC2046
   set -- $(pkg-config --cflags --libs openssl)

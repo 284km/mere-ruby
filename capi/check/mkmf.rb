@@ -22,6 +22,11 @@ check(answers['__STDC__'] == true)
 check(answers['NO_SUCH_MACRO_ANYWHERE'] == false)
 check(answers['sizeof(long)'] == [0].pack('l!').bytesize)
 check(answers['note'] == 7)
+# The OpenSSL the interpreter itself was built with is an extension's too:
+# mere-ruby's RbConfig said no --with-openssl-dir, so on macOS (Homebrew's
+# openssl@3 is not on the compiler's paths) puma was built without MiniSSL
+# and 63 of its tests were not there to run.
+check(answers['openssl'] == true)
 check(MkmfProbe.floor(2.75) == 2.0)
 # ruby's own ext/-test-/float, through its own extconf.rb
 require '-test-/float'

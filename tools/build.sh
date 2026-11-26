@@ -154,7 +154,10 @@ if [ -z "$ossl_prefix" ] && [ "$(uname -s)" = Darwin ] && command -v brew >/dev/
 fi
 if [ -n "$ossl_prefix" ]; then
   [ -f "$ossl_prefix/include/openssl/ssl.h" ] || { echo 'build.sh: OPENSSL_PREFIX has no OpenSSL headers' >&2; exit 2; }
-  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto
+  # (-DMR_OPENSSL_DIR: RbConfig says the directory as configure's
+  #  --with-openssl-dir, for an extension's mkmf -- capi/core.c)
+  set -- "-I$ossl_prefix/include" "-L$ossl_prefix/lib" "-Wl,-rpath,$ossl_prefix/lib" -lssl -lcrypto \
+    "-DMR_OPENSSL_DIR=\"$ossl_prefix\""
 elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists 'openssl >= 3.0'; then
   # pkg-config emits compiler arguments for the selected provider.
   # shellcheck disable=SC2046
