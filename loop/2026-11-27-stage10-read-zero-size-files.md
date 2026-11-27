@@ -46,6 +46,12 @@ The prelude's readers took a Float the same way. `IO.read`, `IO#read`, `#sysread
 - `File#readpartial`, which handed the Float to the builtin as it was and answered a read;
 - `IO#read_nonblock`, which called `to_int`.
 
+An offset was reached by reading the bytes before it (fifth review, Major). `read_path_prefix` read the offset and the length from byte 0 and dropped the offset's bytes. `File.read("/dev/urandom", 0, 16)` read 16 bytes and then answered nil at the end of what it had read; ruby and main answer "". `File.read("/dev/urandom", 0, 2**40)` set out to read 1 TiB for a read of nothing, and did not return. `File.binread`, `IO.binread` and `File#pread` (which reads through `File.binread`) did the same. Now:
+
+- A read with a length opens the path, seeks to the offset and reads at most the length (`read_path_at`). A character device takes the seek. A FIFO is refused before, by its stat, and the order of the refusals is as before.
+- A length of 0 reads nothing and is "", at any offset, past the end too. A regular file read with a length of 0 at or past its end answered nil, on main (6d2cb190) as well.
+- A regular file with a size is read the same way when a length is given, so a few bytes of a big file no longer read all of it.
+
 A File reopened onto another path kept what it had read of the old one as a stream (third review, Major). Read over a pipe and then reopened onto a file, it answered the pipe's "old\n" again. `__f_reopen` now drops `__f_whole`, the bytes and the mark that the path was not a stream alike.
 
 A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
@@ -71,6 +77,7 @@ Corpus 838 covers:
 - a negative length, a negative offset and both, for `File` and `IO`, `read` and `binread`, over `/dev/zero`, a pipe and a regular file;
 - lengths and offsets that are not Integers: a Float, an object with `#to_int` (answering -1, 2, and a String), a String, nil and a Bignum;
 - Floats that have no long, as a length and as an offset, for `File` and `IO`, `read` and `binread`, and for `#read`, `#readpartial`, `#sysread`, `#read_nonblock`, `#gets`, `#seek` and `#sysseek`: the two infinities, NaN, 1e100, -1e100, 9.3e18 and 2**63;
+- a length of 0 and a length of 3 at offsets 0, 16 and 2**40 of `/dev/urandom` and `/dev/zero`, and lengths of 0 and 2 near, at and past the end of a regular file, for `File.read`, `File.binread`, `IO.binread` and `IO.read`, and `File#pread` at 2**40;
 - a File read over a pipe and then reopened onto a file;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.

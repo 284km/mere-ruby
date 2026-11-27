@@ -135,3 +135,22 @@ Dir.mktmpdir do |d|
   t("pipe reopened") { piped("old\n") { |p| File.open(p) { |io| [io.read, io.reopen(f).class, io.read] } } }
   t("pipe reopened, gets") { piped("old\n") { |p| File.open(p) { |io| [io.gets, (io.reopen(f, "r"); io.gets), io.gets] } } }
 end
+
+# a read with a length reads only the length, from the offset: a length of 0
+# is "" at any offset (past the end too), and a big offset is a seek, not
+# 1 TiB read and dropped
+def sz(v) = v.nil? ? nil : [v.bytesize, v.encoding.to_s]
+size = File.size(__FILE__)
+[[File, :read], [File, :binread], [IO, :binread], [IO, :read]].each do |k, m|
+  [0, 16, 2**40].each do |off|
+    t("#{k}.#{m} urandom 0 #{off}") { sz(k.send(m, "/dev/urandom", 0, off)) }
+    t("#{k}.#{m} zero 3 #{off}")    { k.send(m, "/dev/zero", 3, off) }
+  end
+  [3, size, size + 100].each do |off|
+    t("#{k}.#{m} file 0 at #{off - size}") { sz(k.send(m, __FILE__, 0, off)) }
+    t("#{k}.#{m} file 2 at #{off - size}") { sz(k.send(m, __FILE__, 2, off)) }
+  end
+  t("#{k}.#{m} file 2 at -1") { k.send(m, __FILE__, 2, size - 1) }
+end
+t("File#pread urandom 0 2**40") { File.open("/dev/urandom") { |f| f.pread(0, 2**40) } }
+t("File#pread zero 2 2**40")    { File.open("/dev/zero") { |f| f.pread(2, 2**40) } }
