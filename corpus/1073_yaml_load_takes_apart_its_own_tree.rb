@@ -53,3 +53,22 @@ p stream.children[1].root.children.size
 a = YAML.load("k: [1, [2, 3], {x: y}]\n")
 b = YAML.load("k: [4]\n")
 p a, b
+
+# what a load made is answered as it is, whatever methods it defines: the
+# load does not send it anything (a tap of its own answered :intercepted
+# here, and one that raised failed the load)
+class TapValue
+  attr_reader :v
+  def init_with(coder) = (@v = coder["v"])
+  def tap = :intercepted
+end
+class TapRaises
+  def init_with(coder) = nil
+  def tap = raise("tap was sent")
+end
+doc = "--- !ruby/object:TapValue\nv: 7\n"
+p YAML.unsafe_load(doc).class, YAML.unsafe_load(doc).v
+p YAML.load(doc, permitted_classes: [TapValue]).class
+p YAML.safe_load(doc, permitted_classes: [TapValue]).v
+p YAML.unsafe_load("--- !ruby/object:TapRaises {}\n").class
+p YAML.safe_load("--- !ruby/object:TapRaises {}\n", permitted_classes: [TapRaises]).class

@@ -40,10 +40,18 @@ names.each do |name|
       # nothing a program can see changes; Psych.parse and parse_stream, whose
       # tree is the caller's, are left alone. Each line has to be found
       # exactly once -- a new psych that moved them fails here, not silently.
+      # (the value goes through a local, not through `.tap { ... }`: tap is
+      # sent to whatever the document made, and a loaded object can define
+      # its own tap -- the load must answer the object, and must not raise
+      # because that tap does.)
       { "    result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols)\n" =>
-          "    result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols).tap { __drop_tree(result) }\n",
+          "    __value = result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols)\n" \
+          "    __drop_tree(result)\n" \
+          "    __value\n",
         "    result = visitor.accept result\n" =>
-          "    result = visitor.accept(result).tap { __drop_tree(result) }\n" }.each do |from, to|
+          "    __value = visitor.accept result\n" \
+          "    __drop_tree(result)\n" \
+          "    result = __value\n" }.each do |from, to|
         found = api.scan(from).size
         abort "gen_psych_lib.rb: expected one #{from.strip.inspect} in vendor/psych/lib/psych.rb, found #{found}" unless found == 1
         api = api.sub(from) { to }
