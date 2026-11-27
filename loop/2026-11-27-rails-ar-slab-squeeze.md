@@ -94,11 +94,33 @@ A second diagnostic (`MERE_RUBY_DIAG=1`) records the same three events in
 memory with the time since start and prints them at exit, together with
 every arena still retired at exit.
 
+### Three more runs without `GC_LOG` (2026-11-28 early morning)
+
+The diagnostic binaries are the bad build's `mr.c` with only the diagnostic
+lines (and, for the last run, the limit below) added.
+
+| run | squeezes | preload | footprint after preload | peak | still retired at exit |
+| --- | --- | --- | --- | --- | --- |
+| `DIAG=1` | 2 | 77 s | 1,230 MB | 1.55 GB | 60 MB, none over 50 MB |
+| `DIAG=1` | 2 | 89 s | 1,262 MB | 1.54 GB | 39 MB, none over 50 MB |
+| `DIAG=1 SLAB_SQUEEZE_MAX=1` | 1 | 80 s | 1,270 MB | 1.52 GB | 198 MB, one of 135 MB |
+
+- Every run was good. The first squeeze's arena (339-353 MB) was retired,
+  kept, and freed 11-17 s later each time, so a kept arena does not explain
+  the bad runs.
+- Both bad runs made one squeeze and good runs two or three, but a run held
+  to one squeeze (`MERE_RUBY_SLAB_SQUEEZE_MAX=1`, a diagnostic knob, ends
+  with 4.85M slots like the bad runs' 4.74M) is good too. The number of
+  squeezes is not the cause either.
+- So far: 7 runs of the squeeze build, 2 bad. Both bad runs were the
+  original binary on the afternoon of 2026-11-27; the original binary with
+  `GC_LOG` and all five diagnostic runs were good. What is left: the
+  machine's state that afternoon, or something only in the original binary.
+
 ## Next
 
-1. Two probe runs with `GC_TIGHT=1 DIAG=1` and no `GC_LOG`. Look only at the
-   diagnostic lines (pin, retire, free, what is still retired at exit),
-   since the times move with the machine's load.
+1. The original binary again, with only `GC_TIGHT` and `STORE_STATS`, one or
+   two runs: bad again points at the binary, good at that afternoon.
 2. sq-stress-vm again, on its own.
 3. If the retired-arena suspicion holds, propose a fix before writing it
    (for example: when the slab's arena is pinned, skip the squeeze and try
