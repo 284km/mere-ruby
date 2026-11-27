@@ -2689,6 +2689,15 @@ let arg_splat_note = fn (id: int) ->
 let arg_splat_forget = fn (u: unit) -> vec_set arg_notes 1 0;
 let arg_splat_keep = fn (u: unit) -> vec_get arg_notes 2 == 1;
 let arg_splat_mark_keep = fn (u: unit) -> vec_set arg_notes 2 1;
+// Anonymous-rest source provenance is independent of keyword origin:
+// suffix length, spread length, binder-only pending source, current source.
+// Source 0 is inactive, a positive handle names an Array, -1 is *nil and
+// -2 refuses borrowing. The active source is manually marked by GC.
+let anon_splat_tail = (let v = vec_new () in let _ = vec_push v 0 in
+                       let _ = vec_push v 0 in let _ = vec_push v 0 in
+                       let _ = vec_push v 0 in v);
+let anon_splat_forget = fn (u: unit) ->
+  if vec_get anon_splat_tail 3 == 0 then () else vec_set anon_splat_tail 3 0;
 // The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
 // the top level is a MODE, not a call on names -- language/fixtures/def.rb
 // switches it with a bare `public` and the spec then asks Object for the
@@ -2865,7 +2874,9 @@ let gc_cenv0 = map_new ();
 let gc_hold = map_new ();
 // iter_held's values (main.mere), by a number drawn for each walk: a root
 // like gc_hold, with an Int key, so a walk builds no key string
-let gc_iter_hold = map_new ();
+// Scoped roots churn on block conversion too. Own their storage from birth
+// so GC can reclaim deleted copies rather than pinning them in __heap.
+let gc_iter_hold = (let t = map_new () in let _ = map_compact t in t);
 let gc_iter_hold_n = vec_new ();
 let _ = vec_push gc_iter_hold_n 0;
 let bind_store = map_new ();
@@ -3790,6 +3801,23 @@ let meth_params = map_new ();   // "cls#name" -> the Array of parameter names
 // Keeping the fields together avoids hashing and copying three prefixed owner
 // keys for every anonymous method, and lets the collector scan its owner once.
 let meth_src = map_new ();
+// Compact Prism call metadata belongs to the method, never to its defining
+// scope. The AST keeps ordinary text; the installed row keeps one Ruby String.
+// Aliases/snapshots share it and the class sweep drops it with its owner.
+let meth_eval_nodes = map_new ();
+let eval_node_parse = map_new ();
+// A recorded backtrace String retains only the compact metadata of that frame.
+// This is a weak-key side table: marking a live String follows its value;
+// sweeping that String removes the row before a handle can be reused.
+let bt_eval_nodes = map_new ();
+let eval_node_frame_key = "__node_info" ++ chr 1;
+let rec meth_node_text = fn (body: Stmt list) ->
+  match body with
+  | Cons (SNodeIds text, _) -> text
+  | Cons (SFile _, rest) -> meth_node_text rest
+  | Cons (SLine _, rest) -> meth_node_text rest
+  | Cons (SLineQ _, rest) -> meth_node_text rest
+  | _ -> "";
 let meth_source_get = fn (key: str) -> fn (field: int) ->
   if map_has meth_src key then
     (let (line, file, last, flags) = map_get meth_src key in
@@ -4015,6 +4043,7 @@ let store_proc = fn (k: str) -> fn entry ->
   let rec ol9 = fn (b9: Stmt list) -> (match b9 with
                                        | Cons (SLine n9, _) -> (if n9 < 0 then blk_line_of n9 else 0)
                                        | Cons (SFile _, t9) -> ol9 t9
+                                       | Cons (SNodeIds _, t9) -> ol9 t9
                                        | Cons (st9, t9) -> (if dflt_prologue_stmt st9 then ol9 t9 else 0)
                                        | _ -> 0) in
   let ln9 = ol9 body in
@@ -6224,7 +6253,8 @@ let mro_note_mixins = fn (names: str) ->
 // box wrote, and the includes' and prepends' values. bx_val (constants,
 // globals) and bx_meth (methods): "v<kind><box>\1<key>" -> the box's own
 // value, "u<kind><box>\1<key>" -> the master's where it had one. The kinds:
-// constants (c), globals (g), methods (m), includes (i), prepends (p).
+// constants (c), globals (g), methods (m), compact method node data (n),
+// includes (i), prepends (p). Node data shares the method row's journal lifetime.
 // ⚠ SIX `let`s, no tuples: each top-level binding is a level of nesting in
 //   the emitted C, a tuple's elements are one level EACH, and the build
 //   passes 1024 (tools/bracket_depth_check.sh -- this round met it twice).
@@ -6315,7 +6345,10 @@ and bx_note_al = fn (k: str) ->
   else ()
 and bx_note_gvar = fn (slot: str) -> if bx_writing () then bx_note globals bx_val "g" slot else ()
 and bx_note_meth = fn (k: str) ->
-  if bx_writing () && bx_master_cls (bx_key_cls k) then bx_note meths_g bx_meth "m" k else ()
+  if bx_writing () && bx_master_cls (bx_key_cls k) then
+    (let _ = bx_note meths_g bx_meth "m" k in
+     bx_note meth_eval_nodes bx_val "n" k)
+  else ()
 and bx_note_inc = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note includes bx_str "i" k else ()
 and bx_note_pre = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note prepends bx_str "p" k else ()
 // (a method key changing hands drops its parameter-name memo, as a write does)
@@ -6330,6 +6363,7 @@ and bx_switch = fn (b: int) ->
               let _ = bx_out autoloads bx_val "a" l in
               let _ = bx_out globals bx_val "g" l in
               let _ = bx_out meths_g bx_meth "m" l in
+              let _ = bx_out meth_eval_nodes bx_val "n" l in
               let _ = bx_out includes bx_str "i" l in
               let _ = bx_out prepends bx_str "p" l in
               bx_meth_memo l)) in
@@ -6338,6 +6372,7 @@ and bx_switch = fn (b: int) ->
               let _ = bx_in autoloads bx_val "a" b in
               let _ = bx_in globals bx_val "g" b in
               let _ = bx_in meths_g bx_meth "m" b in
+              let _ = bx_in meth_eval_nodes bx_val "n" b in
               let _ = bx_in includes bx_str "i" b in
               let _ = bx_in prepends bx_str "p" b in
               bx_meth_memo b)) in
@@ -6455,6 +6490,7 @@ let msnap_copy = fn t -> fn (dst: str) -> fn (src: str) ->
 // the per-definition tables, k's entries copied to dst (meths' own entry is
 // the caller's: the table reaches set_meth as an argument)
 let msnap_copy_tables = fn (dst: str) -> fn (k: str) ->
+  let _ = msnap_copy meth_eval_nodes dst k in
   let _ = msnap_copy dm_captured dst k in
   let _ = msnap_copy dm_closenv dst k in
   let _ = msnap_copy dm_had_blk dst k in
@@ -6519,7 +6555,15 @@ let note_reflection_protocol = fn (key: str) ->
   then vec_set reflection_protocol_changed 0 1 else ();
 // All primary method writes, including raw singleton copies, mark their arena.
 let store_meth = fn tbl -> fn (key: str) -> fn (value: Meth) ->
+  // Journal the old method and its frozen metadata before either is replaced.
+  // Box switching only swaps existing values; it allocates no Ruby objects.
   let _ = bx_note_meth key in
+  let text = (match value with Meth (_, _, body) -> meth_node_text body) in
+  let _ = (if str_eq text "" then
+             (if map_len meth_eval_nodes > 0 && map_has meth_eval_nodes key then map_delete meth_eval_nodes key else ())
+           else (let data = mkstr text in
+                 let _ = (match data with VStr h -> map_set str_frozen h 1 | _ -> ()) in
+                 map_set meth_eval_nodes key data)) in
   let _ = note_refinement_method_name key in
   let _ = note_reflection_protocol key in
   let _ = vec_set method_store_dirty 0 1 in map_set tbl key value;
@@ -6570,6 +6614,7 @@ let ast_reader_canon = fn (b: str) -> fn (v: Meth) ->
        | Cons (SLine _, t) -> one t seen
        | Cons (SLineQ _, t) -> one t seen
        | Cons (SFile _, t) -> one t seen
+       | Cons (SNodeIds _, t) -> one t seen
        | Cons (SExpr (EMethod (ESelf, n, Nil)), t) -> (if seen then false else (if str_eq n ("__nd_" ++ b) then one t true else false))
        | Cons (SReturn (EMethod (ESelf, n, Nil)), t) -> (if seen then false else (if str_eq n ("__nd_" ++ b) then one t true else false))
        | _ -> false in
@@ -6640,6 +6685,7 @@ let del_meth = fn tbl -> fn (k: str) ->
   let _ = bx_note_meth k in
   let _ = vec_set method_store_dirty 0 1 in
   let _ = msnap_save tbl k in
+  let _ = (if map_len meth_eval_nodes > 0 && map_has meth_eval_nodes k then map_delete meth_eval_nodes k else ()) in
   let _ = mro_bump () in let _ = mrec_del_sv meth_params k in map_delete tbl k;
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
@@ -7063,7 +7109,7 @@ let map_compact_big = fn m -> if map_bytes m > 262144 then map_compact m else ()
 let gvar_wname = (let t = map_new () in let _ = map_compact t in t);
 let gc_churn_bytes = fn (u: unit) ->
   capi_bytes () + vec_bytes metadata_methods_cache + vec_bytes method_store_floor + vec_bytes method_store_dirty + vec_bytes include_defaults_cache + vec_bytes core_new_cache + vec_bytes private_new_seen + vec_bytes protected_new_seen + map_bytes gvar_wname +
-  map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
+  map_bytes gc_iter_hold + map_bytes meth_name_ids + map_bytes meth_names + vec_bytes meth_name_next +
   map_bytes anonymous_classes + map_bytes cls_copy_of + map_bytes method_cores + map_bytes ast_node_pos + map_bytes ast_node_vals + vec_bytes refinement_method_bits + vec_bytes reflection_protocol_changed +
   map_bytes bi_class_name +
   map_bytes bi_owner_memo + map_bytes meth_cfn + map_bytes builtin_alias + map_bytes ie_def_meths + map_bytes hng_store + map_bytes hng_arr_ids + map_bytes hng_prim_ids + map_bytes hng_sng_base
@@ -7096,6 +7142,8 @@ let gc_churn_bytes = fn (u: unit) ->
   + map_bytes rx_gnums + map_bytes rx_gbodies
   + map_bytes arr_pending + map_bytes arr_vc + map_bytes arr_vc_ver + map_bytes arr_vc_len + map_bytes arr_vers + map_bytes lv_up + map_bytes lv_cap + map_bytes lv_capx;
 let gc_churn_compact = fn (already: int) ->
+  // Readers only traverse during marking; no borrowed entry survives here.
+  let _ = map_compact_big gc_iter_hold in
   let _ = map_compact_big gvar_wname in
   let _ = map_compact_big bi_class_name in
   let _ = map_compact_big bi_owner_memo in
@@ -7274,6 +7322,17 @@ let bi_rescued = fn (u: unit) ->
 // a probe that failed and was caught inside the interpreter cannot leave a
 // stale site for a later one. Without it that exception had no backtrace at
 // all: `begin; 1.nope; rescue => e; e.backtrace; end` was nil.
+// Installed after frame helpers are available. The callback captures no Ruby
+// environment: it retains only backtrace Strings and compact method metadata.
+let prim_bt_capture = vec_new ();
+let capture_prim_bt = fn (u: unit) ->
+  if vec_len prim_bt_capture == 0 then () else
+  let bt = (vec_get prim_bt_capture 0) () in
+  let _ = (if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else ()) in
+  let _ = (if map_has prim_missing "rbt_raw" then map_delete prim_missing "rbt_raw" else ()) in
+  match bt with
+  | VArr _ -> (let _ = map_set prim_missing "rbt" bt in map_set prim_missing "rbt_raw" (VBool true))
+  | _ -> ();
 let prim_nm_set = fn (v: Val) ->
   // A native missing call replaces an outer method_missing's bare-call
   // reason, just as dispatch to another Ruby method_missing does.
@@ -7285,7 +7344,8 @@ let prim_nm_set = fn (v: Val) ->
   let _ = map_set prim_missing "n" v in
   let _ = map_set prim_missing "nl" (VInt (cur_line ())) in
   let _ = map_set prim_missing "nd" (VInt (cd_get ())) in
-  map_set prim_missing "nf" (mkstr (cur_file ()));
+  let _ = map_set prim_missing "nf" (mkstr (cur_file ())) in
+  capture_prim_bt ();
 // ...and one that can: what the call was made on and with, for the
 // NoMethodError's #receiver and #args
 let prim_nm_set_ra = fn (recv: Val) -> fn (args: Val list) -> fn (v: Val) ->
@@ -7321,7 +7381,9 @@ let prim_raise_enc = fn (cls: str) -> fn (msg: str) -> fn (enc: str) ->
   let _ = map_set prim_missing "c" (mkstr cls) in
   let _ = map_set prim_missing "m" (mkstr msg) in
   let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+  let new_site = (if map_has prim_missing "rl" then false else true) in
   let _ = note_raise_site () in
+  let _ = (if new_site then capture_prim_bt () else ()) in
   (let __fm = ("mere-ruby: " ++ cls ++ ": " ++ msg) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
 let prim_raise = fn (cls: str) -> fn (msg: str) ->
   let _ = (if map_has prim_missing "me" then map_delete prim_missing "me" else ()) in
@@ -7333,7 +7395,9 @@ let prim_raise = fn (cls: str) -> fn (msg: str) ->
   // TypeError raised afterwards -- the right exception, announced under the
   // wrong name.
   let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+  let new_site = (if map_has prim_missing "rl" then false else true) in
   let _ = note_raise_site () in
+  let _ = (if new_site then capture_prim_bt () else ()) in
   (let __fm = ("mere-ruby: " ++ cls ++ ": " ++ msg) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
 // `Integer(x, exception: false)` / `Float(x, exception: false)` answer nil
 // where the raising form refuses. The refusal RULES must stay in one place --

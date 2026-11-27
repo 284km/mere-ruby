@@ -827,4 +827,47 @@ check(joined == (['test'] * 400).join(', ') && collections > 0)
   check(same && intact && held == 'held-only-in-c' && ary == %w[a b] && collections > 0)
   check(seen == 'W' + rest && s == 'W' + rest)
 end
+# (last: they grow the heap by tens of megabytes, and join_in_c above counts
+#  the collections a long C call makes in a heap the size it is there)
+# Strings of a megabyte and more, whose buffers in C are mapped: made by C
+# (rb_str_new(NULL, n)), written through RSTRING_PTR, cut down to a few bytes
+# and grown again (a mapped buffer to malloc's and back), and grown by
+# rb_str_cat past the bound; each reads back in Ruby as C left it, and many
+# made and dropped in a row are let go (a collection between them)
+mb = 1 << 20
+check(A.big_new(3 * mb, 122) == 'z' * (3 * mb))
+big_s = 'a' * (2 * mb)
+check(A.big_fill(big_s, 113).equal?(big_s) && big_s == 'q' * (2 * mb))
+A.big_resize(big_s, 10, 0)
+check(big_s == 'q' * 10)
+A.big_resize(big_s, 3 * mb, 114)
+check(big_s.bytesize == 3 * mb && big_s.start_with?('q' * 10) && big_s.end_with?('rrr') && big_s.count('r') == 3 * mb - 10)
+check(A.big_cat(+'x', 600).bytesize == 1 + 600 * 4096)
+check((1..40).all? { |i| s = A.big_new(mb + i, 65 + i % 26); GC.start if i % 8 == 0; s.bytesize == mb + i && s.getbyte(mb) == 65 + i % 26 })
+check(Array.new(6) { |i| A.big_fill('b' * (mb + i), 100 + i) }.each_with_index.all? { |s, i| s == (100 + i).chr * (mb + i) })
+# rb_str_new(NULL, n) of a big n is made in its C struct and reaches Ruby
+# when C has written it: Ruby reads the first half C wrote, then both halves
+# after C wrote more, then what rb_str_resize / rb_str_set_len /
+# rb_str_modify left; a data object that holds one alone keeps it across
+# collections; one a stopped Fiber holds survives a collection
+zn = 3 * mb
+# (only what C wrote is compared: CRuby leaves the rest of rb_str_new(NULL, n)
+#  as malloc gave it)
+peek = ->(s) { [s.bytesize, s.byteslice(0, zn / 2) == 'a' * (zn / 2)] }
+seen, again, zs = A.zeroed_steps(zn, peek, :none)
+check(seen == [zn, true] && again == [zn, true] && zs == 'a' * (zn / 2) + 'b' * (zn - zn / 2))
+_, _, zs = A.zeroed_steps(zn, peek, :resize)
+check(zs == 'r' + 'a' * (zn / 4 - 1))
+_, _, zs = A.zeroed_steps(zn, peek, :set_len)
+check(zs.bytesize == zn - 1 && zs.end_with?('bbs') && zs.start_with?('aaa'))
+_, _, zs = A.zeroed_steps(zn, peek, :modify)
+check(zs.bytesize == zn && zs.start_with?('am') && zs.end_with?('bb'))
+zh = A.zeroed_holder(zn, 104)
+3.times { GC.start; 'x' * 1000 }
+check(A.zeroed_held(zh) == 'h' * zn)
+zf = Fiber.new { z = A.zeroed_holder(zn, 102); Fiber.yield; A.zeroed_held(z) }
+zf.resume
+2.times { GC.start }
+check(zf.resume == 'f' * zn)
+check((1..12).all? { |i| _, _, z = A.zeroed_steps(mb + i, ->(s) { s.bytesize }, :none); GC.start if i % 4 == 0; z.bytesize == mb + i && z.getbyte(0) == 97 && z.getbyte(mb + i - 1) == 98 })
 puts "api contracts: #{$count} passed"

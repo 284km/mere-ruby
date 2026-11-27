@@ -19,12 +19,13 @@ module RubyVM::AbstractSyntaxTree
   class << self
     def __node_id_for_location(loc) # :nodoc:
       path = loc.absolute_path
-      return -1 unless path && File.file?(path)
-      stat = File.stat(path)
+      eval_nodes = loc.instance_variable_get(:@__eval_nodes)
+      return -1 unless eval_nodes || (path && File.file?(path))
+      stat = File.stat(path) unless eval_nodes
       line = loc.lineno
       want = loc.instance_variable_get(:@__callee)
       own = loc.base_label.to_s.to_sym
-      key = [path, stat.mtime, stat.size, line, want, own]
+      key = [eval_nodes || path, stat&.mtime, stat&.size, line, want, own]
       ids = (@__nid_ids ||= {})
       return ids[key] if ids.key?(key)
 
@@ -33,7 +34,19 @@ module RubyVM::AbstractSyntaxTree
       index_key = key[0, 3]
       unless @__nid_index_key == index_key
         index = {}
-        __nid_index(Prism.parse_file(path).value, index)
+        if eval_nodes
+          # The method owns compact rows, not source text, nodes or a frame.
+          # IDs were read from the complete compilation unit before its tree
+          # was discarded. Line offsets affect lookup, not Prism node IDs.
+          eval_nodes.each_line do |row|
+            line_no, type, id, names, target = row.chomp.split("\t", 5)
+            entry = [type.to_sym, id.to_i, names.split("\x1f").map { |name| name.to_sym },
+                     target && !target.empty? ? target.to_i : nil]
+            (index[line_no.to_i] ||= []) << entry
+          end
+        else
+          __nid_index(Prism.parse_file(path).value, index)
+        end
         @__nid_index_key = index_key
         @__nid_index = index
       end
@@ -107,7 +120,21 @@ module RubyVM::AbstractSyntaxTree
     def __nid_names(node)
       case node.type
       when :lambda_node, :block_node then []
-      when :call_node, :constant_read_node, :constant_path_node, :def_node then [node.name]
+      when :call_node
+        names = [node.name]
+        # A literal forwarding target describes the call represented by
+        # this node as well as its sender. Keep ambiguity handling above:
+        # several possible calls still have no uniquely justified node id.
+        if %i[send __send__ public_send const_get].include?(node.name)
+          arg = node.arguments&.arguments&.first
+          if arg && (arg.type == :symbol_node || arg.type == :string_node)
+            target = arg.unescaped
+            target = target.split("::").last || target if node.name == :const_get
+            names << target.to_sym
+          end
+        end
+        names
+      when :constant_read_node, :constant_path_node, :def_node then [node.name]
       when :call_operator_write_node then [node.read_name, node.write_name, node.binary_operator]
       when :call_and_write_node, :call_or_write_node then [node.read_name, node.write_name]
       when :index_operator_write_node then [:[], :[]=, node.binary_operator]
