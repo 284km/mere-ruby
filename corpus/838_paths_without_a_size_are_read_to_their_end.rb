@@ -65,3 +65,21 @@ p File.read("/dev/zero", 0)
 p File.read(__FILE__, 2).encoding, File.read(__FILE__, 2, 1).encoding, File.read(__FILE__).encoding
 t("pipe offset")  { piped("abcdefgh") { |p| File.read(p, 3, 2) } }
 t("pipe offset 0") { piped("abc") { |p| File.binread(p, 2, 0) } }
+
+# a negative length or offset is refused before anything is read: /dev/zero
+# never ends. IO.read refuses a negative offset first; IO.binread seeks to it,
+# which a character device takes and a pipe refuses, and then refuses a
+# negative length.
+%i[read binread].each do |m|
+  [File, IO].each do |k|
+    t("#{k}.#{m} zero -1")    { k.send(m, "/dev/zero", -1) }
+    t("#{k}.#{m} zero -1 0")  { k.send(m, "/dev/zero", -1, 0) }
+    t("#{k}.#{m} zero 2 -1")  { k.send(m, "/dev/zero", 2, -1) }
+    t("#{k}.#{m} zero -1 -1") { k.send(m, "/dev/zero", -1, -1) }
+    t("#{k}.#{m} pipe -1")    { piped("abc") { |p| k.send(m, p, -1) } }
+    t("#{k}.#{m} pipe -1 0")  { piped("abc") { |p| k.send(m, p, -1, 0) } }
+    t("#{k}.#{m} pipe 1 -1")  { piped("abc") { |p| k.send(m, p, 1, -1) } }
+    t("#{k}.#{m} file -1")    { k.send(m, __FILE__, -1) }
+    t("#{k}.#{m} file 1 -1")  { k.send(m, __FILE__, 1, -1) }
+  end
+end

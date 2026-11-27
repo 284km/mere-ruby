@@ -20,6 +20,14 @@ With a length, `File.read` and `File.binread` read such a path only as far as th
 - an offset is a seek, which a pipe refuses -- Errno::ESPIPE "Illegal seek @ rb_io_seek", even for an offset of 0;
 - a read with a length is BINARY, as ruby tags it, the length possibly ending mid-character. Of a regular file it was UTF-8 on main too.
 
+The refusals of a negative length or offset now come before the read (second review, Major). `raise_exc` records the exception and returns, so the arm went on to read: `File.read("/dev/zero", -1)` took the -1 for "no length", read a device without an end and never returned. ruby and main raise ArgumentError at once. The order is ruby's, asked of the reference for File and IO, read and binread, over /dev/zero, a pipe and a regular file:
+
+- `read` refuses a negative offset first (ArgumentError);
+- then the seek: a pipe refuses any offset (ESPIPE). `binread` seeks to a negative offset as well: a regular file refuses it (EINVAL "@ rb_io_seek", which this arm wrote without the "@ rb_io_seek"), and a character device takes it;
+- a negative length comes last (ArgumentError).
+
+`IO.read` is the prelude's. It refused a negative length before the offset and before the seek, and `File#seek` here does not refuse a pipe, so `IO.read(pipe, -1, 0)` answered ArgumentError where ruby answers ESPIPE. It now refuses the offset, asks `File.pipe?` when an offset is given, seeks, and then refuses the length. (`File#seek` on a File over a pipe still moves without ESPIPE; that is outside this change.)
+
 A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
 
 `read_file` is still used where the path is known to be regular:
@@ -40,6 +48,7 @@ Corpus 838 covers:
 - regular files: whole, with a length and an offset, empty, empty with a length, a directory (EISDIR) and a missing one (ENOENT);
 - character devices with a length: `/dev/urandom` (16 and 8 bytes), `/dev/zero` (with an offset, and with a length of 0), and the encodings of reads with and without a length;
 - a pipe read with an offset, and with an offset of 0: ESPIPE;
+- a negative length, a negative offset and both, for `File` and `IO`, `read` and `binread`, over `/dev/zero`, a pipe and a regular file;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
 
@@ -74,5 +83,3 @@ On 391b560e:
 - `tools/loop_rss_check.sh`: all 14 loops within their bounds.
 - Linux (arm64, docker): /proc as above, both engines.
 - After the review fix: the same corpus, vm_corpus, vm_check, root check and loop_rss_check again, all passing.
-
-CHECKED
