@@ -1,144 +1,225 @@
-# Reuse fresh keyword packets for a pure keyword rest
+# Reuse fresh keyword-rest packets
 
-## Cause and scope
+A method, Proc or lambda receiving only a named **rest previously allocated a second Hash to bind a completed fresh keyword packet. Transfer ownership of that unexposed packet. Forwarded, permanently flagged and ObjectSpace-exposed packets remain borrowed and receive an independent callee Hash. Acquire the rest before default callbacks, retaining validation and local-binding order. No dummy objects or accounting-only work are added to ordinary calls.
 
-Calling a Ruby method, Proc or Lambda with only a named **kwargs parameter
-created a caller Hash and copied it into a second callee Hash. A completed,
-fresh keyword packet can itself become the named keyword rest. The original
-Hash supplied through **input remains independent: the call-site producer
-already copied it. An empty call still creates the observable callee Hash.
+The reviewed bare-super P2 remains fixed: restore the forwarding frame's saved keyword provenance at every implicit-super boundary, after a previous consumer or super. Current main is integrated with its frame/ivar doors and callback boundaries. Corpus 994 retains the two bare-super witnesses and independence, capture, conversion/default/seeding exposure controls. Corpus 995 retains the anonymous-rest dependency's keyword-declaration, keyword-expression and live ObjectSpace exposure corrections.
 
-Use the existing keyword-origin map: VNil means borrowed origin, VBool true
-permits reuse of a completed fresh packet. No root, counter or Val tag is
-added. Keyword binding consumes origin. Generic forwarding downgrades the
-packet to borrowed state and records its provenance in its frame, because
-multiple or escaped forwarding calls need independent keyword-rest Hashes.
-Calls with explicit named keywords retain their copy: dropping keys before
-binding defaults needs a separate lifetime argument for the removed values.
+Current validated runtime `e4d98dbcc3235324ac6eab41869c0f5779909931` integrates main `83bc573585b0e73c3266edd2f30fd7d80c2391eb` and anonymous-rest dependency runtime `41c3dac95da23fa65e9b9b467600b5a5a26bb161` (PR #251). The owner merges the dependency first. Documentation-only publication preserves this runtime, generated C and all regression inputs.
 
-## Exposure and lifetime
+## Current-main integration acceptance
 
-ObjectSpace enumeration downgrades a completed packet before publishing its
-handle. If block conversion exposes a packet before binding, the target gets
-an independent Hash, as on Ruby. Positional defaults run after keyword-rest
-binding and may observe that bound Hash. Hash-key callbacks during packet
-construction are different: Ruby may expose and deliver the same Hash. Fresh
-permission is published after seeding, so that case retains the reference
-identity. Permission describes a completed call packet, not absence of every
-possible alias during its construction.
+- Full corpus `--both`: **1007/1007**, hash index ON and OFF.
+- VM corpus: **1007 VM / 0 fallback / 0 differences / 0 failures**, no fallback-list mismatch.
+- **28 focused engine comparisons** match clean Ruby stdout, stderr and exit status, including GC stress50 controls.
+- All ten source gates, record_hygiene before/after, header/vendor and CI-timing checks pass. The corpus driver retains iv-door and shape-statistics preflights.
 
-The returned Hash is an ordinary GC-managed Hash in the target frame and in
-any captured closure. Captured values and later mutations keep their normal
-GC and identity behavior; no counting exclusion hides a live object.
+These are fresh integrated corpus/gate results requested by the owner. Complete unchanged test-file and resource comparisons below were completed before integration, on runtime `6e8094f88322ae0243c075caa5f4096f5ccdac59` against main `6d8a416dec9f1e56f6594c077014fbd90789e719`. They are not relabeled as measurements of the current integrated binary. No full unit suite or Rails cold measurement is run.
 
-## Validation and remaining groups
+Integrated binary SHA-256 `446bc8573bee5b6a0d7429d1c128cab5c1deac3f42fd8f586c56e75e2a7a1a9f`; generated C `9d4953d483aceca58989c5393ed67e9cb433b2f189cd264e7c7392d91ed3bfb6`.
 
-Corpus 994 covers method/Proc/Lambda copies, subclasses and copy hooks,
-repeated forwarding with mutation, explicit-keyword fallback, positional
-reuse, captured values across GC, nested conversion, actual Hash counts,
-ObjectSpace exposure at conversion and default binding, and custom-key
-callbacks during construction. Compare both engines with clean Ruby 4.0.10.
+## Completed pre-integration upstream files
 
-Keep all 76 allocation cases and existing budgets/exclusions. Post the
-allocation file measured alone, evaluator and VM before/after, grouped
-atomic mismatches, max RSS, hardware instructions for method/block/matrix
-and keyword-rest calls, full corpus --both, VM/fallback/difference counts,
-all nine source gates and record_hygiene in the English PR description.
-No full unit-test suite or Rails cold measurement is run. Run one corpus
-sweep at a time and read automated inline review comments after each push.
+Seed 1, complete unchanged files. No new RED, BOTH or EXTRA, case exclusion or driver limit.
 
-This removes a real redundant Hash. Remaining fixed-keyword call packets,
-anonymous rest Arrays, and generic forwarding are distinct representation
-work. CRuby-only concatenation/splat temporaries, missing empty-merger Hashes
-and unused marked-call copies stay documented as not matched; never create
-an unused Ruby object solely to imitate a count.
+| File / engine | Main MATCH / RED | Runtime 6e8094f8 MATCH / RED |
+| --- | ---: | ---: |
+| `ruby/test_keyword.rb` / evaluator | 115 / 0 | 115 / 0 |
+| `ruby/test_keyword.rb` / vm | 115 / 0 | 115 / 0 |
+| `ruby/test_call.rb` / evaluator | 65 / 0 | 65 / 0 |
+| `ruby/test_call.rb` / vm | 65 / 0 | 65 / 0 |
+| `ruby/test_hash.rb` / evaluator | 297 / 1 | 297 / 1 |
+| `ruby/test_hash.rb` / vm | 297 / 1 | 297 / 1 |
+| `ruby/test_allocation.rb` / evaluator | 14 / 62 | 18 / 58 |
+| `ruby/test_allocation.rb` / vm | 14 / 62 | 18 / 58 |
 
-## Review: repeated implicit super
+All 76 allocation cases run. Four positional-splat-plus-keyword-splat method/Proc cases, with and without a block, become MATCH. The existing Hash RED is `TestHashOnly#test_replace_memory_leak` (timeout).
 
-A callee consumes transient keyword origin, including a packet borrowed from
-an enclosing generic forwarding frame. Restore that frame's saved origin
-when zsuper_args expands its private forwarding rest, at every bare-super
-boundary. Restored packets stay borrowed, so separate callee keyword rests
-retain independent Hash identities. This touches only the existing rest
-expansion path, with no extra work on ordinary fixed-arity calls.
+## Allocation causes
 
-Corpus 994 adds consume-then-super and repeated bare super, including an
-identity check for the two returned Hashes. All 19 output lines match clean
-Ruby 4.0.10 on evaluator and VM, also with GC stress 50. GC-root, duplicate
-definition and dead-definition gates pass. Previous whole-file allocation
-results are historical until replayed on this review fix; final whole-file,
-corpus and hardware measurements will be posted in the PR description.
+Groups count mismatching assertions; case sets overlap.
 
-## Current-main integration and corpus number
+| Engine / cause | Main assertions (cases) | Runtime assertions (cases) |
+| --- | ---: | ---: |
+| evaluator / extra Arrays | 218 (10) | 116 (4) |
+| evaluator / absent CRuby Array temporaries | 198 (40) | 346 (46) |
+| evaluator / extra keyword Hashes | 504 (38) | 280 (26) |
+| evaluator / absent CRuby Hash temporaries | 8 (4) | 8 (4) |
+| evaluator / ruby2_keywords decoding temporaries | 8 (4) | 8 (4) |
+| vm / extra Arrays | 218 (10) | 116 (4) |
+| vm / absent CRuby Array temporaries | 198 (40) | 346 (46) |
+| vm / extra keyword Hashes | 504 (38) | 280 (26) |
+| vm / absent CRuby Hash temporaries | 8 (4) | 8 (4) |
+| vm / ruby2_keywords decoding temporaries | 8 (4) | 8 (4) |
 
-Merge main 779c7cc9 after the CI integrity fixes and the Action Pack/C API
-changes. Main now uses corpus 989 through 992 for other regressions; move
-this unmerged program from 990 to the free slot 994. Its descriptive
-filename and assertions are unchanged. Repeat focused comparisons on both
-engines, isolated allocation-file before/after totals, instruction/RSS
-controls, all corpus modes, source gates and record_hygiene against this
-main before the next batched code-and-record push. Earlier head results
-remain historical until the integrated head is measured. One corpus sweep
-at a time; no full unit suite or Rails cold measurement.
+Generic forwarding Arrays remain PR #245 work. Literal keyword-packet representation, named-keyword filtering and Hash source metadata are separate causes. CRuby-only temporary Arrays/Hashes and ruby2_keywords decoding copies remain not matched: mere-ruby does not create those objects, and no unused allocation is manufactured. Every case cause is retained below.
 
-## Follow the iterator-mapping integration
+## Instructions retired before integration
 
-Merge main a9e68981 for the same acceptance baseline as PR 242. Preserve
-main's Hash mapping conversion before iteration and this change's native
-argument ownership. For anonymous rest, consume incoming Array provenance
-before any mapping to_hash callback. Validate the integrated regression and
-main's mapping corpus before recording final-head acceptance; earlier
-779c7cc9 measurements retain their exact revision labels.
+Ordinary O2, identical input and stdout; startup is included.
 
-## Current-main integration before final acceptance
+| Workload / engine | Main | Runtime | Change |
+| --- | ---: | ---: | ---: |
+| `method_call.rb` / evaluator | 3,433,895,181 | 3,443,509,855 | +0.280% |
+| `method_call_200k.rb` / evaluator | 5,894,963,539 | 5,900,773,048 | +0.099% |
+| `block_call.rb` / evaluator | 4,259,149,889 | 4,266,002,188 | +0.161% |
+| `block_call_200k.rb` / evaluator | 7,577,796,157 | 7,583,760,561 | +0.079% |
+| `so_matrix.rb` / evaluator | 200,316,424,707 | 200,512,514,742 | +0.098% |
+| `method_call.rb` / vm | 3,714,342,603 | 3,709,030,199 | -0.143% |
+| `method_call_200k.rb` / vm | 6,477,250,000 | 6,481,531,712 | +0.066% |
+| `block_call.rb` / vm | 5,130,336,450 | 5,134,728,870 | +0.086% |
+| `block_call_200k.rb` / vm | 9,315,646,232 | 9,321,740,250 | +0.065% |
+| `so_matrix.rb` / vm | 214,591,012,221 | 214,843,685,852 | +0.118% |
+| `keyword_rest_method.rb` / evaluator | 4,902,048,853 | 4,802,443,823 | -2.032% |
+| `keyword_rest_proc.rb` / evaluator | 5,877,469,618 | 5,778,787,414 | -1.679% |
+| `keyword_rest_lambda.rb` / evaluator | 6,963,349,364 | 6,861,727,987 | -1.459% |
+| `keyword_rest_method.rb` / vm | 4,923,608,088 | 4,825,427,037 | -1.994% |
+| `keyword_rest_proc.rb` / vm | 6,087,136,267 | 6,000,110,519 | -1.430% |
+| `keyword_rest_lambda.rb` / vm | 7,192,209,647 | 7,096,896,288 | -1.325% |
 
-Integrate main ecd65075, retaining its lexical block/super behavior, singleton
-metadata collection, formatter changes, C API transfer work and monotonic
-clock. Rebuild in O2 and repeat the isolated allocation file on both engines
-against this same main, ownership/bare-super and mapping regressions,
-call/block/matrix and keyword-rest instructions, full corpus ON/OFF, VM
-counts, source gates, record_hygiene and large-file RSS. Earlier a9e68981
-measurements remain historical. Shared admission limits heavy jobs across
-Codex sessions to two; serialize this session's corpus sweeps and isolate
-allocation files. Batch integration, code and records in one validated push.
-The saved origin and private forwarding payload still need reconciliation
-when PR 242/245 meets this independently measured branch.
+Ordinary method/block/matrix totals range from -0.143% to +0.280%; the increases are retained. Keyword-rest method/Proc/lambda controls improve. This is local measurement evidence, not external approval.
 
-## Integrate the keyword-copy review corrections
+## Controlled maximum RSS before integration
 
-Merge local PR 242 source f2c40d61 on current main ccb68952 before the next
-validation. Keep its value-list/call-origin separation and native callback
-entries, its world-aware native Method helper, and this branch's fresh packet
-marks, borrowed forwarding state and keyword-rest ownership transfer. Bare
-super keeps restoring the saved forwarding-frame keyword provenance.
+Whole allocation file measured alone, GC_TIGHT=1 and fixed seed 1. Kernel command and child high-water marks and sampled simultaneous family RSS are separate metrics.
 
-A block binder acquires the actual callee keyword-rest value before a default
-can call Ruby, then consumes the incoming origin before that callback. It
-binds the already acquired rest at its original validation point. This keeps
-the ownership optimization and PR 242's positional-Hash rule together; no
-packet is exposed to Ruby with a stale keyword mark. Add Proc/lambda default
-callbacks with the incoming flagged Hash to corpus 994.
+| Engine | Kernel command bytes main → runtime | Largest child bytes main → runtime | Sampled family KiB main → runtime |
+| --- | ---: | ---: | ---: |
+| evaluator | 412,073,984 → 414,973,952 (+0.704%) | 310,788,096 → 311,066,624 (+0.090%) | 570,912 → 704,688 (+23.432%) |
+| vm | 407,486,464 → 407,486,464 (+0.000%) | 317,095,936 → 317,128,704 (+0.010%) | 665,344 → 603,392 (-9.311%) |
 
-This combined source is local, unbuilt and unaccepted. Replay corpus 987 and
-994 normally/under GC stress on both engines, the complete allocation file
-alone, all source gates/record hygiene, corpus index ON/OFF then VM, instructions
-and controlled large-file RSS. Treat PR 242 as a dependency until it is merged;
-do not relabel the earlier independent-head results as integrated acceptance.
+Largest-child high-water marks change by less than 0.1% on either engine, and the VM command high-water mark is unchanged. Evaluator command RSS increases 0.704%. Sampled evaluator family RSS rises 23.432% while VM family RSS falls 9.311%; the family metric adds simultaneous runner, forked child and wrapper pages rather than measuring one heap. These increases remain visible; they are not described as flat RSS or a universal memory improvement. All controlled allocation outcomes match the complete-file comparison. Earlier measurements in the previous PR description are superseded by these explicitly pinned controls.
 
-Integrate parent source 8f0bd866 and main 85da98fb without manual conflict
-resolution. Preserve the early block keyword-rest acquisition and incoming
-origin retirement, plus the complete Method ivar API port and new main
-runtime changes. The parent focused controls pass; this combined ownership
-source remains unbuilt and needs its own complete validation before a push.
-Only source and git work takes place during parent allocation measurements.
+Own full corpus sweeps are serial; no supplementary runtime is launched by this session during allocation measurement. Shared heavy cap: two across Codex sessions. Code and records share one push. Exact-head bot review, hosted checks and owner merge remain separate.
 
-## Current main and anonymous-rest dependency
+Reference: clean independently built Ruby 4.0.10, revision `a704b7cd95a42cc0cf5f307137bf3aac0285b915`, 46 default / 38 bundled / zero extras, Prism 1.8.2. Compiler `9dec2ff687a08433247dbdb7729bc19c8522e538`, mgz `661a01d8bb68f5acd68e3192bd47f081d179c436`.
 
-Integrate main 6d8a416d and anonymous-rest source bd5d4b09. Keep the current
-frame-area argument slot, native ivar doors and both independent argument
-provenance protocols. PR 251 is a dependency until it merges. Earlier
-893-program, allocation, instruction and RSS figures are historical; they
-are not acceptance of this combined source. Rebuild and validate the complete
-994/995/987 regressions and bare-super review controls, affected whole files
-on both engines, allocation alone, controlled RSS and instruction profiles,
-then the serial full corpus and VM sweep before the next batched push.
+Record: `loop/2026-11-25-codex-keyword-rest-ownership.md`.
+
+## Per-case cause groups
+
+| Engine / case | Main | Runtime |
+| --- | --- | --- |
+| evaluator / `TestAllocation::MethodCall#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall#test_anonymous_splat_parameter` | A+ | A- |
+| evaluator / `TestAllocation::MethodCall#test_argument_forwarding` | A+, H+ | A+, H+ |
+| evaluator / `TestAllocation::MethodCall#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall#test_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall#test_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::MethodCall#test_nested_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall#test_nested_argument_forwarding` | A+, H+ | A+, H+ |
+| evaluator / `TestAllocation::MethodCall#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| evaluator / `TestAllocation::MethodCall#test_no_parameters` | A-, H- | A-, H- |
+| evaluator / `TestAllocation::MethodCall#test_optional_parameter` | A- | A- |
+| evaluator / `TestAllocation::MethodCall#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| evaluator / `TestAllocation::MethodCall#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| evaluator / `TestAllocation::MethodCall#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::MethodCall#test_required_parameter` | A- | A- |
+| evaluator / `TestAllocation::MethodCall#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall#test_ruby2_keywords` | R2K | R2K |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_anonymous_splat_parameter` | A+ | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_argument_forwarding` | A+, H+ | A+, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_nested_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_nested_argument_forwarding` | A+, H+ | A+, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_no_parameters` | A-, H- | A-, H- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_optional_parameter` | A- | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_required_parameter` | A- | A- |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::MethodCall::WithBlock#test_ruby2_keywords` | R2K | R2K |
+| evaluator / `TestAllocation::ProcCall#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall#test_anonymous_splat_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall#test_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall#test_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::ProcCall#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| evaluator / `TestAllocation::ProcCall#test_no_parameters` | A-, H- | A-, H- |
+| evaluator / `TestAllocation::ProcCall#test_optional_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| evaluator / `TestAllocation::ProcCall#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| evaluator / `TestAllocation::ProcCall#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::ProcCall#test_required_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall#test_ruby2_keywords` | R2K | R2K |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_anonymous_splat_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_no_parameters` | A-, H- | A-, H- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_optional_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_required_parameter` | A- | A- |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| evaluator / `TestAllocation::ProcCall::WithBlock#test_ruby2_keywords` | R2K | R2K |
+| vm / `TestAllocation::MethodCall#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall#test_anonymous_splat_parameter` | A+ | A- |
+| vm / `TestAllocation::MethodCall#test_argument_forwarding` | A+, H+ | A+, H+ |
+| vm / `TestAllocation::MethodCall#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall#test_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall#test_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::MethodCall#test_nested_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall#test_nested_argument_forwarding` | A+, H+ | A+, H+ |
+| vm / `TestAllocation::MethodCall#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| vm / `TestAllocation::MethodCall#test_no_parameters` | A-, H- | A-, H- |
+| vm / `TestAllocation::MethodCall#test_optional_parameter` | A- | A- |
+| vm / `TestAllocation::MethodCall#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| vm / `TestAllocation::MethodCall#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| vm / `TestAllocation::MethodCall#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::MethodCall#test_required_parameter` | A- | A- |
+| vm / `TestAllocation::MethodCall#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall#test_ruby2_keywords` | R2K | R2K |
+| vm / `TestAllocation::MethodCall::WithBlock#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_anonymous_splat_parameter` | A+ | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_argument_forwarding` | A+, H+ | A+, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_nested_anonymous_splat_and_anonymous_keyword_splat_parameters` | A+, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_nested_argument_forwarding` | A+, H+ | A+, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_no_parameters` | A-, H- | A-, H- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_optional_parameter` | A- | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| vm / `TestAllocation::MethodCall::WithBlock#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_required_parameter` | A- | A- |
+| vm / `TestAllocation::MethodCall::WithBlock#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::MethodCall::WithBlock#test_ruby2_keywords` | R2K | R2K |
+| vm / `TestAllocation::ProcCall#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall#test_anonymous_splat_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall#test_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall#test_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::ProcCall#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| vm / `TestAllocation::ProcCall#test_no_parameters` | A-, H- | A-, H- |
+| vm / `TestAllocation::ProcCall#test_optional_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| vm / `TestAllocation::ProcCall#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| vm / `TestAllocation::ProcCall#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::ProcCall#test_required_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall#test_ruby2_keywords` | R2K | R2K |
+| vm / `TestAllocation::ProcCall::WithBlock#test_anonymous_splat_and_anonymous_keyword_splat_parameters` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall::WithBlock#test_anonymous_splat_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_keyword_and_keyword_splat_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall::WithBlock#test_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall::WithBlock#test_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_no_array_allocation_with_splat_and_nonstatic_keywords` | A- | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_no_parameters` | A-, H- | A-, H- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_optional_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_positional_splat_and_keyword_parameter` | H+ | H+ |
+| vm / `TestAllocation::ProcCall::WithBlock#test_positional_splat_and_keyword_splat_parameter` | H+ | MATCH |
+| vm / `TestAllocation::ProcCall::WithBlock#test_required_and_keyword_splat_parameter` | A-, H+ | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_required_parameter` | A- | A- |
+| vm / `TestAllocation::ProcCall::WithBlock#test_required_positional_and_keyword_parameter` | A-, H+ | A-, H+ |
+| vm / `TestAllocation::ProcCall::WithBlock#test_ruby2_keywords` | R2K | R2K |
