@@ -29,6 +29,25 @@ names.each do |name|
     if name == '@api'
       api = root.join('vendor/psych/lib/psych.rb').read
       api = api[api.index("module Psych\n")..]
+      # ⚠ safe_load and unsafe_load TAKE APART THE TREE they built, once its
+      # value is made (Psych.__drop_tree, lib/psych_native_protocols.rb). The
+      # collector scans the C stack conservatively, and a handle left there by
+      # the parse -- a node's -- kept the whole tree alive after the load had
+      # returned: activerecord's citations fixture, 65,536 rows, kept 393k
+      # nodes and their children Arrays (ruby keeps that last tree too, but a
+      # node there is ~80 bytes; here it is a kilobyte and more). Taken apart,
+      # a stale handle keeps one node. The tree never leaves the load, so
+      # nothing a program can see changes; Psych.parse and parse_stream, whose
+      # tree is the caller's, are left alone. Each line has to be found
+      # exactly once -- a new psych that moved them fails here, not silently.
+      { "    result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols)\n" =>
+          "    result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols).tap { __drop_tree(result) }\n",
+        "    result = visitor.accept result\n" =>
+          "    result = visitor.accept(result).tap { __drop_tree(result) }\n" }.each do |from, to|
+        found = api.scan(from).size
+        abort "gen_psych_lib.rb: expected one #{from.strip.inspect} in vendor/psych/lib/psych.rb, found #{found}" unless found == 1
+        api = api.sub(from) { to }
+      end
       source << api.lines.reject { |line| line.start_with?('require_relative ') }.join
     else
       source << "\n" << root.join("lib/#{name[1..]}.rb").read

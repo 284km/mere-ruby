@@ -4,6 +4,30 @@ module Psych
     [0, 2, 5]
   end
 
+  # Takes apart a tree that safe_load or unsafe_load built for itself, once its
+  # Ruby value is made (tools/gen_psych_lib.rb puts the call there, and says
+  # why). Only those: a tree Psych.parse or parse_stream returns is the
+  # caller's.
+  # (the spine only: the stream, its document, and down while a node has one
+  #  child -- the mapping or sequence the document holds, whose children are
+  #  the rows. A stale handle on the C stack is the root's or near it; with
+  #  the spine cleared it keeps one row at most. Walking the whole tree was
+  #  the first version, and it cost more than it saved: iterating an Array
+  #  built by appends folds it into a list, so the walk copied every
+  #  children Array once more, and the 65,536-row fixture's load reached a
+  #  2.3 GB footprint where the spine's reaches 1.5 to 1.9.)
+  def self.__drop_tree(node)
+    while node
+      kids = node.children
+      break unless kids
+      following = kids.size == 1 ? kids[0] : nil
+      kids.clear
+      node = following
+    end
+    nil
+  end
+  private_class_method :__drop_tree
+
   class ClassLoader
     private
 
