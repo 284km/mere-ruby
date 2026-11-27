@@ -1,56 +1,31 @@
-A targeted post-integration control found an additional observable native
-rest regression: ObjectSpace.each_object(Array) could not expose the rest
-Array retained by a closure, so mutating that Array changed Ruby's later
-closure result but not this runtime's. Publish native rests only when an
-Array-compatible ObjectSpace enumeration observes them, updating the actual
-frame slot. Include retained frames and live/suspended Fiber stack frames.
-No new global registry, normal-call check, accounting adjustment or forced GC
-is added. count_objects and Hash/Class-only enumeration keep the native path.
-Corpus 995 adds direct/keyword capture, active-frame, suspended-Fiber and
-frozen/shareable exposure cases. This correction is unbuilt; the prior
-source95 acceptance job was cancelled before admission, and running builds
-were left alone. Rebuild and replay the integrated head before publication.
+# Anonymous-rest current-main integration and acceptance
 
-Current-main integration requested by the owner: merge 83bc5735. Resolve
-splat conversion by retaining native anonymous-rest/source handling and
-main's invoke_own boundary for Hash/Object to_a callbacks. Existing frame and
-ivar doors remain intact. The Major correction passed 32 focused engine
-comparisons, four unchanged whole files and isolated resource controls at
-05387e86 versus main6d; these retain those identities. Per the owner's
-latest request, repeat corpus --both, VM corpus and source gates on the
-integrated head, then push the code and records together and wait for the
-bot's exact-head review before ready/owner merge. No complete unit suite
-or Rails cold measurement is scheduled. Integrated acceptance is pending.
+Current integrated runtime `41c3dac95da23fa65e9b9b467600b5a5a26bb161` merges main `83bc573585b0e73c3266edd2f30fd7d80c2391eb`. The bot's Major is fixed: a bare positional splat into a keyword-declaring method uses a positional snapshot. Explicit keyword operands retain Ruby's separate copy/borrowing rules, including empty variables/nil versus a literal empty Hash and potentially mutating keyword expressions. Native immutable slices preserve the snapshot without a dummy Ruby Array.
 
-The first follow-up build matched the 94-line corpus and the exact direct
-review witnesses, but an additional 48-control private matrix exposed empty
-keyword distinctions. A literal **{} snapshots the Array; an empty variable
-or **nil can retain it. Follow compile.c's existing expression classification
-for keyword key/value/splat evaluation, reusing the block-pass predicate and
-the existing empty-keyword note. Keep snapshots as native immutable slices.
-The matrix and keyword-expression mutation/GC witnesses are now in corpus
-995. This iteration is unbuilt; earlier partial focus passes are not final
-acceptance, and no new code push is made before the complete checks pass.
+The main conflict is resolved by retaining the shared native splat helper and main's `invoke_own` boundary for Hash/Object `to_a` callbacks. Frame and ivar doors remain intact. Corpus 995 includes 149 output lines, including a 48-control keyword-shape matrix, source append/replacement, frozen-source isolation and mutation/GC during keyword evaluation.
 
-# Follow-up review: keyword declarations without keyword arguments
+## Current-main integration acceptance
 
-The review of 457a91b3 found that borrowing an unaccompanied positional
-Array is incorrect when the target declares keyword parameters, including
-an anonymous or named keyword rest. Ruby snapshots this rest even when no
-keyword Hash is peeled. Retain the existing immutable native snapshot for
-this path; explicit keywords after the spread keep their separate borrowing
-behavior. The change is confined to the existing anonymous-splat slow path.
-Corpus 995 adds source append/replacement across GC and frozen-source
-isolation controls for anonymous/named keyword rest, a named keyword, and
-**nil. Both engines and final-head acceptance are pending. The PR is draft
-again; the earlier results below apply to the earlier runtime only.
+- Corpus `--both`: **1006/1006**, hash index ON and OFF.
+- VM corpus: **1006 VM / 0 fallback / 0 differences / 0 failures**; no fallback-list mismatch.
+- **24 focused engine comparisons** match clean Ruby stdout, stderr and exit status. 995, 987, 664 and main's builtin-refinement callback836 run normally and with stress50; 835 and795 controls run on both engines.
+- All ten source gates, record_hygiene before/after, header/vendor and CI-timing checks pass. Corpus driver retains iv-door and shape-statistics preflights.
+
+Per the owner's current-main replay request, these are fresh integrated corpus/gate results. The unchanged whole-file, allocation, RSS and instruction comparisons below were completed on runtime `05387e86` against main `6d8a416d` before this integration and the cold ObjectSpace publication correction; their exact identities are retained, and they are not relabeled as new-main measurements. The source-only main83 ancestry checkout is not presented as a tested binary. No full unit suite or Rails cold measurement is run.
+
+Live anonymous rest is also published when ObjectSpace enumerates Array-compatible objects. The observer updates the actual retained/active/suspended frame slot before taking its object snapshot, so later mutation and freezing are seen by closures and resumed Fibers. This adds no registry, normal-dispatch check, count_objects change or forced GC. Direct and keyword-declared capture, active frames, suspended Fibers and frozen/shareable exposure match both engines, normally and with stress50.
+
+Code and final records share one push. Exact-head review by the bot, hosted checks and the owner's merge remain separate from these local passes.
+
+Integrated binary SHA-256 `f894163782453870c5601625ca5a96fd5dd92da2f03e82becd65be43a7e41565`; generated C `3777cac6e1dab750716298fe8cb5c79c07c0236acf826bc06bbd77b8b9847397`.
+
+## Completed pre-integration file and resource comparisons
 
 # Anonymous rest arguments in native frame storage
 
-Validated runtime `bd5d4b09a835919f4d1ba657ad5d4ea6e62865fd`, compared with main `6d8a416dec9f1e56f6594c077014fbd90789e719`. This integrates
+Validated runtime `05387e86418293d8e1f9cb09ec3a0aeb228c6770`, compared with main `6d8a416dec9f1e56f6594c077014fbd90789e719`. This integrates
 the frame-area argument slot, String/Array/Hash ivar doors and current main
-controls. The documentation-only final commit preserves this exact runtime,
-generated C, binaries, regression inputs and upstream test files.
+controls. The earlier replay used the runtime and binary identities stated in this subsection; the current integrated runtime is identified above.
 
 ## Result and implementation
 
@@ -74,9 +49,29 @@ No allocation counter, exclusion, GC policy, budget or upstream test changes.
 The integrated replay also fixed keyword peeling: a flagged final Hash that
 becomes keywords must not remain in a borrowed positional rest. Keep the
 already bound positional slice; explicit keywords after a spread still allow
-borrowing. Corpus 995 now has 78 output lines covering this and capture/GC,
+borrowing. Expanded corpus 995 covers both review findings and capture/GC,
 frozen state, isolation diagnostics, block conversion, reflection and 10,000
 arguments. No unused Ruby object is created to imitate a CRuby temporary.
+
+The follow-up P2 at 457a91b3 is corrected: keyword-declaring methods called
+without an incoming keyword packet snapshot positional rest instead of
+borrowing the caller's Array. The existing immutable native slice preserves
+later source append/replacement and frozen-source isolation semantics,
+without manufacturing a Ruby Array. This eligibility check is inside the
+existing anonymous-splat slow path. The corpus covers anonymous/named keyword
+rest, a named keyword and **nil, retaining explicit-keyword borrowing controls.
+The exact direct-call review witnesses also run normally and with stress50.
+The earlier ready state was withdrawn when this finding arrived; readiness
+requires this new runtime's acceptance and the post-push comment audit.
+
+The expanded regression also distinguishes explicit empty keyword syntax:
+**empty and **nil can retain the spread source, while a literal **{} and
+potentially mutating keyword expressions snapshot it. The key/value/splat
+classification follows the same rule as the existing block-pass classifier.
+The 48 shape controls and keyword-expression mutation/GC witnesses are part
+of the 144-line corpus 995, which matches both engines normally and at
+GC stress50. Native immutable slices retain the snapshot without an unused
+Ruby Array.
 
 ## Complete upstream files
 
@@ -124,15 +119,15 @@ Same inputs and outputs, ordinary O2 builds. Counts include startup.
 
 | Workload | Evaluator main → runtime | VM main → runtime |
 | --- | ---: | ---: |
-| `method_call.rb` | 3,446,823,277 → 3,421,364,678 (-0.739%) | 3,707,925,775 → 3,709,458,741 (+0.041%) |
-| `method_call_200k.rb` | 5,901,609,617 → 5,910,137,287 (+0.144%) | 6,476,140,470 → 6,484,007,363 (+0.121%) |
-| `block_call.rb` | 4,260,208,649 → 4,266,906,263 (+0.157%) | 5,136,699,327 → 5,137,743,822 (+0.020%) |
-| `block_call_200k.rb` | 7,582,144,110 → 7,588,491,331 (+0.084%) | 9,318,702,030 → 9,330,312,717 (+0.125%) |
-| `so_matrix.rb` | 200,437,802,712 → 200,615,865,919 (+0.089%) | 214,666,868,565 → 214,774,955,350 (+0.050%) |
-| `anonymous_rest_call.rb` | 4,719,189,148 → 4,484,211,967 (-4.979%) | 4,810,243,900 → 4,824,835,023 (+0.303%) |
-| `anonymous_rest_borrowed.rb` | 3,138,053,763 → 2,919,218,349 (-6.974%) | 2,983,438,115 → 2,924,891,917 (-1.962%) |
+| `method_call.rb` | 3,440,159,101 → 3,445,759,723 (+0.163%) | 3,705,945,873 → 3,712,213,508 (+0.169%) |
+| `method_call_200k.rb` | 5,907,120,955 → 5,914,202,383 (+0.120%) | 6,477,998,639 → 6,492,959,264 (+0.231%) |
+| `block_call.rb` | 4,265,552,772 → 4,277,223,464 (+0.274%) | 5,138,302,602 → 5,144,438,208 (+0.119%) |
+| `block_call_200k.rb` | 7,591,863,778 → 7,589,082,427 (-0.037%) | 9,318,885,253 → 9,329,766,048 (+0.117%) |
+| `so_matrix.rb` | 200,441,318,003 → 200,892,537,422 (+0.225%) | 214,719,586,439 → 215,435,994,747 (+0.334%) |
+| `anonymous_rest_call.rb` | 4,736,542,591 → 4,484,876,906 (-5.313%) | 4,820,914,015 → 4,850,855,106 (+0.621%) |
+| `anonymous_rest_borrowed.rb` | 3,163,134,923 → 2,956,695,657 (-6.526%) | 2,990,033,403 → 2,965,916,033 (-0.807%) |
 
-Ordinary method/block/matrix totals range from -0.739% to +0.157%; no material ordinary-call regression is established. Evaluator anonymous-rest controls reduce instructions by 4.979% and 6.974%. VM borrowed-source forwarding reduces 1.962%; the direct anonymous-rest VM control increases 0.303% and is retained explicitly. No counter-only operation is added to every ordinary call.
+Ordinary method/block/matrix totals range from -0.037% to +0.334%. The increases remain explicit; no material ordinary-call regression is established at this scale. Evaluator anonymous-rest controls improve 5.313% for direct calls and 6.526% for borrowed sources. VM borrowed-source forwarding improves 0.807%, while the direct anonymous-rest control increases 0.621%; no claim of universal VM improvement is made. The keyword-expression classification is confined to calls that already have a splat, and no counting-only operation or dummy Ruby object is added to every ordinary call. This is a local performance assessment, not external approval.
 
 ## Controlled maximum RSS
 
@@ -142,23 +137,23 @@ family peaks are distinct measurements; no Ruby observer or forced GC is added.
 
 | Engine | Kernel command bytes main → runtime | Largest child bytes main → runtime | Sampled family KiB main → runtime |
 | --- | ---: | ---: | ---: |
-| evaluator | 411,877,376 → 413,728,768 (+0.450%) | 310,837,248 → 310,984,704 (+0.047%) | 727,008 → 648,976 (-10.733%) |
-| vm | 406,913,024 → 408,272,896 (+0.334%) | 317,161,472 → 317,161,472 (+0.000%) | 738,352 → 725,376 (-1.757%) |
+| evaluator | 310,886,400 → 311,918,592 (+0.332%) | 310,886,400 → 311,918,592 (+0.332%) | 563,808 → 496,832 (-11.879%) |
+| vm | 316,899,328 → 317,440,000 (+0.171%) | 316,899,328 → 317,440,000 (+0.171%) | 401,648 → 461,760 (+14.966%) |
 
-Fresh main337 whole-file controls retain every original sample. Command high-water marks rise by about 0.450% on evaluator and 0.334% on VM; these increases are disclosed, not rounded to zero. The largest-child marks differ by about 0.047% and 0.000%, while the sampled simultaneous family peaks are lower on both engines. No material retained-memory increase is established by these controlled runs. The 20 earlier alternating samples use main7a/source60d4 and remain historical evidence with their own identities, not measurements of this runtime. Final correctness validation may proceed; completed performance controls, review and owner merge are still required.
+Current corrected-source whole-file controls retain all four runs. Kernel command/largest-child maxima rise 0.332% on evaluator and 0.171% on VM; these small increases are disclosed, not rounded to zero. Sampled simultaneous family RSS falls 11.879% on evaluator but rises 14.966% on VM (401,648 → 461,760 KiB). The VM sampled peak moves from MethodCall#test_argument_forwarding on main to Literal#test_hash_literal on this runtime; the dominant child high-water marks remain 316,899,328 → 317,440,000 bytes. Evaluator peaks likewise move from array literal to hash literal. The family metric counts simultaneous resident pages across runner, forked child and wrappers, and is not one process's heap. Peak-event components and every high-water measurement are retained. This does not establish a material retained-memory regression; the sampled-family increase remains visible for review. All 76 case outcomes remain identical under tight GC and seed 1. This local assessment permits final correctness checks and is separate from external review and owner merge. Earlier main7a/source60d4 samples retain their original identities.
 
 The earlier five alternating pairs per engine used main7a and source60d4.
 All 20 samples and their initial four controls remain in the JSON with their
 original identities. They are historical, not current-main measurements.
 
-## Final local acceptance
+### Pre-integration complete replay
 
-- Corpus `--both`: **985/985 match**, hash index ON and OFF (669.519 s).
-- VM corpus: **985 VM / 0 fallback / 0 differences / 0 failures** (214.325 s).
+- Corpus `--both`: **985/985 match**, hash index ON and OFF (775.962 s).
+- VM corpus: **985 VM / 0 fallback / 0 differences / 0 failures** (232.089 s).
   No fallback-list mismatch; unchanged iv-door and shape-statistics preflights run.
-- **24 focused engine comparisons** match reference stdout, stderr and exit status.
-  995, 987 and existing 664 run normally and with stress50; main 949/1119,
-  reader834, ivar1066/1067 and box1112 controls run normally on both engines.
+- **32 focused engine comparisons** match reference stdout, stderr and exit status.
+  995, 987, existing 664 and exact direct P2 witnesses run normally and with
+  stress50; lexical yield, Method/frame/reader/ivar/box controls run on both engines.
 - All ten source gates PASS, including iv_door and bracket-depth.
   record_hygiene PASS before/after sweeps. Header/vendor and CI-timing checks PASS.
 
@@ -176,8 +171,8 @@ Reference: independently built clean Ruby 4.0.10, source revision
 extra gems, Prism 1.8.2. Compiler `9dec2ff687a08433247dbdb7729bc19c8522e538`,
 mgz `661a01d8bb68f5acd68e3192bd47f081d179c436`.
 
-Binary SHA-256: `8056d420057e9b03647e6118f757cfa74c64a83532fda4be2aae24f1919dfc51`.
-Generated C SHA-256: `dcbe662cb5d85a94cc2be9a3ad94963c52e22f0d1109002a060f951408aec2a2`.
+Binary SHA-256: `ccb0cd75722e0cd951147851c1328bdcb2d90a4472e49e662b653c48f61b84dc`.
+Generated C SHA-256: `2bae2356ace6c210dc188c9d583f47b70710d75dc8a45a5e845719cad6cec328`.
 
 ## Per-case cause groups
 
