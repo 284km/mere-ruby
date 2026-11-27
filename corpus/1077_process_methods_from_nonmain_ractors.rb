@@ -64,3 +64,23 @@ p Ractor.new {
   end
 }.value
 p UserClosure1077.read
+
+# ...and so is a program's closure that replaces one of the prelude's methods,
+# whichever way it is defined: it is the program's now.
+secret = ["private"]
+Process.define_singleton_method(:argv0, proc { secret })
+Process.define_singleton_method(:groups) { secret }
+Process.singleton_class.define_method(:maxgroups) { secret }
+Process.singleton_class.class_exec do
+  define_method(:clock_getres, ->(*) { secret })
+end
+%i[argv0 groups maxgroups clock_getres].each do |name|
+  p Ractor.new(name) { |n|
+    begin
+      Process.public_send(n, *(n == :clock_getres ? [Process::CLOCK_MONOTONIC] : []))
+    rescue RuntimeError => error
+      [n, error.class, error.message]
+    end
+  }.value
+  p Process.public_send(name, *(name == :clock_getres ? [Process::CLOCK_MONOTONIC] : []))
+end
