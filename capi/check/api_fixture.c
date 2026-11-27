@@ -50,6 +50,71 @@ static VALUE freeze(VALUE self, VALUE obj) { (void)self; rb_obj_freeze(obj); ret
 static VALUE store(VALUE self, VALUE ary, VALUE index, VALUE value) { (void)self; rb_ary_store(ary, NUM2LONG(index), value); return ary; }
 /* What sqlite3's callback frame asks on every prepare and step. */
 static VALUE thread_current(VALUE self) { (void)self; return rb_thread_current(); }
+/* Strings of a megabyte and more: their buffers are mapped (core.c's big
+ * buffers), made, written, resized and let go as any other */
+static VALUE big_new(VALUE self, VALUE n, VALUE ch) {
+    (void)self;
+    long len = NUM2LONG(n);
+    VALUE s = rb_str_new(NULL, len);
+    memset(RSTRING_PTR(s), NUM2INT(ch), (size_t)len);
+    return s;
+}
+/* rb_str_new(NULL, n) of a big n: the String is made in its struct and
+ * reaches Ruby when C has written it. C writes the first half, lets Ruby read
+ * it (`peek`), writes the second half, and then resizes, sets the length or
+ * modifies as `how` says; Ruby must see each state as C left it. */
+static VALUE zeroed_steps(VALUE self, VALUE n, VALUE peek, VALUE how) {
+    (void)self;
+    long len = NUM2LONG(n);
+    VALUE s = rb_str_new(NULL, len);
+    memset(RSTRING_PTR(s), 'a', (size_t)(len / 2));
+    VALUE seen = rb_funcall(peek, rb_intern("call"), 1, s);
+    memset(RSTRING_PTR(s) + len / 2, 'b', (size_t)(len - len / 2));
+    VALUE again = rb_funcall(peek, rb_intern("call"), 1, s);
+    ID h = SYM2ID(how);
+    if (h == rb_intern("resize")) { rb_str_resize(s, len / 4); RSTRING_PTR(s)[0] = 'r'; }
+    else if (h == rb_intern("set_len")) { rb_str_set_len(s, len - 1); RSTRING_PTR(s)[len - 2] = 's'; }
+    else if (h == rb_intern("modify")) { rb_str_modify(s); RSTRING_PTR(s)[1] = 'm'; }
+    return rb_ary_new3(3, seen, again, s);
+}
+/* ...and one a data object holds alone, marked by its dmark */
+struct zeroed_holder { VALUE str; };
+static void zeroed_holder_mark(void *p) { rb_gc_mark(((struct zeroed_holder *)p)->str); }
+static const rb_data_type_t zeroed_holder_type = { "ApiFixture::ZeroedHolder", { zeroed_holder_mark, RUBY_TYPED_DEFAULT_FREE, NULL }, 0, 0, 0 };
+static VALUE zeroed_holder(VALUE self, VALUE n, VALUE ch) {
+    (void)self;
+    struct zeroed_holder *h;
+    VALUE obj = TypedData_Make_Struct(rb_cObject, struct zeroed_holder, &zeroed_holder_type, h);
+    long len = NUM2LONG(n);
+    h->str = rb_str_new(NULL, len);
+    memset(RSTRING_PTR(h->str), NUM2INT(ch), (size_t)len);
+    return obj;
+}
+static VALUE zeroed_held(VALUE self, VALUE obj) {
+    (void)self;
+    struct zeroed_holder *h;
+    TypedData_Get_Struct(obj, struct zeroed_holder, &zeroed_holder_type, h);
+    return h->str;
+}
+static VALUE big_fill(VALUE self, VALUE str, VALUE ch) {
+    (void)self;
+    memset(RSTRING_PTR(str), NUM2INT(ch), (size_t)RSTRING_LEN(str));
+    return str;
+}
+static VALUE big_resize(VALUE self, VALUE str, VALUE n, VALUE ch) {
+    (void)self;
+    long was = RSTRING_LEN(str), len = NUM2LONG(n);
+    rb_str_resize(str, len);
+    if (len > was) memset(RSTRING_PTR(str) + was, NUM2INT(ch), (size_t)(len - was));
+    return str;
+}
+static VALUE big_cat(VALUE self, VALUE str, VALUE times) {
+    (void)self;
+    char chunk[4096];
+    memset(chunk, 'c', sizeof chunk);
+    for (long i = 0; i < NUM2LONG(times); i++) rb_str_cat(str, chunk, (long)sizeof chunk);
+    return str;
+}
 static VALUE thread_aref(VALUE self, VALUE thread, VALUE key) { (void)self; return rb_thread_local_aref(thread, SYM2ID(key)); }
 /* A row as sqlite3's step makes one: an Array of the capacity, its elements
  * stored in order, a String frozen with rb_obj_freeze, the row frozen; and
@@ -619,6 +684,13 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "store", store, 3);
     rb_define_singleton_method(mod, "row", row, 1);
     rb_define_singleton_method(mod, "thread_current", thread_current, 0);
+    rb_define_singleton_method(mod, "big_new", big_new, 2);
+    rb_define_singleton_method(mod, "zeroed_steps", zeroed_steps, 3);
+    rb_define_singleton_method(mod, "zeroed_holder", zeroed_holder, 2);
+    rb_define_singleton_method(mod, "zeroed_held", zeroed_held, 1);
+    rb_define_singleton_method(mod, "big_fill", big_fill, 2);
+    rb_define_singleton_method(mod, "big_resize", big_resize, 3);
+    rb_define_singleton_method(mod, "big_cat", big_cat, 2);
     rb_define_singleton_method(mod, "thread_aref", thread_aref, 2);
     rb_define_singleton_method(mod, "default_internal", default_internal, 0);
     rb_define_singleton_method(mod, "aset", aset, 3);

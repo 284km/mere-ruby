@@ -10,6 +10,7 @@
 #include <string.h>
 #include <limits.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 /* ---- calls in progress --------------------------------------------------- */
 struct mr_guard { jmp_buf jump; struct mr_guard *prev; };
@@ -41,11 +42,59 @@ void mr_fatal(const char *message) {
     abort();
 }
 
+/* ---- big buffers ---------------------------------------------------------- */
+/* A buffer of MR_BIG_BYTES or more -- a String's bytes in its mirror, the
+ * transit of a big String -- is mapped, and unmapped when it is let go. From
+ * malloc it went back to malloc, and macOS's malloc keeps freed large blocks
+ * resident for reuse (the large cache): msgpack's packer spec, which hands C
+ * a 6 MB String 22 times and makes a 132 MB one, ended at 1.76 GB with 990 MB
+ * of it freed blocks (ruby: 648 MB). The bound: below it a block is small
+ * enough that malloc reuses it, and at it a copy of the bytes (which every
+ * such buffer gets) costs more than the map and the unmap together.
+ * macOS only: glibc maps and unmaps blocks this big itself (Mere fixes its
+ * threshold at 64 KiB), so elsewhere they stay malloc's, and the map, the
+ * unmap and the fresh pages measured 1.7-6.2% more instructions in loops of
+ * big transfers for no memory back. */
+#define MR_BIG_BYTES ((size_t)1 << 20)
+static size_t big_round(size_t n) {
+    static size_t page;
+    if (!page) page = (size_t)sysconf(_SC_PAGESIZE);
+    return (n + page - 1) & ~(page - 1);
+}
+#if defined(__APPLE__)
+int mr_big(size_t n) { return n >= MR_BIG_BYTES; }
+#else
+int mr_big(size_t n) { (void)n; return 0; }
+#endif
+void *mr_big_alloc(size_t n) {
+    if (!mr_big(n)) return malloc(n);
+    void *p = mmap(NULL, big_round(n), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+/* (`mapped`: what mr_big_alloc said for it -- a buffer C made with malloc and
+ *  the mirror took over is freed as malloc's, whatever its size) */
+void mr_big_free(void *p, size_t n, int mapped) {
+    if (!p) return;
+    if (mapped) munmap(p, big_round(n));
+    else free(p);
+}
+/* A buffer of mr_big_alloc's, from `n` bytes to `want` (the first `n` kept). */
+void *mr_big_realloc(void *p, size_t n, size_t want) {
+    if (!mr_big(n) && !mr_big(want)) return realloc(p, want);
+    if (p && mr_big(n) && mr_big(want) && big_round(n) == big_round(want)) return p;
+    void *q = mr_big_alloc(want);
+    if (!q) return NULL;
+    if (p) memcpy(q, p, n < want ? n : want);
+    mr_big_free(p, n, mr_big(n));
+    return q;
+}
+
 /* ---- transit ------------------------------------------------------------- */
 static VALUE *words;
 static long words_cap, words_put;
 static mere_bytes *bytes_out;       /* C -> interpreter */
 static long bytes_out_cap;
+static int bytes_out_small, bytes_in_small;   /* (bytes_need's runs of small transfers) */
 /* (what C has put in transit for the request it is preparing: words_put
  *  words, and the bytes and the name when these are set. A request reads
  *  them before it does anything else and nothing is kept across one, so
@@ -106,11 +155,30 @@ int mr_capi_set(int i, CapiWord w) {
     words[i] = (VALUE)w.mu_w;
     return 0;
 }
-static mere_bytes *bytes_need(mere_bytes **buffer, long *cap, long n) {
+/* A transit buffer grows to the biggest String that went through it. When it
+ * is big and BYTES_SHRINK_AFTER transfers in a row have used a quarter of it
+ * or less, it goes back to the size of the one at hand: a 132 MB String C
+ * made once was held in transit for the rest of the run. (Not at once: work
+ * that passes big Strings over and over -- an unpacker's feed, a big read --
+ * would map and unmap at every one.) */
+#define BYTES_SHRINK_AFTER 64
+static size_t bytes_size(long cap) { return sizeof(mere_bytes) + (size_t)cap + 1; }
+static mere_bytes *bytes_need(mere_bytes **buffer, long *cap, int *small_runs, long n) {
+    /* (on every platform: a transit buffer held at its biggest is memory the
+     *  process keeps, wherever malloc puts it) */
+    if (*buffer && bytes_size(*cap) >= MR_BIG_BYTES && n <= *cap / 4) {
+        if (++*small_runs >= BYTES_SHRINK_AFTER) {
+            mr_big_free(*buffer, bytes_size(*cap), mr_big(bytes_size(*cap)));
+            *buffer = NULL;
+            *cap = 0;
+            *small_runs = 0;
+        }
+    }
+    else *small_runs = 0;
     if (!*buffer || n > *cap) {
         long want = *cap ? *cap : 256;
         while (want < n) want *= 2;
-        *buffer = realloc(*buffer, sizeof(mere_bytes) + (size_t)want + 1);
+        *buffer = mr_big_realloc(*buffer, *buffer ? bytes_size(*cap) : 0, bytes_size(want));
         if (!*buffer) mr_fatal("out of memory");
         *cap = want;
     }
@@ -118,13 +186,21 @@ static mere_bytes *bytes_need(mere_bytes **buffer, long *cap, long n) {
     return *buffer;
 }
 void mr_put_bytes(const void *p, long n) {
-    mere_bytes *b = bytes_need(&bytes_out, &bytes_out_cap, n);
+    mere_bytes *b = bytes_need(&bytes_out, &bytes_out_cap, &bytes_out_small, n);
     if (n > 0) memcpy(b->data, p, (size_t)n);
     bytes_out_live = 1;
 }
-mere_bytes *mr_capi_bytes(void) { return bytes_out ? bytes_out : bytes_need(&bytes_out, &bytes_out_cap, 0); }
+/* n zero bytes, in transit as they are (rb_str_new(NULL, n)): they were
+ * calloc'ed, copied here and freed -- 881 MB of it in msgpack's packer spec,
+ * every byte of which macOS's malloc then kept */
+void mr_put_zero_bytes(long n) {
+    mere_bytes *b = bytes_need(&bytes_out, &bytes_out_cap, &bytes_out_small, n);
+    if (n > 0) memset(b->data, 0, (size_t)n);
+    bytes_out_live = 1;
+}
+mere_bytes *mr_capi_bytes(void) { return bytes_out ? bytes_out : bytes_need(&bytes_out, &bytes_out_cap, &bytes_out_small, 0); }
 int mr_capi_give(mere_bytes *given) {
-    mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, given->len);
+    mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, &bytes_in_small, given->len);
     if (given->len > 0) memcpy(b->data, given->data, (size_t)given->len);
     b->data[given->len] = 0;
     return 0;
@@ -145,12 +221,12 @@ int mr_capi_give_str(const char *s, CapiWord len) {
         to->taken = 1;
         return 0;
     }
-    mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, n);
+    mere_bytes *b = bytes_need(&bytes_in, &bytes_in_cap, &bytes_in_small, n);
     if (n > 0) memcpy(b->data, s, (size_t)n);
     b->data[n] = 0;
     return 0;
 }
-const mere_bytes *mr_got_bytes(void) { return bytes_in ? bytes_in : bytes_need(&bytes_in, &bytes_in_cap, 0); }
+const mere_bytes *mr_got_bytes(void) { return bytes_in ? bytes_in : bytes_need(&bytes_in, &bytes_in_cap, &bytes_in_small, 0); }
 static void text_set(char **buffer, long *cap, const char *text) {
     long n = (long)strlen(text) + 1;
     if (n > *cap) {
@@ -183,7 +259,7 @@ void mr_transit_save(struct mr_transit *t, long nwords) {
     }
     t->bytes = NULL;
     if (bytes_out && bytes_out_live) {
-        t->bytes = malloc(sizeof(mere_bytes) + (size_t)bytes_out->len + 1);
+        t->bytes = mr_big_alloc(bytes_size(bytes_out->len));
         if (!t->bytes) mr_fatal("out of memory");
         memcpy(t->bytes, bytes_out, sizeof(mere_bytes) + (size_t)bytes_out->len);
     }
@@ -193,7 +269,11 @@ void mr_transit_save(struct mr_transit *t, long nwords) {
 void mr_transit_restore(struct mr_transit *t) {
     if (t->words) { mr_put_words(t->nwords, t->words); free(t->words); }
     else words_put = 0;
-    if (t->bytes) { mr_put_bytes(t->bytes->data, (long)t->bytes->len); free(t->bytes); }
+    if (t->bytes) {
+        long n = (long)t->bytes->len;
+        mr_put_bytes(t->bytes->data, n);
+        mr_big_free(t->bytes, bytes_size(n), mr_big(bytes_size(n)));
+    }
     else bytes_out_live = 0;
     if (t->text) { mr_put_text(t->text); free(t->text); }
     else text_out_live = 0;
