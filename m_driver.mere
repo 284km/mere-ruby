@@ -63,6 +63,8 @@ let core_prelude_a =
   "      bs = ENV.delete(\"BUNDLER_SETUP\")\n" ++
   "      begin\n" ++
   "        require 'rubygems'\n" ++
+  "        require 'bundled_gems'\n" ++
+  "        require 'error_highlight' if Box.__error_highlight\n" ++
   "      ensure\n" ++
   "        ENV[\"BUNDLER_SETUP\"] = bs if bs\n" ++
   "      end\n" ++
@@ -4660,7 +4662,7 @@ let core_prelude_d =
   "  end\n" ++
   "\n" ++
   "  # [[fd, interest], ...] -> the ready bits per entry; a nil fd is a File\n" ++
-  "  def self.__sel_wait(ent, ms, scheduler_wait = true)\n" ++
+  "  def self.__sel_wait(ent, ms, scheduler_wait = true, select_poll = false)\n" ++
   "    fds = []\n" ++
   "    ints = []\n" ++
   "    ent.each do |fd, b|\n" ++
@@ -4669,7 +4671,7 @@ let core_prelude_d =
   "      if i then ints[i] |= b else fds << fd; ints << b end\n" ++
   "    end\n" ++
   "    now = ent.any? \{ |fd, _| fd.nil? } ? 0 : ms\n" ++
-  "    got = IO.__poll(fds, ints, 0)\n" ++
+  "    got = select_poll ? IO.__select_poll(fds, ints, 0) : IO.__poll(fds, ints, 0)\n" ++
   "    if got.all? \{ |b| b == 0 } && now != 0 && !ent.any? \{ |fd, _| fd.nil? }\n" ++
   "      scheduler = Fiber.current_scheduler\n" ++
   "      if scheduler_wait && scheduler && ent.size == 1 && ent[0][2]\n" ++
@@ -4756,7 +4758,7 @@ let core_prelude_d =
   "    sets[2].each \{ |o, io| ent << [io.__sel_fd, 8, io] }\n" ++
   "    # bytes #getc read ahead are ready now, whatever the descriptor says\n" ++
   "    ms = 0 if sets[0].any? \{ |o, io| io.__sel_pending? }\n" ++
-  "    got = __sel_wait(ent, ms, false)\n" ++
+  "    got = __sel_wait(ent, ms, false, true)\n" ++
   "    nr = sets[0].size\n" ++
   "    rd = []\n" ++
   "    sets[0].each_with_index do |pair, i|\n" ++
@@ -6349,9 +6351,25 @@ let core_prelude_f =
   "  @__kids = \{}\n" ++
   "  @__kid_n = 0\n" ++
   "\n" ++
+  // Internal scratch files need the same usable-directory checks as tmpdir.
+  // Rails may point TMPDIR at a directory that has not been created.
   "  def self.__kid_dir\n" ++
-  "    d = ENV[\"TMPDIR\"] || \"/tmp\"\n" ++
-  "    d.end_with?(\"/\") ? d[0..-2] : d\n" ++
+  "    paths = [ENV[\"TMPDIR\"], ENV[\"TMP\"], ENV[\"TEMP\"], \"/tmp\", \".\"]\n" ++
+  "    i = 0\n" ++
+  "    while i < paths.length\n" ++
+  "      path = paths[i]\n" ++
+  "      i += 1\n" ++
+  "      next if path.nil? || path.empty?\n" ++
+  "      begin\n" ++
+  "        stat = File.stat(path)\n" ++
+  "      rescue SystemCallError\n" ++
+  "        next\n" ++
+  "      end\n" ++
+  "      next unless stat.directory? && File.writable?(path)\n" ++
+  "      next if stat.world_writable? && !stat.sticky?\n" ++
+  "      return File.expand_path(path)\n" ++
+  "    end\n" ++
+  "    raise ArgumentError, \"could not find a temporary directory\"\n" ++
   "  end\n" ++
   "\n" ++
   "  def self.__str_arg(a)\n" ++
@@ -7267,6 +7285,7 @@ let core_prelude_f =
   "      'LDSHARED' => darwin ? '$(CC) -bundle' : '$(CC) -shared',\n" ++
   "      'LDSHAREDXX' => darwin ? '$(CXX) -bundle' : '$(CXX) -shared',\n" ++
   "      'OUTFLAG' => '-o ', 'COUTFLAG' => '-o ', 'CSRCFLAG' => '', 'CPPOUTFILE' => '-o conftest.i',\n" ++
+  "      'SOEXT' => darwin ? 'dylib' : 'so',\n" ++
   "      'OBJEXT' => 'o', 'LIBEXT' => 'a', 'ASMEXT' => 'S',\n" ++
   // (ENABLE_SHARED is not said. "no" would be true -- there is no libruby --
   //  but RubyGems names the directory of a gem's built extensions after it
@@ -12777,6 +12796,15 @@ let store_stats = fn world ->
   let _ = row "bytes_arr_store" (map_bytes arr_store) in
   let _ = row "bytes_hash_store" (map_bytes hash_store) in
   let _ = row "bytes_ivars" (map_bytes ivars) in
+  // (note 559 step 2b: the shaped objects, the slab's slots and arena, the shapes)
+  let _ = row "obj_iv" (map_len obj_iv) in
+  let _ = row "iv_slab_slots" (vec_len iv_slab) in
+  let _ = row "iv_shapes" (sh_count ()) in
+  let _ = row "sh_cls_var" (map_len sh_cls_var) in
+  let _ = row "sh_cls_cap" (map_len sh_cls_cap) in
+  let _ = row "bytes_obj_iv" (map_bytes obj_iv) in
+  let _ = row "bytes_iv_slab" (vec_bytes iv_slab) in
+  let _ = row "bytes_sh_slot" (map_bytes sh_slot) in
   let _ = row "bytes_ocls" (map_bytes ocls) in
   let _ = row "bytes_meths" (map_bytes meths) in
   // Logical method counts alone do not show which definition metadata
@@ -12821,8 +12849,8 @@ let store_stats = fn world ->
   // the compaction would look like the memory vanished when it only left the
   // frame the other meter can see.
   let _ = row "bytes_call_names" (map_bytes call_names_s) in
-  let _ = row "bytes_call_files" (map_bytes call_files_s) in
-  let _ = row "bytes_call_meths" (map_bytes call_meths_s) in
+  let _ = row "bytes_call_files" (map_bytes call_file_ids) in
+  let _ = row "bytes_call_meths" (map_bytes call_meth_ids) in
   let _ = row "pos_names" (vec_len pos_names) in
   let _ = row "isa_memo" (map_len isa_memo) in
   let _ = row "bytes_isa_memo" (map_bytes isa_memo) in
@@ -12896,7 +12924,7 @@ let cli_syntax_report = fn (name: str) ->
 // with the class after its first line. The eval is parse-only (cli_opt
 // "evpo": a source that parses there runs nothing); what it cannot say keeps
 // the short report.
-let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+let cli_syntax_message = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (held9: bool) ->
   let (_, _, _, iv9) = world in
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let _ = map_set cli_opt "evpo" "y" in
@@ -12905,10 +12933,17 @@ let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) ->
   let m9 = (if ok9 then ""
             else (match (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) with
                   | VNil -> ""
-                  | e9 -> (match try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil with
+                  | e9 -> (match (if held9 then exc_msg_held world e9
+                                  else try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil) with
                            | VStr h9 -> sget h9
                            | _ -> ""))) in
   let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+  m9;
+// Constructing the printer's exception uses the held parser message, so a
+// user #message override runs only when detailed_message asks it. The plain
+// printer retains its existing normal #message dispatch.
+let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+  let m9 = cli_syntax_message env world name src false in
   if str_eq m9 "" then dflt
   else (let nl9 = str_find_from m9 "\n" 0 in
         if nl9 < 0 then name ++ ": " ++ m9 ++ " (SyntaxError)"
@@ -13114,8 +13149,8 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   //   answered [] and nil for everything). Its local_variables are the names
   //   the script DECLARES -- all of them, known when it was parsed, as ruby's
   //   are -- plus any set through the binding itself (tl_decl / tl_dyn).
-  let _ = (let _ = map_set env "__cref" (mkstr "") in
-           let _ = map_set env "self" VMain in
+  let _ = (let _ = fh_cref_set env (mkstr "") in
+           let _ = fh_self_set env VMain in
            let bid = (handle_base + map_len bind_store) in
            let _ = map_set bind_store (str_of_int bid) env in
            let _ = map_set tl_bid "v" bid in
@@ -13523,7 +13558,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = warn_flush world in
   let _ = register_builtin_consts () in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
-  let _ = lv_set env "self" VMain in   // top-level self is `main`
+  let _ = fh_self_lv_set env VMain in   // top-level self is `main`
   // the top-level env is the main stack's bottom frame for the fiber reclaim
   // pass, which may run in the middle of a statement (fb_env_at, key -1)
   let _ = map_set fb_env_at (0 - 1) env in
@@ -13583,6 +13618,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let outid = alloc_oid ocls in
   let _ = map_set ocls outid "IO" in
   let _ = iv_set ivars outid "__io_fd" (VInt 1) in
+  let _ = iv_set ivars outid "__io_label" (mkstr_e "<STDOUT>" "ASCII-8BIT") in
   // The RUBY_* description constants. RUBY_ENGINE says "ruby" rather than
   // "mere-ruby" on purpose: every gate here is a byte comparison against
   // MRI, so MRI's is the behaviour being emulated, and a library that
@@ -13856,11 +13892,13 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let errid = alloc_oid ocls in
   let _ = map_set ocls errid "IO" in
   let _ = iv_set ivars errid "__io_fd" (VInt 2) in
+  let _ = iv_set ivars errid "__io_label" (mkstr_e "<STDERR>" "ASCII-8BIT") in
   let _ = const_tbl_put "STDERR" (VObj errid) in
   let _ = map_set globals "stderr" (VObj errid) in
   let inid = alloc_oid ocls in
   let _ = map_set ocls inid "IO" in
   let _ = iv_set ivars inid "__io_fd" (VInt 0) in
+  let _ = iv_set ivars inid "__io_label" (mkstr_e "<STDIN>" "ASCII-8BIT") in
   let _ = const_tbl_put "STDIN" (VObj inid) in
   let _ = map_set globals "stdin" (VObj inid) in
   // the main Thread object (always index 0 of the registry), the default
@@ -13877,6 +13915,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = map_set sch_fb mainid 0 in
   // (a long division looks at the scheduler and the traps too: m_numeric.mere)
   let _ = map_set long_op_hook 0 (fn (u: unit) -> long_op_tick world) in
+  let _ = map_set public_big_float_hook 0 (fn (u9: unit) -> numeric_float_overflow_warning world) in
   let tgid = alloc_oid ocls in
   let _ = map_set ocls tgid "ThreadGroup" in
   let _ = map_set dfl_tg "v" (VObj tgid) in
@@ -14086,7 +14125,12 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  operating_system.rb warns and re-raises, test_rubygems)
   let gems_ok = (if str_eq (env_get "MERE_RUBY_NO_GEMS") "" && (if map_has cli_opt "nogems" then false else true)
               && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
-           then try_or_msg (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> let _ = vec_set box_st 4 1 in true))
+           then try_or_msg (fn (u: unit) ->
+                  (let _ = do_require env world noblk false "rubygems" in
+                   let _ = vec_set box_st 4 1 in
+                   let _ = do_require env world noblk false "bundled_gems" in
+                   let _ = (if map_has cli_opt "noerror_highlight" then ()
+                            else (let _ = do_require env world noblk false "error_highlight" in ())) in true))
                   (fn (m: str) -> let _ = note_extern_refused m in false)
            else true) in
   // -r's libraries, required as the script itself would require them.
@@ -14094,7 +14138,14 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //   raising BEGIN does (pre_ok below): reported, at_exit, nothing else
   //   runs. It went to the runtime as "fail: mere-ruby: (ruby exception
   //   raised)", naming nothing.
-  let req_ok = gems_ok && (if map_has cli_reqs "v" then
+  // CRuby's gem_prelude loads this before -r libraries and the main script.
+  // Keeping that order also preserves user prepends to detailed_message.
+  let diagnostics_ok = gems_ok &&
+    (if map_has cli_opt "nosyntax_suggest" || map_has cli_opt "nogems"
+        || (if str_eq (env_get "MERE_RUBY_NO_GEMS") "" then false else true) then true
+     else try_or_msg (fn (u9: unit) -> (let _ = do_require env world noblk false "syntax_suggest/core_ext" in true))
+            (fn (message9: str) -> let _ = note_extern_refused message9 in false)) in
+  let req_ok = diagnostics_ok && (if map_has cli_reqs "v" then
              (let rec reqs9 = fn (xs: str list) ->
                 (match xs with
                  | Nil -> ""
@@ -14124,10 +14175,24 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
              else (let (_, _, ocls9, ivars9) = world in
               let txt9 = (if has_meth world "SyntaxError" "detailed_message" then
                             (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr (map_get cli_opt "synmsg"), Nil)) false) VNil with
+                             // Ruby appends a newline to every -e fragment (ruby.c,
+                             // add_e_script). Our fragments already contain separators;
+                             // include the final newline in Prism's actual CLI input.
+                             // Its EOF diagnostics can differ from eval of the raw text.
+                             let source9 = (if str_eq name "-e" then src ++ "\n" else src) in
+                             let report9 = try_or (fn (u: unit) -> prism_report source9 name 1) "" in
+                             let frame9 = (if str_len report9 > 0 then report9
+                                           else cli_syntax_message env world name src true) in
+                             // Construct from the held parser message. Only the real
+                             // detailed_message dispatch may invoke a user's #message.
+                             let message9 = (if str_len frame9 > 0 then frame9 else map_get cli_opt "synmsg") in
+                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr message9, Nil)) false) VNil with
                              | VObj eid9 ->
                                (let _ = iv_set ivars9 eid9 "__path" (mkstr name) in
-                                match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message" Nil false) VNil with
+                                match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message"
+                                         (let options9 = mkhash (Cons (VSym "highlight", Cons (VBool false, Nil))) in
+                                          let _ = (match options9 with VHsh id9 -> mark_kw id9 | _ -> ()) in
+                                          Cons (options9, Nil)) false) VNil with
                                 | VStr h9 -> name ++ ": " ++ sget h9
                                 | _ -> map_get cli_opt "synerr")
                              | _ -> map_get cli_opt "synerr")
@@ -14546,7 +14611,8 @@ let cli_chdir = fn (d: str) ->
 // warning and nothing else. Only three of them switch anything here: gems
 // (whether rubygems is required first), frozen_string_literal (what a literal
 // with no magic comment is) and rubyopt (whether RUBYOPT is read at all);
-// the rest are accepted and have nothing to switch.
+// syntax_suggest controls the bundled SyntaxError annotation hook. The
+// remaining feature names are accepted and have nothing to switch.
 let cli_feature_names = Cons ("gems", Cons ("error_highlight", Cons ("did_you_mean", Cons ("syntax_suggest",
                           Cons ("rubyopt", Cons ("frozen_string_literal", Cons ("yjit", Cons ("zjit", Nil))))))));
 let rec cli_us = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
@@ -14560,6 +14626,12 @@ let rec cli_feat_find = fn (nm: str) -> fn (fs: str list) ->
     else cli_feat_find nm t;
 let cli_feat_set = fn (f: str) -> fn (on: bool) ->
   if str_eq f "gems" then (if on then (if map_has cli_opt "nogems" then map_delete cli_opt "nogems" else ()) else map_set cli_opt "nogems" "1")
+  else if str_eq f "error_highlight" then
+    (if on then (if map_has cli_opt "noerror_highlight" then map_delete cli_opt "noerror_highlight" else ())
+     else map_set cli_opt "noerror_highlight" "1")
+  else if str_eq f "syntax_suggest" then
+    (if on then (if map_has cli_opt "nosyntax_suggest" then map_delete cli_opt "nosyntax_suggest" else ())
+     else map_set cli_opt "nosyntax_suggest" "1")
   else if str_eq f "rubyopt" then (if on then (if map_has cli_opt "norubyopt" then map_delete cli_opt "norubyopt" else ()) else map_set cli_opt "norubyopt" "1")
   else if str_eq f "frozen_string_literal" then
     (let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in

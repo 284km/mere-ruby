@@ -54,3 +54,51 @@ run_input(<<~'RUBY')
   value = LineNumber.new
   p [:coercion, STDIN.__send__(:lineno=, value).equal?(value), STDIN.lineno, $.]
 RUBY
+
+# Stage the input after both readers actually suspend, then wait for the
+# first completed read before supplying the second line. No sleep race.
+def run_staged_readers(method, affinity)
+  source = <<~'RUBY'
+    method, affinity = ARGV.shift, ARGV.shift == 'argf'
+    STDOUT.sync = true
+    ARGF.file if affinity
+    workers = 2.times.map do
+      Thread.new do
+        line = STDIN.__send__(method)
+        p [:read, line, STDIN.lineno, $., affinity ? ARGF.lineno : nil]
+      end
+    end
+    Thread.pass until workers.all? { |worker| worker.status == 'sleep' }
+    p [:ready, method, affinity]
+    workers.each { |worker| raise 'reader timed out' unless worker.join(15) }
+    p [:final, STDIN.lineno, $., affinity ? ARGF.lineno : nil]
+  RUBY
+  error_path = "stdin-staged-#{method}-#{affinity}-#{Process.pid}.err"
+  begin
+    command = [RbConfig.ruby, '-e', source, method, affinity ? 'argf' : 'direct']
+    IO.popen(command, 'r+', err: error_path) do |pipe|
+      pipe.sync = true
+      read_event = -> do
+        raise 'staged reader output timed out' unless IO.select([pipe], nil, nil, 20)
+        line = pipe.gets
+        raise 'staged reader exited early' unless line
+        print line
+      end
+      read_event.call
+      pipe.write("A\n")
+      pipe.flush
+      read_event.call
+      pipe.write("B\n")
+      pipe.flush
+      read_event.call
+      read_event.call
+    end
+    p [File.binread(error_path), $?.exitstatus]
+  ensure
+    File.unlink(error_path) if File.exist?(error_path)
+  end
+end
+%w[gets readline].each do |method|
+  run_staged_readers(method, false)
+  run_staged_readers(method, true)
+end

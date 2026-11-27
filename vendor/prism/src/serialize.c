@@ -2243,6 +2243,33 @@ pm_serialize_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const 
     pm_options_free(&options);
 }
 
+PRISM_EXPORTED_FUNCTION void
+pm_serialize_ripper_lex(pm_buffer_t *buffer, const uint8_t *source, size_t size, const char *data) {
+    pm_options_t options = { 0 };
+    pm_options_read(&options, data);
+
+    pm_parser_t parser;
+    pm_parser_init(&parser, source, size, &options);
+    parser.ripper_lex_compat = true;
+
+    pm_lex_callback_t lex_callback = (pm_lex_callback_t) {
+        .data = (void *) buffer,
+        .callback = serialize_token,
+    };
+
+    parser.lex_callback = &lex_callback;
+    pm_node_t *node = pm_parse(&parser);
+
+    // Append 0 to mark end of tokens.
+    pm_buffer_append_byte(buffer, 0);
+
+    pm_serialize_metadata(&parser, buffer);
+
+    pm_node_destroy(&parser, node);
+    pm_parser_free(&parser);
+    pm_options_free(&options);
+}
+
 /**
  * Parse and serialize both the AST and the tokens represented by the given
  * source to the given buffer.

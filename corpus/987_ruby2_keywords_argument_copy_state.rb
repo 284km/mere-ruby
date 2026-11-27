@@ -1,0 +1,489 @@
+# Argument copies are observable through identity, flags, subclass state and
+# mutation. Native keyword copies must not invoke Ruby copy hooks.
+def self.plain_method(*a) = a
+def self.marked_method(*a) = a
+singleton_class.send(:ruby2_keywords, :marked_method)
+plain_proc = proc { |*a| a }
+plain_lambda = ->(*a) { a }
+marked_proc = proc { |*a| a }.ruby2_keywords
+original = Hash.ruby2_keywords_hash(a: 1)
+callables = [method(:plain_method), method(:marked_method), plain_proc, plain_lambda, marked_proc]
+callables.each_with_index do |callable, index|
+  tail = callable.call(*[original]).last
+  p [index, tail.equal?(original), Hash.ruby2_keywords_hash?(tail), Hash.ruby2_keywords_hash?(original)]
+end
+class KeywordCopyHash < Hash
+  def dup = raise('Ruby dup called')
+  def initialize_copy(other) = raise('Ruby copy hook called')
+end
+special = KeywordCopyHash.new(:default).compare_by_identity
+key = +'key'
+special[key] = 1
+special.instance_variable_set(:@value, 7)
+special = Hash.ruby2_keywords_hash(special)
+def special.only_original = :singleton
+special.freeze
+callables.each_with_index do |callable, index|
+  tail = callable.call(*[special]).last
+  p [index, tail.equal?(special) || tail.class == KeywordCopyHash, tail.default, tail.compare_by_identity?, tail[key],
+     tail.instance_variable_get(:@value), tail.frozen?, tail.respond_to?(:only_original),
+     tail.equal?(special), Hash.ruby2_keywords_hash?(tail)]
+end
+with_default = KeywordCopyHash.new { |_, k| k }
+with_default[:a] = 1
+with_default = Hash.ruby2_keywords_hash(with_default).freeze
+copy = plain_proc.call(*[with_default]).last
+p [:default_proc, copy[:missing], copy.default_proc.equal?(with_default.default_proc), copy.class]
+copy = plain_proc.call(*[original]).last
+copy[:a] = 9
+p [:isolation, original[:a], copy[:a], Hash.ruby2_keywords_hash?(original)]
+# A note from a builtin or an empty splat belongs to that invocation only.
+[].push(*[original])
+p [:direct_after_builtin, plain_proc.call(original).last.equal?(original)]
+empty = Hash.ruby2_keywords_hash({})
+plain_proc.call(*[empty])
+p [:direct_after_empty, plain_proc.call(empty).last.equal?(empty)]
+# Passing a Proc as a block must keep the same keyword policy as #call.
+def self.pass_to_block(*a, &b) = yield(*a)
+p [:plain_block, pass_to_block(original, &plain_proc).last.equal?(original)]
+p [:marked_block, pass_to_block(original, &marked_proc).last.equal?(original)]
+p [:block_given_at_call, plain_proc.call(*[original], &marked_proc).last.equal?(original)]
+# Native Method/Symbol procs must leave conversion to their target method.
+def self.keyword_target(a:) = a
+p [:method_proc, method(:keyword_target).to_proc.call(*[original])]
+class KeywordReceiver
+  def take(a:) = a
+end
+p [:symbol_proc, :take.to_proc.call(KeywordReceiver.new, *[original])]
+GC.start
+p [:after_gc, plain_proc.call(*[original]).last.equal?(original), Hash.ruby2_keywords_hash?(original)]
+
+# Notes must survive nested conversions and end when the callee raises.
+converter = Object.new
+converter.define_singleton_method(:to_proc) do
+  plain_proc.call(*[original])
+  marked_proc
+end
+p [:nested_conversion, pass_to_block(original, &converter).last.equal?(original)]
+original[:a] = 1
+begin
+  Object.new.no_such_method(*[original])
+rescue NoMethodError
+end
+p [:direct_after_error, plain_proc.call(original).last.equal?(original)]
+# An evaluator-created method can be invoked from the VM's direct-send path.
+eval('def self.evaluator_push(h); [].push(*[h]); end')
+evaluator_push(original)
+p [:direct_after_eval_method, plain_proc.call(original).last.equal?(original)]
+
+def self.required_copy(x) = x
+def self.optional_copy(x = nil) = x
+p [:required_copy, required_copy(*[original]).equal?(original)]
+p [:optional_copy, optional_copy(*[original]).equal?(original)]
+begin
+  keyword_target(original)
+rescue ArgumentError => error
+  p [:direct_is_positional, error.class, error.message]
+end
+keyword_lambda = ->(a:) { a }
+p [:lambda_keywords, keyword_lambda.call(*[original])]
+
+# Supplying a block must not bypass the called Proc's flag or lambda marker.
+marked_lambda = ->(*a) { a.last }.ruby2_keywords
+flagged_proc = proc { |*a| a.last }.ruby2_keywords
+call_block = proc {}
+[flagged_proc, marked_lambda].each_with_index do |callable, index|
+  value = callable.call(*[original], &call_block)
+  p [:marked_with_block, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = callable.call(*[original]) {}
+  p [:marked_with_literal, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+end
+begin
+  ->(x) { x }.call(1, 2) {}
+rescue ArgumentError => error
+  p [:lambda_block_arity, error.class, error.message]
+end
+def capture_keyword_yield
+  proc { |*_| yield :captured }
+end
+captured = capture_keyword_yield { |value| [:home, value] }
+p [:captured_yield, captured.call(1) { :call_site }]
+
+# Direct marked calls keep the input; Method#call converts it at its boundary.
+p [:direct_marked, marked_method(*[original]).last.equal?(original)]
+p [:direct_marked_block, marked_method(*[original]) {}.last.equal?(original)]
+p [:marked_method_proc, method(:marked_method).to_proc.call(*[original]).last.equal?(original)]
+# Observer callbacks must not steal or leak the call's transient argument state.
+def self.keyword_observer_work
+  [1].each { |value| value.to_s }
+end
+trace = TracePoint.new(:call, :b_call, :c_call) { keyword_observer_work }
+trace.enable do
+  value = plain_method(*[original]).last
+  p [:trace_plain, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = marked_method(*[original]).last
+  p [:trace_marked, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = method(:marked_method).call(*[original]).last
+  p [:trace_bound, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = marked_proc.call(*[original]) {}
+  p [:trace_proc_block, value.last.equal?(original), Hash.ruby2_keywords_hash?(value.last)]
+end
+
+# The native Method block path has the same conversion boundary.
+bound_marked = method(:marked_method)
+converted_marked = bound_marked.to_proc
+[bound_marked, converted_marked].each_with_index do |callable, index|
+  value = callable.call(*[original], &call_block).last
+  p [:bound_with_proc, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+  value = callable.call(*[original]) {}.last
+  p [:bound_with_literal, index, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+end
+
+# Keyword origin belongs to a forwarding frame, not one shared Hash mark.
+def self.repeated_keyword_target(a:) = a
+def self.repeated_keyword_forward(...)
+  [repeated_keyword_target(...), repeated_keyword_target(...)]
+end
+p [:repeated_keywords, repeated_keyword_forward(a: 23)]
+def self.captured_keyword_forward(...)
+  -> { repeated_keyword_target(...) }
+end
+forwarded_keywords = captured_keyword_forward(a: 24)
+p [:captured_keywords, forwarded_keywords.call, forwarded_keywords.call]
+eval('def self.evaluator_repeated_forward(...); [repeated_keyword_target(...), repeated_keyword_target(...)]; end')
+p [:evaluator_repeated_keywords, evaluator_repeated_forward(a: 25)]
+
+# A flagged Hash passed positionally stays positional through ... .
+def self.forward_plain_identity(...) = plain_method(...).last
+value = forward_plain_identity(original)
+p [:forwarded_positional, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = forward_plain_identity(*[original])
+p [:forwarded_splat, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+begin
+  repeated_keyword_forward(original)
+rescue ArgumentError => error
+  p [:forwarded_direct_error, error.class, error.message]
+end
+
+class RepeatedKeywordSuperParent
+  def take(a:) = a
+end
+class RepeatedKeywordSuperChild < RepeatedKeywordSuperParent
+  def take(...) = [super, super]
+end
+p [:repeated_keyword_super, RepeatedKeywordSuperChild.new.take(a: 26)]
+class ForwardedIdentitySuperParent
+  def take(*args) = args.last
+end
+class ForwardedIdentitySuperChild < ForwardedIdentitySuperParent
+  def take(...) = super
+end
+super_receiver = ForwardedIdentitySuperChild.new
+value = super_receiver.take(original)
+p [:super_positional_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = super_receiver.take(*[original])
+p [:super_splat_identity, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+
+# Method#to_proc invokes the captured entry, independently of public #call.
+def proxy_keyword_original(a:)
+  block_given? ? [a, yield] : a
+end
+proxy_method = method(:proxy_keyword_original)
+proxy_before_override = proxy_method.to_proc
+def proxy_method.call(*) = :singleton_override
+p [:singleton_call_override, proxy_method.call]
+p [:singleton_proxy_before, proxy_before_override.call(a: 27)]
+p [:singleton_proxy_after, proxy_method.to_proc.call(a: 28) { :block }]
+class Method
+  alias saved_keyword_corpus_call call
+  def call(*) = :class_override
+end
+class_proxy_method = method(:proxy_keyword_original)
+p [:class_call_override, class_proxy_method.call]
+p [:class_proxy, class_proxy_method.to_proc.call(a: 29)]
+p [:class_proxy_block, class_proxy_method.to_proc.call(a: 30) { :class_block }]
+class Method
+  alias call saved_keyword_corpus_call
+  remove_method :saved_keyword_corpus_call
+end
+# Native targets and captured Ruby definitions retain their ordinary behavior.
+p [:builtin_proxy, [1, 2].method(:map).to_proc.call { |value| value * 2 }]
+p [:operator_proxy, 1.method(:+).to_proc.call(2)]
+class StoredProxyTarget
+  def value = :old
+end
+stored_proxy_method = StoredProxyTarget.new.method(:value)
+stored_proxy = stored_proxy_method.to_proc
+class StoredProxyTarget
+  def value = :new
+end
+p [:snapshot_proxy, stored_proxy.call]
+plain_method_proxy = method(:plain_method).to_proc
+value = plain_method_proxy.call(original).last
+p [:proxy_direct_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = plain_method_proxy.call(*[original]).last
+p [:proxy_splat_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+value = plain_method_proxy.call(original) {}.last
+p [:proxy_direct_block_hash, value.equal?(original), Hash.ruby2_keywords_hash?(value)]
+def proxy_yield_target
+  yield
+  :after
+end
+p [:proxy_break, method(:proxy_yield_target).to_proc.call { break :done }]
+
+def proxy_block_identity(&block) = block
+identity_block = -> { :identity }
+p [:proxy_block_identity, method(:proxy_block_identity).to_proc.call(&identity_block).equal?(identity_block)]
+
+# A native consumer must not turn a later iterator's ordinary yield into **kw.
+StaleSplatHash = Hash.ruby2_keywords_hash({a: 2})
+def stale_splat_pos(*args) = args
+stale_splat_pos(StaleSplatHash)
+[].push(*[StaleSplatHash])
+p [:iterator_after_splat, [StaleSplatHash].map { |a: 0| a }]
+
+# Removing and re-adding ivars must keep copy metadata accurate across GC.
+removed_hash = Hash.ruby2_keywords_hash({a: 2})
+removed_hash.instance_variable_set(:@deleted, :old)
+removed_hash.instance_variable_set(:@kept, :first)
+removed_hash.remove_instance_variable(:@deleted)
+removed_hash.instance_variable_set(:@kept, :updated)
+def copied_ivar_target(*args) = args.last
+ruby2_keywords def copied_ivar_forward(*args) = copied_ivar_target(*args)
+copy = copied_ivar_forward(*[removed_hash])
+p [:copied_ivars, copy.instance_variable_get(:@kept), copy.instance_variable_defined?(:@deleted)]
+removed_hash.instance_variable_set(:@deleted, :new)
+GC.start
+copy = copied_ivar_forward(*[removed_hash])
+p [:readded_ivar, copy.instance_variable_get(:@deleted), copy.equal?(removed_hash)]
+
+# A real Ruby override still receives its splatted keywords before any leaf.
+class FlaggedNativeOverride < Array
+  def push(*positional, **keywords) = [positional, keywords]
+end
+p [:native_override_keywords, FlaggedNativeOverride.new.push(*[StaleSplatHash])]
+
+# Every native call must retire its incoming origin, including calls that
+# bypass the primitive leaf and calls made inside another block.
+NativeSplatStruct = Struct.new(:a)
+NativeSplatKeywordStruct = Struct.new(:a, keyword_init: true)
+def native_splat_keyword(a: 0) = a
+def native_splat_noop = 1
+def native_splat_probe(label, before)
+  hash = Hash.ruby2_keywords_hash({a: 2})
+  before.call(hash)
+  native_splat_noop
+  direct = begin
+    native_splat_keyword(hash)
+  rescue ArgumentError => error
+    error.class
+  end
+  before.call(hash)
+  native_splat_noop
+  block = proc { |a: 0| a }.call(hash)
+  before.call(hash)
+  native_splat_noop
+  strict = begin
+    lambda { |value, a: 0| [value.equal?(hash), a] }.call(hash)
+  rescue ArgumentError => error
+    error.class
+  end
+  p [label, direct, block, strict]
+end
+native_splat_probe(:hash_brackets, ->(hash) { Hash[*[hash]] })
+native_splat_probe(:struct_new, ->(hash) { NativeSplatStruct.new(*[hash]) })
+native_splat_probe(:ivar_set, ->(hash) { Object.new.instance_variable_set(:@value, *[hash]) })
+native_splat_probe(:kernel_p, ->(hash) { p(*[hash]) })
+native_splat_probe(:string_format, ->(hash) { '%p'.%(*[hash]) })
+native_splat_probe(:native_raise, ->(hash) {
+  begin
+    Object.new.instance_variable_set(:invalid, *[hash])
+  rescue NameError
+  end
+})
+
+# An ordinary no-block call, an explicit block and native keyword parsing
+# retain their normal values while the invocation owns the keyword origin.
+native_hash = Hash.ruby2_keywords_hash({a: 2})
+p [:native_struct_keywords, NativeSplatKeywordStruct.new(*[native_hash]).a]
+Hash[*[native_hash]] { :unused }
+native_splat_noop
+p [:after_native_block, proc { |a: 0| a }.call(native_hash)]
+
+# Resolution must retain Ruby overrides before the native boundary.
+class NativeSplatHashOverride < Hash
+  def self.[](*positional, **keywords) = [positional, keywords]
+end
+p [:hash_override_keywords, NativeSplatHashOverride[*[native_hash]]]
+class NativeSplatStringOverride < String
+  def %(*positional, **keywords) = [positional, keywords]
+end
+p [:format_override_keywords, NativeSplatStringOverride.new('%p').%(*[native_hash])]
+native_ivar_override = Object.new
+def native_ivar_override.instance_variable_set(*positional, **keywords)
+  [positional, keywords]
+end
+p [:ivar_override_keywords, native_ivar_override.instance_variable_set(:@value, *[native_hash])]
+
+# Native inspection/name conversion can call Ruby before returning. A
+# zero-argument callback does not inherit its caller's splatted Hash.
+native_inspection = nil
+native_observer = Hash.ruby2_keywords_hash({a: 2})
+native_observer.define_singleton_method(:inspect) do
+  native_inspection = proc { |a: 0| a }.call(self)
+  'native-observer'
+end
+p(*[native_observer])
+p [:native_inspection_callback, native_inspection]
+native_conversion = nil
+native_ivar_name = Object.new
+native_ivar_name.define_singleton_method(:to_str) do
+  native_conversion = proc { |a: 0| a }.call(native_hash)
+  '@native_value'
+end
+Object.new.instance_variable_set(native_ivar_name, *[native_hash])
+p [:native_name_callback, native_conversion]
+
+# Method-name conversion runs before the final target consumes its arguments.
+native_sender_observation = nil
+native_sender_name = Object.new
+native_sender_name.define_singleton_method(:to_str) do
+  native_sender_observation = proc { |a: 0| a }.call(native_hash)
+  'native_splat_keyword'
+end
+p [:native_sender_conversion, send(native_sender_name, *[native_hash]), native_sender_observation]
+class NativeSplatInitializer
+  attr_reader :value
+  def initialize(a:)
+    @value = a
+  end
+end
+p [:native_constructor_forwarding, NativeSplatInitializer.new(*[native_hash]).value]
+
+# A splat that builds values does not prepare a keyword call.
+value_preparers = [
+  ->(h) { x = [*[h]]; nil },
+  ->(h) { x = [1, *[h]]; nil },
+  ->(h) { x, y = 1, *[h]; nil },
+  ->(h) { x = {nested: [*[h]]}; nil },
+  ->(h) { x = [[*[h]]]; nil },
+  ->(h) { x = "#{[*[h]]}"; nil },
+  ->(h) { x = '%p' % [*[h]]; nil }
+]
+value_preparers.each_with_index do |prepare, index|
+  h = Hash.ruby2_keywords_hash(a: 2)
+  prepare.call(h)
+  native_splat_noop
+  method_answer = begin
+    native_splat_keyword(h)
+  rescue ArgumentError => error
+    error.class
+  end
+  prepare.call(h)
+  native_splat_noop
+  proc_answer = proc { |a: 0| a }.call(h)
+  prepare.call(h)
+  native_splat_noop
+  lambda_answer = ->(value, a: 0) { a }.call(h)
+  p [:value_splat_origin, index, method_answer, proc_answer, lambda_answer]
+end
+empty_value_hash = Hash.ruby2_keywords_hash({})
+empty_values = [*[empty_value_hash]]
+p [:empty_value_splat, empty_values.size, empty_values.last.equal?(empty_value_hash),
+   Hash.ruby2_keywords_hash?(empty_values.last)]
+first_value, second_value = 1, *[empty_value_hash]
+p [:empty_assignment_splat, first_value, second_value.equal?(empty_value_hash)]
+
+# Native callbacks receive positional values even when another native argument
+# is the same flagged Hash. These callbacks enter Ruby without an AST send.
+class KeywordOriginCallback
+  def initialize(h) = @h = h
+  def kwm(a: 0) = a
+  def inspect = ((kwm(@h) rescue $!.class).to_s)
+  alias to_s inspect
+end
+callback_hash = Hash.ruby2_keywords_hash(a: 2)
+callback_object = KeywordOriginCallback.new(callback_hash)
+p [:native_inspect_callback]
+p(*[callback_object, callback_hash])
+print(*[callback_object, callback_hash])
+puts
+p [:native_format_callback, format('%p/%p', *[callback_object, callback_hash])]
+p [:native_fetch_callback, {}.fetch(*[callback_hash]) {
+  (native_splat_keyword(callback_hash) rescue $!.class)
+}]
+saved_verbosity = $VERBOSE
+$VERBOSE = nil
+p [:native_array_callback, Array.new(1, *[callback_hash]) {
+  (native_splat_keyword(callback_hash) rescue $!.class)
+}]
+$VERBOSE = saved_verbosity
+
+# Actual forwarding protocols still deliver the call's keywords to its block.
+def keyword_origin_yield(h)
+  yield(*[h])
+end
+p [:explicit_yield_origin, keyword_origin_yield(callback_hash) { |a: 0| a }]
+p [:instance_exec_origin, Object.new.instance_exec(*[callback_hash]) { |a: 0| a }]
+p [:class_exec_origin, Class.new.class_exec(*[callback_hash]) { |a: 0| a }]
+p [:module_exec_origin, Module.new.module_exec(*[callback_hash]) { |a: 0| a }]
+yielded_keywords = []
+Enumerator.new { |y| y.yield(*[callback_hash]) }.each { |a: 0| yielded_keywords << a }
+p [:yielder_origin, yielded_keywords]
+
+# Empty value-list keyword merges omit the element; an ordinary splat keeps it.
+empty_value_987 = Hash.ruby2_keywords_hash({})
+p [:empty_value_merges, [**{}], [1, **{}], [**{}, **{}], [**empty_value_987], [*[empty_value_987]]]
+merge_calls_987 = []
+empty_merge_987 = Object.new
+empty_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :empty; {} }
+full_merge_987 = Object.new
+full_merge_987.define_singleton_method(:to_hash) { merge_calls_987 << :full; {a: 2} }
+p [:value_merge_evaluation, [**empty_merge_987], [1, **full_merge_987], merge_calls_987]
+
+# A scheduled Thread binds after its creator's native call has returned.
+# Retiring that call must not retire the Thread's own startup provenance.
+thread_hash_987 = Hash.ruby2_keywords_hash(a: 2)
+thread_987 = Thread.new(*[thread_hash_987]) { |a: 0| a }
+p [:thread_creator_positional, (native_splat_keyword(thread_hash_987) rescue $!.class)]
+GC.start
+p [:thread_deferred_keywords, thread_987.value]
+p [:thread_literal_keywords, Thread.new(a: 2) { |a: 0| a }.value]
+p [:thread_positional_hash, Thread.new(thread_hash_987) { |a: 0| a }.value]
+p [:thread_lambda_keywords, Thread.new(*[thread_hash_987], &->(a:) { a }).value]
+p [:thread_start_keywords, Thread.start(*[thread_hash_987]) { |a: 0| a }.value]
+p [:thread_fork_keywords, Thread.fork(*[thread_hash_987]) { |a: 0| a }.value]
+thread_copy_987 = Thread.new(*[thread_hash_987]) { |*args| args.last }.value
+p [:thread_argument_copy, thread_copy_987.equal?(thread_hash_987),
+   Hash.ruby2_keywords_hash?(thread_copy_987), Hash.ruby2_keywords_hash?(thread_hash_987)]
+thread_keep_987 = proc { |*args| args.last }.ruby2_keywords
+thread_kept_987 = Thread.new(*[thread_hash_987], &thread_keep_987).value
+p [:thread_marked_block, thread_kept_987.equal?(thread_hash_987), Hash.ruby2_keywords_hash?(thread_kept_987)]
+thread_marked_literal_987 = Thread.new(a: 3, &thread_keep_987).value
+p [:thread_marked_literal, thread_marked_literal_987, Hash.ruby2_keywords_hash?(thread_marked_literal_987)]
+thread_later_proc_987 = proc { |*args| args.last }
+thread_release_987 = Queue.new
+thread_gate_trace_987 = TracePoint.new(:thread_begin) { thread_release_987.pop }
+thread_gate_trace_987.enable
+thread_later_987 = Thread.new(a: 4, &thread_later_proc_987)
+thread_later_proc_987.ruby2_keywords
+GC.start
+thread_release_987 << true
+thread_later_hash_987 = thread_later_987.value
+thread_gate_trace_987.disable
+p [:thread_later_policy, thread_later_hash_987, Hash.ruby2_keywords_hash?(thread_later_hash_987)]
+thread_snapshot_987 = Thread.new(*[thread_hash_987]) { |a: 0| a }
+thread_hash_987[:a] = 9
+p [:thread_argument_snapshot, thread_snapshot_987.value, thread_hash_987[:a]]
+thread_hash_987[:a] = 2
+thread_special_987 = Thread.new(*[special]) { |*args| args.last }.value
+p [:thread_copy_metadata, thread_special_987.class, thread_special_987.default,
+   thread_special_987.compare_by_identity?, thread_special_987.instance_variable_get(:@value)]
+thread_observations_987 = []
+thread_trace_987 = TracePoint.new(:thread_begin) do
+  thread_observations_987 << (native_splat_keyword(thread_hash_987) rescue $!.class)
+end
+thread_trace_987.enable
+Thread.new(*[thread_hash_987]) { |a: 0| a }.value
+thread_trace_987.disable
+p [:thread_begin_positional_callback, thread_observations_987]

@@ -53,6 +53,22 @@ CASES = {
     n = 200_000 / d
     loop { break if i >= n; [:s, "x" * 8, [i, 1]]; i += 1 }
   },
+  # a String's, an Array's and a Hash's instance variables were never given
+  # back: their keys in the table outlived the values, and kept what they held
+  # (note 559 step 2b' gives a dead one's area back at the sweep)
+  "a String's variables" => ->(d) {
+    (150_000 / d).times { |i| s = "s#{i}"; s.instance_variable_set(:@v, [i, "x" * 16]); a = [i]; a.instance_variable_set(:@w, i); h = {}; h.instance_variable_set(:@u, s) }
+  },
+  # a search with a pattern other than the last one's wrote the pattern, its
+  # key and what was looked up for it into a cache of eight strings, and a
+  # binary subject wrote its encoding into the cut's slot -- each write
+  # leaving the old copy in the default region (note 559 §10: a YAML.load
+  # of 16,384 rows left 134 MB of them)
+  "alternating regexp searches" => ->(d) {
+    u = "key: value, other: thing " * 4
+    b = u.b
+    (200_000 / d).times { |i| u =~ /other/; u.index(/thing/); b =~ /value/; b.index(/key/) }
+  },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))
