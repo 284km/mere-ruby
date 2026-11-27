@@ -48,17 +48,24 @@ void mr_fatal(const char *message) {
  * malloc it went back to malloc, and macOS's malloc keeps freed large blocks
  * resident for reuse (the large cache): msgpack's packer spec, which hands C
  * a 6 MB String 22 times and makes a 132 MB one, ended at 1.76 GB with 990 MB
- * of it freed blocks (ruby: 648 MB). glibc already maps what is that big. The
- * bound: below it a block is small enough that malloc reuses it, and at it a
- * copy of the bytes (which every such buffer gets) costs more than the map
- * and the unmap together. */
+ * of it freed blocks (ruby: 648 MB). The bound: below it a block is small
+ * enough that malloc reuses it, and at it a copy of the bytes (which every
+ * such buffer gets) costs more than the map and the unmap together.
+ * macOS only: glibc maps and unmaps blocks this big itself (Mere fixes its
+ * threshold at 64 KiB), so elsewhere they stay malloc's, and the map, the
+ * unmap and the fresh pages measured 1.7-6.2% more instructions in loops of
+ * big transfers for no memory back. */
 #define MR_BIG_BYTES ((size_t)1 << 20)
 static size_t big_round(size_t n) {
     static size_t page;
     if (!page) page = (size_t)sysconf(_SC_PAGESIZE);
     return (n + page - 1) & ~(page - 1);
 }
+#if defined(__APPLE__)
 int mr_big(size_t n) { return n >= MR_BIG_BYTES; }
+#else
+int mr_big(size_t n) { (void)n; return 0; }
+#endif
 void *mr_big_alloc(size_t n) {
     if (!mr_big(n)) return malloc(n);
     void *p = mmap(NULL, big_round(n), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -157,9 +164,11 @@ int mr_capi_set(int i, CapiWord w) {
 #define BYTES_SHRINK_AFTER 64
 static size_t bytes_size(long cap) { return sizeof(mere_bytes) + (size_t)cap + 1; }
 static mere_bytes *bytes_need(mere_bytes **buffer, long *cap, int *small_runs, long n) {
-    if (*buffer && mr_big(bytes_size(*cap)) && n <= *cap / 4) {
+    /* (on every platform: a transit buffer held at its biggest is memory the
+     *  process keeps, wherever malloc puts it) */
+    if (*buffer && bytes_size(*cap) >= MR_BIG_BYTES && n <= *cap / 4) {
         if (++*small_runs >= BYTES_SHRINK_AFTER) {
-            mr_big_free(*buffer, bytes_size(*cap), 1);
+            mr_big_free(*buffer, bytes_size(*cap), mr_big(bytes_size(*cap)));
             *buffer = NULL;
             *cap = 0;
             *small_runs = 0;

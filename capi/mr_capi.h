@@ -99,7 +99,8 @@ void mr_put_words(long n, const VALUE *words);
 VALUE mr_word(long i);
 void mr_put_bytes(const void *p, long n);
 void mr_put_zero_bytes(long n);
-/* Buffers of 1 MiB or more are mapped, and unmapped when let go (core.c):
+/* Buffers of 1 MiB or more are mapped, and unmapped when let go, on macOS
+ * (core.c; elsewhere the libc does it):
  * mr_big says whether a size is one; mr_big_free's `mapped` is what
  * mr_big_alloc did for that buffer. */
 int mr_big(size_t n);

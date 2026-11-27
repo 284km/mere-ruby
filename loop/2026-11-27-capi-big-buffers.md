@@ -84,6 +84,22 @@ On c913da27 + this change, with Mere 9dec2ff6 and reference ruby 4.0.10. The bas
 - `run_corpus.sh --both`: the gates, then 1027/1027 with the hash index on and off. `MERE_RUBY_VM=1 run_corpus.sh --both`: 1027/1027.
 - capi_spec_check: 2420 of 2602, the recorded count. capi_mkmf_check passes. capi_gem_check: seventeen gems give the same output on both sides. headers_check: 194 headers, 10 patched, 22 vendored sources unchanged.
 
+## Review (#386): the mapping on macOS only
+
+On Linux the map, the unmap and the fresh pages cost the loops above 1.7-6.2% more instructions for no memory back: glibc maps and unmaps blocks this big itself. `mr_big` now answers yes only on macOS (`__APPLE__`); elsewhere the big buffers are malloc's, as before. Two parts stay on every platform. The transit buffer still shrinks after the run of small transfers, because a transit held at 134 MB is memory the process keeps wherever malloc puts it. `mr_put_zero_bytes` also stays, because it saves a calloc, a copy and a free.
+
+Linux after this (docker as above; CPU time, user + sys, median of three, the same main without and with the change):
+
+| loop | CPU | peak |
+|---|---|---|
+| to_s, 1 MiB x 1000 | 5.76 -> 5.47 s | 316 -> 352 MiB |
+| to_s, 2 MiB x 500 | 5.98 -> 5.73 s | 402 -> 388 MiB |
+| to_s, 8 MiB x 120 | 5.35 -> 5.63 s (before: 5.14 to 6.04) | 806 -> 646 MiB |
+| Unpacker#feed, 2 MiB x 500 | 2.64 -> 2.30 s | 408 -> 434 MiB |
+| 1 in 16 writes of 2 MiB, x 2000 | 2.38 -> 1.82 s | 316 -> 316 MiB |
+
+macOS is unchanged. The packer example on the evaluator ends at 829 / 831 / 868 MB, with peaks of 1,601 / 1,678 / 2,054 MB.
+
 ## Left
 
 - **B: shared bytes for big Strings.** `rb_str_dup` / `rb_str_new_frozen` of a big String copy its bytes into a second mirror, where ruby shares them. In the packer example that is 22 x 6 MB that C keeps alive through the Packer.
