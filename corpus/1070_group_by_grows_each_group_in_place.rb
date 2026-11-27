@@ -106,3 +106,22 @@ class Hash
   alias_method :default, :__default_1070
 end
 p h, $dflt_1070
+
+# A Hash#default defined in the middle of the iteration -- in group_by's own
+# block -- is asked about the misses after it: with few keys (the list) and
+# with many (the Hash).
+class Hash
+  alias_method :__default_mid_1070, :default
+end
+def try_1070(n, at)
+  (1..n).group_by do |i|
+    Hash.class_eval { def default(k = nil) = raise("user default") } if i == at
+    [i]
+  end
+rescue => e
+  [e.message, n, at]
+ensure
+  Hash.class_eval { alias_method :default, :__default_mid_1070 }
+end
+p try_1070(2, 2), try_1070(30, 25), try_1070(30, 2), try_1070(3, 9).size
+p [1, 2].group_by { |i| i }, (1..20).group_by { |i| i % 18 }.size
