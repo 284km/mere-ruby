@@ -616,6 +616,35 @@ void *rb_mere_string(VALUE obj) {
     rb_raise(rb_eTypeError, "wrong argument type %s (expected String)", rb_obj_classname(obj));
 }
 
+/* rb_str_new(NULL, len) of a big len: the interpreter makes an empty String,
+ * and the zero bytes are made here, in the struct's buffer, where C is about
+ * to write them. They reach the interpreter at the next crossing, as any
+ * write C makes: the struct is watched, and its hash is not the hash of what
+ * the interpreter has. Before, the bytes were zeroed in transit, became a
+ * String of zeros in the interpreter, were fetched back into the struct and
+ * then written back -- four copies of a String msgpack's recursive packer
+ * makes of each level's whole buffer (1.5 GB at the peak of its packer spec
+ * on Linux, ruby 0.37 GB). (`enc`: the encoding's index, as make() has it) */
+VALUE mr_string_new_zeroed(long len, int enc) {
+    mr_put_bytes("", 0);
+    mr_put_text(mr_enc_name_of_index(enc));
+    VALUE obj = mr_up1(MR_STR_NEW, (VALUE)enc);
+    struct mr_mirror *m = mr_mirror_of(obj);
+    int term = str_term(m);
+    if (m->body != T_STRING && !str_embedded(m)) {
+        m->as.string.as.heap.ptr = NULL;
+        m->as.string.as.heap.aux.capa = 0;
+    }
+    string_room(m, len, term, ROOM_EXACT);
+    memset(str_ptr(m), 0, (size_t)len + (size_t)term);
+    m->as.string.len = len;
+    m->body = T_STRING;
+    m->hash = body_hash(m) ^ 1;
+    m->body_epoch = mr_epoch;
+    touch(m, obj);
+    return obj;
+}
+
 static void array_room(struct mr_mirror *m, long capa) {
     if (m->as.array.as.heap.ptr && capa <= m->capa) return;
     long want = m->capa > 0 ? m->capa : 4;
