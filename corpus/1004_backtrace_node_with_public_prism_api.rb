@@ -101,3 +101,35 @@ end
     eval_node_result1004(name, source, error)
   end
 end
+
+# A method on a shared core class must recover its own compact metadata after
+# another Box replaces that method. This raw-location invariant also works
+# while Prism's existing boxed-load path is unavailable. Ruby has no such
+# private metadata and compares its absent values; the interpreter's probe
+# separately verifies that both sides actually carry indexed method data.
+box_source1004 = <<~'RUBY_BOX'
+  source_a = "def box_node1004\n  Integer(:invalid)\nend\n"
+  source_b = "def box_node1004\n  11; 12; Integer(:invalid)\nend\n"
+  filename = "box-node1004.rb"
+  String.class_eval(source_a, filename, 1)
+  collect = -> {
+    begin
+      "".box_node1004
+    rescue StandardError => error
+      error.backtrace_locations.select { |location| location.path.end_with?(filename) }
+           .map { |location| location.instance_variable_get(:@__eval_nodes) }
+    end
+  }
+  before = collect.call
+  box = Ruby::Box.new
+  box.eval("String.class_eval(#{source_b.dump}, #{filename.dump}, 1)")
+  p [:box_metadata, before == collect.call]
+  box.eval("String.define_method(:box_node1004) { Integer(:invalid) }")
+  p [:box_plain_method_metadata, before == collect.call]
+  box.eval("String.remove_method(:box_node1004)")
+  p [:box_removed_metadata, before == collect.call]
+  GC.start
+  p [:box_metadata_gc, before == collect.call]
+RUBY_BOX
+print IO.popen([{'RUBY_BOX' => '1'}, RbConfig.ruby, '--disable-gems', '-W0', '-e', box_source1004, err: File::NULL], &:read)
+p $?.exitstatus
