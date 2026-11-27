@@ -97,3 +97,4 @@ On 391b560e:
 - Linux (arm64, docker): /proc as above, both engines.
 - After the review fix: the same corpus, vm_corpus, vm_check, root check and loop_rss_check again, all passing.
 - After the second review fix, merged with main 9547d96b: `run_corpus.sh` 1024/1024, `vm_corpus.sh` all 1024 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
+- After the third review fix, merged with main ad289755: `run_corpus.sh` 1027/1027, `vm_corpus.sh` all 1027 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
