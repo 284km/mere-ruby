@@ -1676,11 +1676,21 @@ let stdin_src_pos = map_new ();
 //   (test_hash's test_st_literal_memory_leak, note 404). The sweep deletes a
 //   dead hash's entry now; hash_ctr counts the handles issued.
 let hash_store = (let t = map_new () in let _ = map_compact t in t);  // (an arena of its own from birth: see arr_store)
+// Hash -> immutable metadata Array of pairs. These handles are marked from
+// the owning Hash, never as global roots, and swept with that owner.
+let hash_shared = (let t = map_new () in let _ = map_compact t in t);
+let hash_lazy = (let t = map_new () in let _ = map_compact t in t);
 let hash_ctr = (let v = vec_new () in let _ = vec_push v 0 in v);
 // the next handle a hash will get (the end of the range issued so far)
 let hash_next = fn (u: unit) -> handle_base + vec_get hash_ctr 0;
 // the stored pair list of a hash (none, for a handle no hash holds any more)
-let hst_get = fn (id: int) -> if map_has hash_store id then map_get hash_store id else (Nil : Val list);
+let hst_get = fn (id: int) ->
+  if map_len hash_shared > 0 && map_has hash_shared id then deref (map_get hash_shared id)
+  else if map_has hash_store id then map_get hash_store id else (Nil : Val list);
+// Every pair-list publication detaches this owner from its immutable copy.
+let hst_publish = fn (id: int) -> fn (xs: Val list) ->
+  let _ = (if map_len hash_shared > 0 && map_has hash_shared id then map_delete hash_shared id else ()) in
+  map_set hash_store id xs;
 // The signal names a program may trap, and the handlers it registered
 // (signal_traps, keyed by the short name). Nothing outside delivers a signal
 // to this process's handlers; the one source there is -- Process.kill of our
@@ -1832,7 +1842,11 @@ let hkey_dig = fn (id: int) -> fn (k: Val) -> if hcbi_fwd id then hkey_ident k e
 // (the off-switch lives in main.mere, where env_get is in scope; this is the
 //  plain question "does this hash have an index", asked while maintaining it)
 let hidx_off = map_new ();
-let hidx_on = fn (id: int) -> map_has hash_indexed id;
+let fn hidx_lazy_fwd: int -> bool;
+let hidx_on = fn (id: int) ->
+  if map_has hash_indexed id then true
+  else if map_len hash_lazy > 0 && map_has hash_lazy id then hidx_lazy_fwd id
+  else false;
 // ⚠ AN OVERWRITE IS WRITTEN TO THE INDEX ONLY. Storing a new value under a key
 //   the hash already has rebuilt the whole list and replaced it (hset), and
 //   hset drops the index -- so after one `h[k] = v` on an existing key every
@@ -1862,7 +1876,7 @@ let hpend_fold = fn (id: int) ->
   then
     (let q = map_get hash_pending id in
      let merged = list_append (hst_get id) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
-     let _ = map_set hash_store id merged in
+     let _ = hst_publish id merged in
      let _ = map_delete hash_pending id in
      qv_drop q)
   else ();
@@ -1890,7 +1904,7 @@ let hstale_fold = fn (id: int) ->
      let _ = map_delete hash_stale id in
      if map_has hash_index id then
        (let ys = hstale_vals id (hst_get id) in
-        let _ = map_set hash_store id ys in ())
+        let _ = hst_publish id ys in ())
      else ())
   else ();
 // anything the index cannot describe: the hash goes back to scanning
@@ -1948,6 +1962,7 @@ let hidx_drain = fn (u: unit) ->
   let _ = go 0 in
   vec_set hidx_pool_n 1 0;
 let hidx_drop = fn (id: int) ->
+  let _ = (if map_len hash_lazy > 0 && map_has hash_lazy id then map_delete hash_lazy id else ()) in
   // (a stale list is brought up to date while the index can still say how --
   //  the queue of new pairs keeps its own values, and hderef folds it later)
   let _ = hstale_fold id in
@@ -2020,7 +2035,7 @@ let mkhash = fn (xs: Val list) ->
   let _ = (if vec_get atr_on 0 > 0 then atr_note ("hsh:" ++ str_of_int id) else ()) in
   let _ = hcnt_drop id in
   let _ = vec_set hash_ctr 0 (vec_get hash_ctr 0 + 1) in
-  let _ = map_set hash_store id xs in
+  let _ = hst_publish id xs in
   // (a small hash of plain keys -- `{}`, `{a: 1}` -- is its list alone)
   let _ = (if hplain_small xs then ()
            else (let _ = hidx_start id in
@@ -2061,7 +2076,48 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
   let _ = hpend_drop id in
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   let _ = hidx_drop id in
-  let _ = map_set hash_store id xs in ();
+  let _ = hst_publish id xs in ();
+// Only immutable plain keys permit deferred index creation. In particular,
+// an Array key changing after dup must not acquire a new stored digest.
+let rec hplain_all = fn (xs: Val list) ->
+  match xs with
+  | Nil -> true
+  | Cons (key9, Cons (_, tail9)) -> hplain_key key9 && hplain_all tail9
+  | _ -> false;
+let hidx_lazy_fwd = fn (id: int) ->
+  let _ = map_delete hash_lazy id in
+  let xs9 = hst_get id in
+  if hplain_small xs9 then false
+  else (let _ = hidx_start id in
+        if hidx_seed id xs9 then true else (let _ = hidx_drop id in false));
+// Settle actual writes before reusing a snapshot. New pending or stale
+// values invalidate the old association through hst_publish when folded.
+let hshare_snapshot = fn (id: int) ->
+  let _ = hpend_fold id in
+  let _ = hstale_fold id in
+  if hcbi_fwd id then 0 - 1
+  else if map_has hash_shared id then map_get hash_shared id
+  else
+    (let xs9 = hst_get id in
+     // Keep the existing compact-list representation for small hashes.
+     if hplain_small xs9 || (if hplain_all xs9 then false else true) then 0 - 1
+     else (match arr_new_metadata xs9 with
+           | VArr snapshot9 ->
+             (let _ = map_set hash_store id (Nil : Val list) in
+              let _ = map_set hash_shared id snapshot9 in snapshot9)
+           | _ -> 0 - 1));
+let hcopy_shared = fn (src: int) ->
+  let snapshot9 = hshare_snapshot src in
+  if snapshot9 < 0 then mkhash (hst_get src)
+  else (let copy9 = mkhash Nil in
+        let _ = (match copy9 with
+                 | VHsh dst -> (let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1)
+                 | _ -> ()) in copy9);
+let hreplace_shared = fn (dst: int) -> fn (src: int) ->
+  let snapshot9 = hshare_snapshot src in
+  if snapshot9 < 0 then hset dst (hst_get src)
+  else (let _ = hset dst Nil in
+        let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1);
 let hderef_fwd = fn (id: int) -> hderef id;
 // ⚠ A DELETE KEEPS THE INDEX, if the key has a digest. `hset` is the door for
 // "the list changed in a way this file did not choose" and it drops the index;
@@ -2078,7 +2134,7 @@ let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
   // hset would drop the index; write the list underneath it instead
   let _ = hpend_drop id in
   let _ = (if keep then () else hidx_drop id) in
-  let _ = map_set hash_store id xs in ();
+  let _ = hst_publish id xs in ();
 // an existing key of an INDEXED hash takes a new value: the index says it,
 // and the list is stale until someone reads it (hderef)
 let hput_over = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
