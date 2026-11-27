@@ -9,11 +9,7 @@
 static VALUE make(const char *ptr, long len, int enc) {
     if (len < 0) rb_raise(rb_eArgError, "negative string size (or size too big)");
     if (ptr) mr_put_bytes(ptr, len);
-    else {
-        char *zeros = ruby_xcalloc(1, (size_t)len + 1);
-        mr_put_bytes(zeros, len);
-        ruby_xfree(zeros);
-    }
+    else mr_put_zero_bytes(len);
     mr_put_text(mr_enc_name_of_index(enc));
     return mr_up1(MR_STR_NEW, (VALUE)enc);
 }

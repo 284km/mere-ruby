@@ -98,6 +98,14 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e);
 void mr_put_words(long n, const VALUE *words);
 VALUE mr_word(long i);
 void mr_put_bytes(const void *p, long n);
+void mr_put_zero_bytes(long n);
+/* Buffers of 1 MiB or more are mapped, and unmapped when let go (core.c):
+ * mr_big says whether a size is one; mr_big_free's `mapped` is what
+ * mr_big_alloc did for that buffer. */
+int mr_big(size_t n);
+void *mr_big_alloc(size_t n);
+void mr_big_free(void *p, size_t n, int mapped);
+void *mr_big_realloc(void *p, size_t n, size_t want);
 const mere_bytes *mr_got_bytes(void);
 /* Where the next request's answer goes when it is a String's bytes
  * (MR_STR_GET): `take` gets the interpreter's own bytes while the request
