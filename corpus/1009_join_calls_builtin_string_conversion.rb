@@ -35,4 +35,23 @@ p [:hash_override, joined1009, joined1009.encoding.name, custom1009.calls]
 class BadJoinHash1009 < Hash
   def to_s = 123
 end
-p [:hash_bad_to_s, [BadJoinHash1009.new].join.match?(/\A#<BadJoinHash1009:0x[0-9a-f]+>\z/)]
+fallback1009 = [BadJoinHash1009.new].join
+p [:hash_bad_to_s, fallback1009.match?(/\A#<BadJoinHash1009:0x[0-9a-f]+>\z/), fallback1009.encoding.name]
+
+saved_verbose1009 = $VERBOSE
+$VERBOSE = nil
+$join_identity_calls1009 = 0
+class BadIdentityHash1009 < BadJoinHash1009
+  def object_id
+    $join_identity_calls1009 += 1
+    raise "object_id must not be called"
+  end
+end
+$VERBOSE = saved_verbose1009
+fallback1009 = [BadIdentityHash1009.new].join
+p [:native_hash_identity, fallback1009.match?(/\A#<BadIdentityHash1009:0x[0-9a-f]+>\z/),
+   fallback1009.encoding.name, $join_identity_calls1009]
+
+class MauvaisÉHash1009 < BadJoinHash1009; end
+fallback1009 = [MauvaisÉHash1009.new].join
+p [:unicode_hash_fallback, fallback1009.match?(/\A#<MauvaisÉHash1009:0x[0-9a-f]+>\z/), fallback1009.encoding.name]
