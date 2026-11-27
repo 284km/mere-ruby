@@ -108,6 +108,27 @@ bad = Object.new; def bad.to_int = "x"
   end
 end
 
+# ...and a Float that has no long -- NaN, the infinities, one past a long --
+# is a RangeError before anything is read, as a length and as an offset (an
+# offset is binread's off_t, "long long" where an off_t is not a long)
+[Float::INFINITY, -Float::INFINITY, Float::NAN, 1e100, -1e100, 9.3e18, 2.0**63].each do |x|
+  %i[read binread].each do |m|
+    [File, IO].each do |k|
+      t("#{k}.#{m} #{x}")         { k.send(m, "/dev/zero", x) }
+      t("#{k}.#{m} 1 #{x}")       { k.send(m, "/dev/zero", 1, x) }
+      t("#{k}.#{m} file 1 #{x}")  { k.send(m, __FILE__, 1, x) }
+    end
+  end
+  t("File#read #{x}")         { File.open("/dev/zero") { |f| f.read(x) } }
+  t("File#readpartial #{x}")  { File.open("/dev/zero") { |f| f.readpartial(x) } }
+  t("File#sysread #{x}")      { File.open("/dev/zero") { |f| f.sysread(x) } }
+  t("File#read_nonblock #{x}") { File.open("/dev/zero") { |f| f.read_nonblock(x) } }
+  t("pipe read #{x}")         { piped("ab\n") { |p| File.open(p) { |f| f.read(x) } } }
+  t("File#gets #{x}")         { File.open(__FILE__) { |f| f.gets(x) } }
+  t("File#seek #{x}")         { File.open(__FILE__) { |f| f.seek(x) } }
+  t("File#sysseek #{x}")      { File.open(__FILE__) { |f| f.sysseek(x) } }
+end
+
 # a File read over a pipe and then reopened onto a file reads the file
 Dir.mktmpdir do |d|
   f = File.join(d, "fresh.txt"); File.write(f, "fresh\n")

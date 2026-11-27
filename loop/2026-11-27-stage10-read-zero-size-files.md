@@ -37,6 +37,15 @@ A length or an offset that is not an Integer was taken for "none given" (third r
 
 `binread` converts the length first, `read` the offset first. `IO.read` (the prelude's) converts the length after the open and the seek, as ruby does.
 
+A Float was truncated without a look at its range (fourth review, Major). `File.read("/dev/zero", Float::INFINITY)` and `File.binread("/dev/zero", 1e100)` became a length past any device and read without an end; main answered "" (wrong, but at once). ruby raises a RangeError before anything is read. `file_read_num` now refuses NaN, the infinities and a Float outside a long with ruby's RangeError: "float Inf out of range of integer", "float NaN ...", "float 1e+100 ..." (in `%-.10g`).
+
+An offset that is an off_t says "long long" instead, except on Linux, where an off_t is a long. These offsets are binread's, `#seek`'s, `#sysseek`'s, `#advise`'s and `IO.write`'s.
+
+The prelude's readers took a Float the same way. `IO.read`, `IO#read`, `#sysread`, the line readers' limit, `#seek`, `#sysseek`, `#advise` and `IO.write`'s offset all converted through `__fd_long(__fd_int(x))`. A Float infinity there was a FloatDomainError, and one past a long was "bignum too big". They now go through `IO.__fd_num`, which checks a Float first. Two more places convert a Float through it now:
+
+- `File#readpartial`, which handed the Float to the builtin as it was and answered a read;
+- `IO#read_nonblock`, which called `to_int`.
+
 A File reopened onto another path kept what it had read of the old one as a stream (third review, Major). Read over a pipe and then reopened onto a file, it answered the pipe's "old\n" again. `__f_reopen` now drops `__f_whole`, the bytes and the mark that the path was not a stream alike.
 
 A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
@@ -61,6 +70,7 @@ Corpus 838 covers:
 - a pipe read with an offset, and with an offset of 0: ESPIPE;
 - a negative length, a negative offset and both, for `File` and `IO`, `read` and `binread`, over `/dev/zero`, a pipe and a regular file;
 - lengths and offsets that are not Integers: a Float, an object with `#to_int` (answering -1, 2, and a String), a String, nil and a Bignum;
+- Floats that have no long, as a length and as an offset, for `File` and `IO`, `read` and `binread`, and for `#read`, `#readpartial`, `#sysread`, `#read_nonblock`, `#gets`, `#seek` and `#sysseek`: the two infinities, NaN, 1e100, -1e100, 9.3e18 and 2**63;
 - a File read over a pipe and then reopened onto a file;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
