@@ -32,3 +32,39 @@ klass.prepend(outer)
 p [:ordinary, klass.included_modules.include?(ordinary)]
 p [:nested, outer.included_modules.first.equal?(nested)]
 p [:receiver, outer.included_modules.any? { |mod| mod.equal?(outer) }]
+
+# A concern-style included block keeps all of its lexical modules when it
+# defines a method on the consumer through class_eval.
+module JobScope955
+  Context = :lexical
+  module Feature
+    BODY = proc do
+      def context955 = Context
+      def nesting955 = Module.nesting.map(&:name)
+    end
+    SINGLE = proc do
+      def context955 = [Context, Module.nesting.map(&:name)]
+    end
+    def self.included(base) = base.class_eval(&BODY)
+  end
+end
+class JobConsumer955
+  Context = :caller
+  include JobScope955::Feature
+end
+p [:included_lexical, JobConsumer955.new.context955, JobConsumer955.new.nesting955]
+p [:single_definition_lexical, Class.new(&JobScope955::Feature::SINGLE).new.context955]
+
+# A qualified module opening has no enclosing lexical module, even though
+# the same module path is printed. It must not see JobScope955::Context.
+module JobScope955::Feature
+  QUALIFIED = proc do
+    def qualified_context955 = Context
+  end
+end
+qualified955 = Class.new(&JobScope955::Feature::QUALIFIED)
+begin
+  qualified955.new.qualified_context955
+rescue NameError => error
+  p [:qualified_scope, error.class, error.name]
+end
