@@ -53,3 +53,15 @@ Dir.mktmpdir do |d|
   big = File.join(d, 'b.txt'); File.write(big, (1..5).map { |i| "l#{i}\n" }.join)
   File.open(big) { |io| p [io.gets, io.read(3), io.gets, io.eof?, io.read, io.eof?]; io.seek(-3, IO::SEEK_END); p io.read }
 end
+
+# with a length, a path without an end is read only that far, and the bytes
+# are BINARY; an offset is a seek, which a character device takes and a pipe
+# refuses (even 0)
+p File.read("/dev/urandom", 16).bytesize
+p File.binread("/dev/zero", 4)
+p File.read("/dev/zero", 3, 5)
+p IO.read("/dev/urandom", 8).bytesize
+p File.read("/dev/zero", 0)
+p File.read(__FILE__, 2).encoding, File.read(__FILE__, 2, 1).encoding, File.read(__FILE__).encoding
+t("pipe offset")  { piped("abcdefgh") { |p| File.read(p, 3, 2) } }
+t("pipe offset 0") { piped("abc") { |p| File.binread(p, 2, 0) } }

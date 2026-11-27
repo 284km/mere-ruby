@@ -15,6 +15,13 @@ The interpreter's whole-file read is Mere's `read_file`, which takes a regular f
   - A regular file that is really empty is not kept: a Tempfile written later, or a log followed as it grows, still sees what is written.
   - A character device is not kept either: `/dev/zero` has no end to read to.
 
+With a length, `File.read` and `File.binread` read such a path only as far as the offset and the length reach (`read_path_prefix`). A character device has no end: `File.read("/dev/urandom", 16)` read to the end of a device that has none, and never returned (review, Major). ruby answers its 16 bytes. And with the review's corpus lines, two more of ruby's answers came in:
+
+- an offset is a seek, which a pipe refuses -- Errno::ESPIPE "Illegal seek @ rb_io_seek", even for an offset of 0;
+- a read with a length is BINARY, as ruby tags it, the length possibly ending mid-character. Of a regular file it was UTF-8 on main too.
+
+A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
+
 `read_file` is still used where the path is known to be regular:
 
 - File.write's read of the old content (with an offset or "a");
@@ -31,6 +38,8 @@ Corpus 838 covers:
 
 - a pipe behind `/dev/fd/N`, read by `File.read`, `File.binread` (BINARY), `IO.read`, `File.read` with a length, `File.readlines`, `File.foreach`, `File.open(&:read)` and `gets`, and an empty pipe;
 - regular files: whole, with a length and an offset, empty, empty with a length, a directory (EISDIR) and a missing one (ENOENT);
+- character devices with a length: `/dev/urandom` (16 and 8 bytes), `/dev/zero` (with an offset, and with a length of 0), and the encodings of reads with and without a length;
+- a pipe read with an offset, and with an offset of 0: ESPIPE;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
 
@@ -64,5 +73,6 @@ On 391b560e:
 - The collector's root check.
 - `tools/loop_rss_check.sh`: all 14 loops within their bounds.
 - Linux (arm64, docker): /proc as above, both engines.
+- After the review fix: the same corpus, vm_corpus, vm_check, root check and loop_rss_check again, all passing.
 
 CHECKED
