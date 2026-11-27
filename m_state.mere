@@ -146,6 +146,7 @@ extern fn mem_set_u8: int -> int -> int -> int;
 // ⚠ The `bytes` a call returns is the glue's one static buffer, reused by the
 // next call: the caller copies it into a Ruby string before anything else runs.
 extern fn prism_ser: int -> bytes -> bytes -> bytes;
+extern fn prism_error_spans: bytes -> bytes -> bytes;
 extern fn prism_ok: bytes -> bytes -> int;
 extern fn prism_more: bytes -> bytes -> int;
 extern fn prism_query: int -> bytes -> str -> int;
@@ -1676,11 +1677,21 @@ let stdin_src_pos = map_new ();
 //   (test_hash's test_st_literal_memory_leak, note 404). The sweep deletes a
 //   dead hash's entry now; hash_ctr counts the handles issued.
 let hash_store = (let t = map_new () in let _ = map_compact t in t);  // (an arena of its own from birth: see arr_store)
+// Hash -> immutable metadata Array of pairs. These handles are marked from
+// the owning Hash, never as global roots, and swept with that owner.
+let hash_shared = (let t = map_new () in let _ = map_compact t in t);
+let hash_lazy = (let t = map_new () in let _ = map_compact t in t);
 let hash_ctr = (let v = vec_new () in let _ = vec_push v 0 in v);
 // the next handle a hash will get (the end of the range issued so far)
 let hash_next = fn (u: unit) -> handle_base + vec_get hash_ctr 0;
 // the stored pair list of a hash (none, for a handle no hash holds any more)
-let hst_get = fn (id: int) -> if map_has hash_store id then map_get hash_store id else (Nil : Val list);
+let hst_get = fn (id: int) ->
+  if map_len hash_shared > 0 && map_has hash_shared id then deref (map_get hash_shared id)
+  else if map_has hash_store id then map_get hash_store id else (Nil : Val list);
+// Every pair-list publication detaches this owner from its immutable copy.
+let hst_publish = fn (id: int) -> fn (xs: Val list) ->
+  let _ = (if map_len hash_shared > 0 && map_has hash_shared id then map_delete hash_shared id else ()) in
+  map_set hash_store id xs;
 // The signal names a program may trap, and the handlers it registered
 // (signal_traps, keyed by the short name). Nothing outside delivers a signal
 // to this process's handlers; the one source there is -- Process.kill of our
@@ -1752,10 +1763,21 @@ let fn hkey_obj_ident_fwd: Val -> bool;
 // killed test_hash at the 20th of its 306 tests.
 let fn hcbi_fwd: int -> bool;
 let hkey_busy = map_new ();
+// a String key's encoding, as far as it decides which keys are the same: ""
+// for the strings eql? compares by bytes alone across encodings, else the
+// encoding's name (see hkey_str_enc_fwd's definition, beside enc_canon_name)
+let fn hkey_str_enc_fwd: int -> str;
 let rec hkey_digest = fn (k: Val) ->
   match k with
   | VInt n -> "i" ++ str_of_int n
-  | VStr h -> "s" ++ sget h
+  // ⚠ THE BYTES ARE NOT THE WHOLE KEY. Two Strings are eql? when their bytes
+  //   are equal AND their encodings are comparable (rb_str_comparable, our
+  //   str_comparable): "ab" in UTF-16LE and "ab".b are two keys in ruby, and
+  //   were one wherever a hash had its index -- `{[] => 1, utf16 => 2, bin =>
+  //   3}.size` was 2 (#351's review). So a String outside the class that
+  //   compares by bytes alone carries its encoding.
+  | VStr h -> (let e = hkey_str_enc_fwd h in
+               if str_eq e "" then "s" ++ sget h else "S" ++ e ++ ":" ++ sget h)
   | VSym y -> "y" ++ y
   | VNil -> "n"
   | VBool b -> (if b then "t" else "f")
@@ -1832,7 +1854,11 @@ let hkey_dig = fn (id: int) -> fn (k: Val) -> if hcbi_fwd id then hkey_ident k e
 // (the off-switch lives in main.mere, where env_get is in scope; this is the
 //  plain question "does this hash have an index", asked while maintaining it)
 let hidx_off = map_new ();
-let hidx_on = fn (id: int) -> map_has hash_indexed id;
+let fn hidx_lazy_fwd: int -> bool;
+let hidx_on = fn (id: int) ->
+  if map_has hash_indexed id then true
+  else if map_len hash_lazy > 0 && map_has hash_lazy id then hidx_lazy_fwd id
+  else false;
 // ⚠ AN OVERWRITE IS WRITTEN TO THE INDEX ONLY. Storing a new value under a key
 //   the hash already has rebuilt the whole list and replaced it (hset), and
 //   hset drops the index -- so after one `h[k] = v` on an existing key every
@@ -1862,7 +1888,7 @@ let hpend_fold = fn (id: int) ->
   then
     (let q = map_get hash_pending id in
      let merged = list_append (hst_get id) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
-     let _ = map_set hash_store id merged in
+     let _ = hst_publish id merged in
      let _ = map_delete hash_pending id in
      qv_drop q)
   else ();
@@ -1890,7 +1916,7 @@ let hstale_fold = fn (id: int) ->
      let _ = map_delete hash_stale id in
      if map_has hash_index id then
        (let ys = hstale_vals id (hst_get id) in
-        let _ = map_set hash_store id ys in ())
+        let _ = hst_publish id ys in ())
      else ())
   else ();
 // anything the index cannot describe: the hash goes back to scanning
@@ -1948,6 +1974,7 @@ let hidx_drain = fn (u: unit) ->
   let _ = go 0 in
   vec_set hidx_pool_n 1 0;
 let hidx_drop = fn (id: int) ->
+  let _ = (if map_len hash_lazy > 0 && map_has hash_lazy id then map_delete hash_lazy id else ()) in
   // (a stale list is brought up to date while the index can still say how --
   //  the queue of new pairs keeps its own values, and hderef folds it later)
   let _ = hstale_fold id in
@@ -2020,7 +2047,7 @@ let mkhash = fn (xs: Val list) ->
   let _ = (if vec_get atr_on 0 > 0 then atr_note ("hsh:" ++ str_of_int id) else ()) in
   let _ = hcnt_drop id in
   let _ = vec_set hash_ctr 0 (vec_get hash_ctr 0 + 1) in
-  let _ = map_set hash_store id xs in
+  let _ = hst_publish id xs in
   // (a small hash of plain keys -- `{}`, `{a: 1}` -- is its list alone)
   let _ = (if hplain_small xs then ()
            else (let _ = hidx_start id in
@@ -2061,7 +2088,48 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
   let _ = hpend_drop id in
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   let _ = hidx_drop id in
-  let _ = map_set hash_store id xs in ();
+  let _ = hst_publish id xs in ();
+// Only immutable plain keys permit deferred index creation. In particular,
+// an Array key changing after dup must not acquire a new stored digest.
+let rec hplain_all = fn (xs: Val list) ->
+  match xs with
+  | Nil -> true
+  | Cons (key9, Cons (_, tail9)) -> hplain_key key9 && hplain_all tail9
+  | _ -> false;
+let hidx_lazy_fwd = fn (id: int) ->
+  let _ = map_delete hash_lazy id in
+  let xs9 = hst_get id in
+  if hplain_small xs9 then false
+  else (let _ = hidx_start id in
+        if hidx_seed id xs9 then true else (let _ = hidx_drop id in false));
+// Settle actual writes before reusing a snapshot. New pending or stale
+// values invalidate the old association through hst_publish when folded.
+let hshare_snapshot = fn (id: int) ->
+  let _ = hpend_fold id in
+  let _ = hstale_fold id in
+  if hcbi_fwd id then 0 - 1
+  else if map_has hash_shared id then map_get hash_shared id
+  else
+    (let xs9 = hst_get id in
+     // Keep the existing compact-list representation for small hashes.
+     if hplain_small xs9 || (if hplain_all xs9 then false else true) then 0 - 1
+     else (match arr_new_metadata xs9 with
+           | VArr snapshot9 ->
+             (let _ = map_set hash_store id (Nil : Val list) in
+              let _ = map_set hash_shared id snapshot9 in snapshot9)
+           | _ -> 0 - 1));
+let hcopy_shared = fn (src: int) ->
+  let snapshot9 = hshare_snapshot src in
+  if snapshot9 < 0 then mkhash (hst_get src)
+  else (let copy9 = mkhash Nil in
+        let _ = (match copy9 with
+                 | VHsh dst -> (let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1)
+                 | _ -> ()) in copy9);
+let hreplace_shared = fn (dst: int) -> fn (src: int) ->
+  let snapshot9 = hshare_snapshot src in
+  if snapshot9 < 0 then hset dst (hst_get src)
+  else (let _ = hset dst Nil in
+        let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1);
 let hderef_fwd = fn (id: int) -> hderef id;
 // ⚠ A DELETE KEEPS THE INDEX, if the key has a digest. `hset` is the door for
 // "the list changed in a way this file did not choose" and it drops the index;
@@ -2078,7 +2146,7 @@ let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
   // hset would drop the index; write the list underneath it instead
   let _ = hpend_drop id in
   let _ = (if keep then () else hidx_drop id) in
-  let _ = map_set hash_store id xs in ();
+  let _ = hst_publish id xs in ();
 // an existing key of an INDEXED hash takes a new value: the index says it,
 // and the list is stale until someone reads it (hderef)
 let hput_over = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
@@ -2873,6 +2941,9 @@ let include_defaults_cache =
    // Slots2/3 cache the permanent Object metaclass's include lookup.
    let _ = vec_push v (0 - 1) in
    let _ = vec_push v 0 in
+   // Slot4 stays set after the first Module-subclass backing is installed.
+   // Ordinary hooks can use their original lookup until that protocol exists.
+   let _ = vec_push v 0 in
    let _ = vec_compact v in
    v);
 let mro_anc = (let t = map_new () in let _ = map_compact t in t);  // cls -> its linearized ancestors // (its own arena: gc_churn_bytes, note 270)
@@ -2915,6 +2986,9 @@ let mro_next_epoch = fn () ->
   let n = vec_get mro_gen 2 + 1 in
   let _ = vec_set mro_gen 2 n in n;
 let mro_bump = fn () -> vec_set mro_gen 0 (mro_next_epoch ());
+// (group_by's question, whether a program has a Hash#default of its own,
+//  answered once per epoch: [the epoch it was asked at, 1 / 0])
+let gb_dflt_memo = (let v = vec_new () in let _ = vec_push v (0 - 1) in let _ = vec_push v 0 in v);
 // The tables a method's record reads (mrec_get, note 560 A) are written
 // through these: each write moves the epoch, so no record read before it is
 // taken for one read after. (Most writes come with a method table's change,
@@ -6880,6 +6954,15 @@ let method_store_floor =
 //  arena takes a new block, not with each row: a loop of
 //  `Class.new { def m; end }; GC.start` takes the same time and
 //  instructions as without the force, 1.5 s / 11.6e9 for 1,000 turns)
+// ...and a compaction a pin refused, to be done again where nothing can pin
+// (compact_method_store_at_top). The collector runs off the stack it
+// interrupts, and that stack is pinned by every word on it that looks like a
+// pointer into the arena -- stale ones too, which differ from run to run with
+// the addresses the allocator gave. A store past Mere's small-map rule then
+// waits under the pin until it has doubled again: test_module's
+// complemented_method_entry leak test ended with this arena at 8, 16 or 33 MB
+// depending on the run, and its RSS ratio went with it.
+let method_store_refused = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_compact v in v);
 let compact_method_store = fn (force: bool) ->
   if vec_get method_store_dirty 0 == 0 then false
   else
@@ -6897,9 +6980,27 @@ let compact_method_store = fn (force: bool) ->
         // become a larger baseline that delays the next real attempt.
         if (if arena_measurable then floor == 0 || after < before else true) then
           (let _ = (if arena_measurable then vec_set method_store_floor 0 after else ()) in
+           let _ = vec_set method_store_refused 0 0 in
            vec_set method_store_floor 1 rows)
-        else ()) else ()) in
+        else vec_set method_store_refused 0 1) else ()) in
      let _ = vec_set method_store_dirty 0 0 in due);
+// A top-level statement boundary of the main program: no call is in flight,
+// the stack running here is not a suspended one the runtime pins for, and
+// nothing on it is in the middle of a method row. A compaction of the method
+// store a pin refused is done here, the next time there is one -- the same
+// for every run, where the collector's own attempts depend on the words left
+// on the stack it interrupted.
+let compact_method_store_at_top = fn (u: unit) ->
+  if vec_get method_store_refused 0 == 0 then ()
+  else
+    (let before = map_bytes meths_g in
+     let _ = map_compact meths_g in
+     let after = map_bytes meths_g in
+     let _ = vec_set method_store_refused 0 0 in
+     if after < before then
+       (let _ = vec_set method_store_floor 0 after in
+        vec_set method_store_floor 1 (map_len meths_g))
+     else ());
 let map_compact_big = fn m -> if map_bytes m > 262144 then map_compact m else ();
 // The spelling is a one-write warning baton, consumed by gvar_write. Its
 // deleted strings must not accumulate in the process-wide default arena.
@@ -7466,6 +7567,30 @@ let enc_canon_name = fn (nm: str) ->
   else if str_index_of nm (chr 3) >= 0 then enc_canon_name0 nm
   else (let r = enc_canon_name0 nm in
         let _ = map_set enc_canon_memo nm r in r);
+// (hkey_digest's question.) One class compares by bytes alone: every UTF-8
+// String (a String with no entry in str_enc is UTF-8), every ASCII-only one in
+// an ASCII-compatible encoding, and the empty one -- str_comparable says yes
+// for any two of them, and their bytes are then the whole answer. Anything else
+// is comparable only to its own encoding.
+// (per encoding -- its index in enc_names, which str_enc holds -- what decides
+//  it: "" for UTF-8, else the canonical name behind "+" when the encoding is
+//  ASCII-compatible and "-" when it is not. Asked of every String key with an
+//  encoding of its own on every store and lookup, where canonicalising the
+//  name each time cost 4% on a hash of binary keys.)
+let hkey_enc_memo = map_new ();
+let hkey_str_enc_fwd = fn (h: int) ->
+  if map_has str_enc h then
+    (let ei = map_get str_enc h in
+     let m = (if map_has hkey_enc_memo ei then map_get hkey_enc_memo ei
+              else (let e = enc_canon_name (vec_get enc_names ei) in
+                    let v = (if str_eq e "UTF-8" then "" else if enc_ascii_compat e then "+" ++ e else "-" ++ e) in
+                    let _ = map_set hkey_enc_memo ei v in v)) in
+     if str_len m == 0 then ""
+     // (an empty String is ASCII-only too: it meets every encoding)
+     else if ord (char_at m 0) == 43 then (if str_is_ascii h then "" else substring m 1 (str_len m))
+     else if str_len (sget h) == 0 then ""
+     else substring m 1 (str_len m))
+  else "";
 // (enc_ascii_compat is defined once, beside enc_is_dummy. A SECOND copy used
 // to live here that knew only UTF-16/32/7, and being the later definition it
 // won: every DUMMY encoding -- IBM037, CP50220/1, the ISO-2022-JP family --

@@ -44,8 +44,12 @@ module RubyVM::AbstractSyntaxTree
           #  the def, or the lambda / block define_method was given)
           [cands.select { |n| n[0] == :def_node && n[2].include?(own) },
            cands.select { |n| n[0] == :lambda_node || n[0] == :block_node }]
+        elsif want
+          # A recorded callee must match. An eval filename can name a file
+          # containing entirely different code; unrelated nodes are no fallback.
+          [cands.select { |n| __nid_call?(n) && n[2].include?(want) }]
         else
-          [want ? cands.select { |n| __nid_call?(n) && n[2].include?(want) } : [],
+          [[],
            # (a method written in C has a frame of its own, on its caller's
            #  line, named for the method: Integer#+)
            cands.select { |n| __nid_call?(n) && n[2].include?(own) },
@@ -103,7 +107,21 @@ module RubyVM::AbstractSyntaxTree
     def __nid_names(node)
       case node.type
       when :lambda_node, :block_node then []
-      when :call_node, :constant_read_node, :constant_path_node, :def_node then [node.name]
+      when :call_node
+        names = [node.name]
+        # A literal forwarding target describes the call represented by
+        # this node as well as its sender. Keep ambiguity handling above:
+        # several possible calls still have no uniquely justified node id.
+        if %i[send __send__ public_send const_get].include?(node.name)
+          arg = node.arguments&.arguments&.first
+          if arg && (arg.type == :symbol_node || arg.type == :string_node)
+            target = arg.unescaped
+            target = target.split("::").last || target if node.name == :const_get
+            names << target.to_sym
+          end
+        end
+        names
+      when :constant_read_node, :constant_path_node, :def_node then [node.name]
       when :call_operator_write_node then [node.read_name, node.write_name, node.binary_operator]
       when :call_and_write_node, :call_or_write_node then [node.read_name, node.write_name]
       when :index_operator_write_node then [:[], :[]=, node.binary_operator]

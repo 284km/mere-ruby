@@ -69,6 +69,13 @@ CASES = {
     b = u.b
     (200_000 / d).times { |i| u =~ /other/; u.index(/thing/); b =~ /value/; b.index(/key/) }
   },
+  # Module#constants made its two tables in the default region, the size of
+  # the constants it read, and Process.clock_gettime asked Process.constants
+  # on every call with a CLOCK_ number -- ActiveSupport::Notifications reads
+  # the clock around every query (323 MB over 16,384 rows inserted and
+  # preloaded)
+  "Module#constants" => ->(d) { (20_000 / d).times { Process.constants.size } },
+  "clock_gettime with a CLOCK_ number" => ->(d) { (100_000 / d).times { Process.clock_gettime(Process::CLOCK_MONOTONIC) } },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))

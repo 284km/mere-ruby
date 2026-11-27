@@ -267,6 +267,14 @@ module Prism
       dumped
     end
 
+    # Parser-owned scanner ranges, separate from the public diagnostics.
+    def __ripper_escape_locations(code, **options) # :nodoc:
+      bytes = Prism.__prism_error_spans(check_string(code), dump_options(options))
+      bytes.unpack("L<*").each_slice(4).to_h do |index, start, length, state|
+        [index, [start, length, state == 0xffffffff ? nil : state]]
+      end
+    end
+
     def lex_common(code, options) # :nodoc:
       serialize.load_lex(code, Prism.__prism_ser(1, code, dump_options(options)), options.fetch(:freeze, false))
     end

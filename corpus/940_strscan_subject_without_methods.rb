@@ -6,7 +6,7 @@ require 'strscan'
   string = +'abcädeföghi'
   scanner = StringScanner.new(string, fixed_anchor: fixed)
   class << string
-    undef_method(*instance_methods)
+    undef_method(*instance_methods.sort)
   end
   p [scanner.charpos, scanner.scan_until(/ä/), scanner.charpos,
      scanner.scan_until(/ö/), scanner.charpos]

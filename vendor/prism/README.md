@@ -30,7 +30,7 @@ here calls into a Ruby. `api_pack.c` is not either, for the same reason.
 From a Ruby source tree at the version mere-ruby targets (tools/ref_ruby.sh):
 
 ```sh
-sh tools/gen_prism_src.sh ~/src/github.com/ruby/ruby-4.0.9
+sh tools/gen_prism_src.sh ~/src/github.com/ruby/ruby-4.0.10
 ```
 
 It runs `prism/templates/template.rb` with the reference ruby for each
@@ -60,3 +60,12 @@ selects the private path only for a heredoc diagnostic or an actual stray
 right-brace diagnostic. Public Prism lex/parse keeps its original behavior.
 The extracted Ruby consumer preserves the reference file's frozen-string
 pragma as well as its original lexical constant scope.
+
+## Local scanner provenance
+
+After the heredoc adaptation, the generator applies
+`tools/prism_ripper_spans.patch`. It retains a private invalid-escape
+location at the parser's actual escape cursor. Public diagnostic locations,
+messages and serialized data remain unchanged. The extra location is read
+only by the private Ripper glue; its source pointers die with the parser,
+and only copied offsets cross the boundary.
