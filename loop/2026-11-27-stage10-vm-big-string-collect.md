@@ -115,4 +115,11 @@ ruby answers true to all five. On main, the VM answers false to the last two. Th
 
 ## Checked
 
-CHECKED
+On 737bca4e:
+
+- `run_corpus.sh`: 1030/1030.
+- `vm_corpus.sh`: all 1030 programs on the VM, 0 fallback, 0 FAIL.
+- vm_check: 246/246.
+- The collector's root check.
+- `tools/loop_rss_check.sh` (14/14).
+- `tools/class_watermark_check.sh`.
