@@ -164,3 +164,43 @@ Dir.mktmpdir('eval-node-operators-') do |directory|
     end
   end
 end
+
+# Heredoc bodies may lie beyond their DefNode's source span. Include those
+# descendants without pulling in a neighboring definition's compact index.
+heredoc_sources1004 = {
+  endless: <<~'RUBY_SOURCE',
+    def heredoc_node1004 = <<~TEXT
+      #{nil.missing_heredoc1004}
+    TEXT
+  RUBY_SOURCE
+  regular: <<~'RUBY_SOURCE',
+    def heredoc_node1004
+      <<~TEXT
+        #{nil.missing_heredoc1004}
+      TEXT
+    end
+  RUBY_SOURCE
+  sibling: <<~'RUBY_SOURCE'
+    def other_heredoc1004 = <<~TEXT
+      #{nil.wrong_heredoc1004}
+    TEXT
+    def heredoc_node1004 = <<~TEXT
+      #{nil.missing_heredoc1004}
+    TEXT
+  RUBY_SOURCE
+}
+Dir.mktmpdir('eval-node-heredocs-') do |directory|
+  heredoc_sources1004.each do |kind, source|
+    path = File.join(directory, "#{kind}.rb")
+    File.write(path, source)
+    [[:file, path], [:synthetic, 'heredoc-template1004']].each do |label, filename|
+      owner = Class.new
+      owner.class_eval(source, filename, 1)
+      begin
+        owner.new.heredoc_node1004
+      rescue NoMethodError => error
+        eval_node_result1004([:heredoc, kind, label], source, error)
+      end
+    end
+  end
+end
