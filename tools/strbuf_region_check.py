@@ -32,6 +32,17 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # region's. Each was looked at for this check: what it builds is small and
 # bounded (a name, a number's digits, a line of a message), or it runs once.
 ALLOWED = {
+    # its new StrBufs are typed as the one it is handed, which lex_dstr_t makes
+    # in `region DSTR`: a function's StrBuf of a region parameter is made in
+    # the region its caller passes, not the default one
+    ("m_parse.mere", "lex_dstr_buf"): "lex_dstr_t's region DSTR",
+    # its one-character buffers are passed back to itself where its `b` goes,
+    # so they are typed as `b`, which encode_cps makes in `region ENCB`
+    ("m_codec.mere", "encode_cps_go"): "encode_cps's region ENCB",
+    # --dump=parsetree, once per run, and its printers share one StrBuf type
+    ("m_driver.mere", "pt_q"): "--dump=parsetree, once",
+    ("m_driver.mere", "pt_e_inline"): "--dump=parsetree, once",
+    ("m_driver.mere", "cli_parsetree"): "--dump=parsetree, once",
 }
 
 DEF = re.compile(r"^(let|and)( rec)? ([a-z_][a-zA-Z0-9_']*)")
