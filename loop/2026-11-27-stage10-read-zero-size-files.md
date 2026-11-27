@@ -75,7 +75,7 @@ Corpus 838 covers:
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
 
-It matches ruby on both engines. main differs in 27 lines.
+It matches ruby on both engines, and under GC stress on both. main (6d2cb190) answers the first pipe reads wrongly and then stops with a segmentation fault at its fifth line.
 
 On Linux, `/proc/self/status` (read, binread, IO.read, readlines, foreach, open and read, gets and eof?), `/proc/self/cmdline` and `/proc/sys/kernel/ostype` match ruby 3.4 on both engines. main answered six of the ten wrongly.
 
