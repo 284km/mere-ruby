@@ -32,7 +32,10 @@ collection that leaves a free slot (a check mode for the corpus).
    - sq-stress (`SLAB_SQUEEZE=1 GC_STRESS=50`): 1012/1014. 676_tail_calls
      does not finish under `GC_STRESS=50` even without the squeeze (300 s);
      526_objectspace_internal_class differs under `GC_STRESS=50` on main too.
-   - sq-stress-vm: **not run yet**.
+   - sq-stress-vm: every file up to 497 passed (0 FAIL). The run stopped
+     in the reference ruby on 498 (its FIFO between two threads) after
+     2 h 24 min, while another corpus run was stuck on the same file; it
+     was stopped and is to be run again on its own from the start.
    - Fiber / Thread / Enumerator / Ractor files (128) under
      `SLAB_SQUEEZE=1 GC_STRESS=50`, evaluator and VM: 0 new differences.
 4. Fixture probe (`zz_fixture_probe_test.rb`, normal GC): 1 squeeze in 61
@@ -72,11 +75,31 @@ On a small top-level script the slab's recycle took the unpinned path
 (8.8M slots, 607 MB arena), and two retired arenas (97 MB, 240 MB) were kept
 and later freed.
 
+### Two runs with the diagnostic and `GC_LOG` (2026-11-27 evening)
+
+Both were good runs: preload 133 s and 87 s, footprint after preload
+1,248 MB and 1,303 MB, peak 1.63 GB and 1.68 GB, two squeezes each.
+
+- In both, the first squeeze's `vec_recycle` of the slab took the pinned
+  path: a 350 MB arena was retired and kept, pinned by 4 stacks. The
+  second squeeze kept a 53 MB arena the same way.
+- Both arenas were freed in a later collection. Every arena over 50 MB that
+  was kept during the run was freed again before the end.
+
+So the pinned retire happens on every run, good or bad; what is not seen
+yet is an arena that stays. All three runs with `GC_LOG` were good and both
+runs without it were bad, so printing may change the timing.
+
+A second diagnostic (`MERE_RUBY_DIAG=1`) records the same three events in
+memory with the time since start and prints them at exit, together with
+every arena still retired at exit.
+
 ## Next
 
-1. Two probe runs of the squeeze build with `GC_TIGHT=1 GC_LOG=1` and the
-   diagnostic, never alongside a corpus, to catch a bad run with its log.
-2. sq-stress-vm.
+1. Two probe runs with `GC_TIGHT=1 DIAG=1` and no `GC_LOG`. Look only at the
+   diagnostic lines (pin, retire, free, what is still retired at exit),
+   since the times move with the machine's load.
+2. sq-stress-vm again, on its own.
 3. If the retired-arena suspicion holds, propose a fix before writing it
    (for example: when the slab's arena is pinned, skip the squeeze and try
    at the next collection).
