@@ -50,6 +50,34 @@ static VALUE freeze(VALUE self, VALUE obj) { (void)self; rb_obj_freeze(obj); ret
 static VALUE store(VALUE self, VALUE ary, VALUE index, VALUE value) { (void)self; rb_ary_store(ary, NUM2LONG(index), value); return ary; }
 /* What sqlite3's callback frame asks on every prepare and step. */
 static VALUE thread_current(VALUE self) { (void)self; return rb_thread_current(); }
+/* Strings of a megabyte and more: their buffers are mapped (core.c's big
+ * buffers), made, written, resized and let go as any other */
+static VALUE big_new(VALUE self, VALUE n, VALUE ch) {
+    (void)self;
+    long len = NUM2LONG(n);
+    VALUE s = rb_str_new(NULL, len);
+    memset(RSTRING_PTR(s), NUM2INT(ch), (size_t)len);
+    return s;
+}
+static VALUE big_fill(VALUE self, VALUE str, VALUE ch) {
+    (void)self;
+    memset(RSTRING_PTR(str), NUM2INT(ch), (size_t)RSTRING_LEN(str));
+    return str;
+}
+static VALUE big_resize(VALUE self, VALUE str, VALUE n, VALUE ch) {
+    (void)self;
+    long was = RSTRING_LEN(str), len = NUM2LONG(n);
+    rb_str_resize(str, len);
+    if (len > was) memset(RSTRING_PTR(str) + was, NUM2INT(ch), (size_t)(len - was));
+    return str;
+}
+static VALUE big_cat(VALUE self, VALUE str, VALUE times) {
+    (void)self;
+    char chunk[4096];
+    memset(chunk, 'c', sizeof chunk);
+    for (long i = 0; i < NUM2LONG(times); i++) rb_str_cat(str, chunk, (long)sizeof chunk);
+    return str;
+}
 static VALUE thread_aref(VALUE self, VALUE thread, VALUE key) { (void)self; return rb_thread_local_aref(thread, SYM2ID(key)); }
 /* A row as sqlite3's step makes one: an Array of the capacity, its elements
  * stored in order, a String frozen with rb_obj_freeze, the row frozen; and
@@ -619,6 +647,10 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "store", store, 3);
     rb_define_singleton_method(mod, "row", row, 1);
     rb_define_singleton_method(mod, "thread_current", thread_current, 0);
+    rb_define_singleton_method(mod, "big_new", big_new, 2);
+    rb_define_singleton_method(mod, "big_fill", big_fill, 2);
+    rb_define_singleton_method(mod, "big_resize", big_resize, 3);
+    rb_define_singleton_method(mod, "big_cat", big_cat, 2);
     rb_define_singleton_method(mod, "thread_aref", thread_aref, 2);
     rb_define_singleton_method(mod, "default_internal", default_internal, 0);
     rb_define_singleton_method(mod, "aset", aset, 3);
