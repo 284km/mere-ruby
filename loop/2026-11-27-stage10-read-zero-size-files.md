@@ -116,3 +116,4 @@ On 391b560e:
 - After the second review fix, merged with main 9547d96b: `run_corpus.sh` 1024/1024, `vm_corpus.sh` all 1024 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
 - After the third review fix, merged with main ad289755: `run_corpus.sh` 1027/1027, `vm_corpus.sh` all 1027 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
 - After the fourth review fix, on 8b1c2ed5: `run_corpus.sh` 1027/1027, `vm_corpus.sh` all 1027 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
+- After the fifth review fix, merged with main 491cc5ca: `run_corpus.sh` 1032/1032, `vm_corpus.sh` all 1032 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, `tools/loop_rss_check.sh` (15/15) and `tools/class_watermark_check.sh`.
