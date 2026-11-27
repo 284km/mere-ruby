@@ -1,7 +1,9 @@
-# Rails-2: squeeze the instance variables' slab (work in progress)
+# Rails-2: squeeze the instance variables' slab
 
-Branch `rails-ar-slab-compact`, base main `b9ca06d6`. No PR yet: the fixture
-probe shows an intermittent regression that has to be explained first.
+Branch `rails-ar-slab-compact`, first on main `b9ca06d6`, main `491cc5ca`
+merged in on 2026-11-28. The PR is opened on the macOS numbers; it is merged
+only after the Linux comparison below is added. The fixture probe's
+intermittent regression is not explained (see "Open").
 
 ## What the change does
 
@@ -117,11 +119,60 @@ lines (and, for the last run, the limit below) added.
   `GC_LOG` and all five diagnostic runs were good. What is left: the
   machine's state that afternoon, or something only in the original binary.
 
+### The original binary and the baseline again, with vmmap (2026-11-28)
+
+`vmmap --summary` after `fixtures+gc` and after `preload`, only `GC_TIGHT`
+and `STORE_STATS` set.
+
+| build | squeezes | preload | footprint after preload | peak |
+| --- | --- | --- | --- | --- |
+| squeeze (original) | 2 | 183 s | 1,896 MB | 2.20 GB |
+| squeeze (original) | 1 | 101 s | 1,265 MB | 1.60 GB |
+| squeeze (original), vmmap | 2 | 126 s | 1,387 MB | 1.64 GB |
+| squeeze (original), vmmap | 2 | 85 s | 1,227 MB | 1.53 GB |
+| without the squeeze, vmmap | 0 | 89 s | 1,231 MB | 1.47 GB |
+| without the squeeze, vmmap | 0 | 80 s | 1,255 MB | 1.85 GB |
+
+The first of these had 47 GB of disk free, so a full disk is not the whole
+story. After preload, most of the footprint is `VM_ALLOCATE` (the arenas):
+508-758 MB resident and 366-564 MB compressed, on both builds; all the
+`MALLOC_*` rows together stay near 120 MB.
+
+All runs so far: the original squeeze binary 7 (bad 2, middling 1, a little
+heavy 1, good 3), the diagnostic binaries 5 (all good), the build without
+the squeeze 4 (all good in preload and footprint after preload; the peak
+moves between 1.47 and 1.85 GB). The bad runs came while the machine was
+loaded; the cause is not found.
+
+## eager_test under run.py (2026-11-28, macOS)
+
+`run.py run --jobs 1 --side mere` on `eager_test.rb` (family RSS limit
+2 GiB, 600 s), the two builds alternating. The compressor's pages are from
+`vm_stat` before and after each run (16 KiB pages).
+
+| build | state | cases | time | peak family RSS | compressor pages |
+| --- | --- | --- | --- | --- | --- |
+| squeeze | COMPLETE | 198/199 | 435 s | 1.29 GiB | 867,500 -> 913,523 |
+| without | COMPLETE | 198/199 | 405 s | 1.44 GiB | 913,501 -> 829,104 |
+| squeeze | COMPLETE | 198/199 | 398 s | 1.11 GiB | 829,070 -> 977,191 |
+| without | COMPLETE | 198/199 | 386 s | 1.71 GiB | 977,119 -> 881,381 |
+
+- Neither build hits `MEMORY_LIMIT` on this machine any more. The case that
+  fails on both is `test_exceptions_have_suggestions_for_fix` (the runs had
+  no `--framework-bootstrap`, so no did_you_mean).
+- With the squeeze the peak RSS is lower in both pairs (1.20 against
+  1.58 GiB on average). macOS RSS goes down when the compressor takes pages,
+  and the compressor held 13-15 GiB through these runs, so the size of the
+  gain is not settled here.
+
 ## Next
 
-1. The original binary again, with only `GC_TIGHT` and `STORE_STATS`, one or
-   two runs: bad again points at the binary, good at that afternoon.
-2. sq-stress-vm again, on its own.
+1. The same comparison on Linux (docker), where CI's limit applies and
+   nothing is compressed: the two builds alternating, two runs each, with
+   run.py's limits. The PR is merged only after this is in it.
+2. sq-stress-vm with `CORPUS_KEEP_GOING=1` on the merged tree (the run
+   without it stopped at 526, which differs under `GC_STRESS=50` on main
+   too).
 3. If the retired-arena suspicion holds, propose a fix before writing it
    (for example: when the slab's arena is pinned, skip the squeeze and try
    at the next collection).
