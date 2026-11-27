@@ -30,7 +30,7 @@ here calls into a Ruby. `api_pack.c` is not either, for the same reason.
 From a Ruby source tree at the version mere-ruby targets (tools/ref_ruby.sh):
 
 ```sh
-sh tools/gen_prism_src.sh ~/src/github.com/ruby/ruby-4.0.9
+sh tools/gen_prism_src.sh ~/src/github.com/ruby/ruby-4.0.10
 ```
 
 It runs `prism/templates/template.rb` with the reference ruby for each
@@ -38,11 +38,34 @@ generated file and copies the hand-written ones. The templates are driven by
 `prism/config.yml`, so a version bump regenerates everything; the diff that
 needs reading is `src/prism.c`.
 
+The generator then applies `tools/prism_ripper_heredoc.patch`. This private
+Ripper serializer enables EOF recovery while the actual parser and its local
+scopes remain live. An internal empty interpolation-end marker lets the
+parser unwind into its heredoc's normal EOF recovery, which resumes the
+actual saved header cursor. Ripper hides the empty recovery markers after
+LexCompat has flushed its buffers. No source fragment is reparsed and no
+source location is synthesized. Ordinary Prism parse/lex/lex_compat do not
+enable this entry point.
+
+`tools/gen_prism_ripper_lex.rb` extracts the reference LexCompat#result using
+its actual Prism DefNode span and changes only its native token producer.
+The resulting `lib/prism_ripper_lex.rb` is a private subclass for this cold
+recovery path. The public producer and ordinary valid Ripper lexing retain
+their original path.
+
+The private lexer also returns a zero-brace-nesting right brace with its
+actual pre-closer state, as CRuby's tSTRING_DEND branch does. This is a real
+source token, distinct from the hidden empty EOF recovery markers. Ripper
+selects the private path only for a heredoc diagnostic or an actual stray
+right-brace diagnostic. Public Prism lex/parse keeps its original behavior.
+The extracted Ruby consumer preserves the reference file's frozen-string
+pragma as well as its original lexical constant scope.
+
 ## Local scanner provenance
 
-`tools/prism_ripper_spans.patch` retains a private invalid-escape location
-at the parser's actual escape cursor. Public diagnostic locations, messages
-and serialized data remain unchanged. The generation script reapplies the
-patch after copying upstream sources. The extra location is read only by
-the private Ripper glue; its source pointers die with the parser, and only
-copied offsets cross the boundary.
+After the heredoc adaptation, the generator applies
+`tools/prism_ripper_spans.patch`. It retains a private invalid-escape
+location at the parser's actual escape cursor. Public diagnostic locations,
+messages and serialized data remain unchanged. The extra location is read
+only by the private Ripper glue; its source pointers die with the parser,
+and only copied offsets cross the boundary.

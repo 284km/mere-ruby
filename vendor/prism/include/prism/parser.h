@@ -651,6 +651,9 @@ struct pm_parser {
     /** The current state of the lexer. */
     pm_lex_state_t lex_state;
 
+    /** Private Ripper recovery; ordinary Prism serialization leaves it false. */
+    bool ripper_lex_compat;
+
     /** Tracks the current nesting of (), [], and {}. */
     int enclosure_nesting;
 

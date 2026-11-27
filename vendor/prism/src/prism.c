@@ -9856,6 +9856,29 @@ parser_lex(pm_parser_t *parser) {
             // We'll check if we're at the end of the file. If we are, then we
             // need to return the EOF token.
             if (parser->current.end >= parser->end) {
+                /* In the private Ripper stream, let the still-live parser
+                 * unwind an unfinished interpolation before its heredoc's
+                 * normal EOF recovery resumes the real declaration cursor.
+                 * Locals, parameter scopes and parsing context remain live.
+                 * The empty EOF marker is internal and is not source text. */
+                if (parser->ripper_lex_compat && parser->lex_modes.current->mode == PM_LEX_EMBEXPR) {
+                    size_t index = parser->lex_modes.index;
+                    pm_lex_mode_t *mode = parser->lex_modes.current;
+                    bool heredoc = false;
+                    while (index > 0) {
+                        index--;
+                        mode = index < PM_LEX_STACK_SIZE ? &parser->lex_modes.stack[index] : mode->prev;
+                        if (mode->mode == PM_LEX_HEREDOC) { heredoc = true; break; }
+                    }
+                    if (heredoc) {
+                        const uint8_t *diagnostic_start = parser->current.start;
+                        if (diagnostic_start > parser->start && diagnostic_start[-1] == '\n') diagnostic_start--;
+                        pm_parser_err(parser, diagnostic_start, parser->current.end, PM_ERR_EMBEXPR_END);
+                        parser->enclosure_nesting--;
+                        lex_mode_pop(parser);
+                        LEX(PM_TOKEN_EMBEXPR_END);
+                    }
+                }
                 // If we hit EOF, but the EOF came immediately after a newline,
                 // set the start of the token to the newline.  This way any EOF
                 // errors will be reported as happening on that line rather than
@@ -10241,6 +10264,13 @@ parser_lex(pm_parser_t *parser) {
 
                 // }
                 case '}':
+                    // Like CRuby's tSTRING_DEND, a zero-nesting right brace
+                    // keeps its actual pre-closer state and enclosure stacks.
+                    if (parser->ripper_lex_compat && parser->brace_nesting == 0 &&
+                        parser->lex_modes.current->mode != PM_LEX_EMBEXPR) {
+                        parser->brace_nesting--;
+                        LEX(PM_TOKEN_EMBEXPR_END);
+                    }
                     parser->enclosure_nesting--;
                     pm_do_loop_stack_pop(parser);
 

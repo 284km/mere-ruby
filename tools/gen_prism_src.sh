@@ -32,7 +32,10 @@ for h in "$src/prism/"*.h; do
   [ "$b" = prism.h ] || cp "$h" "$out/include/prism/$b"
 done
 cp "$src/prism/util/"*.h "$out/include/prism/util/"
-# Preserve the private scanner ranges without changing Prism's public spans.
-(cd "$root" && git apply "$here/prism_ripper_spans.patch")
+# The private Ripper serializer resumes the parser's actual deferred heredoc
+# cursor. Keep this adaptation reproducible after replacing generated files.
+patch -p1 -d "$root" < "$here/prism_ripper_heredoc.patch"
+# Preserve private scanner ranges without changing Prism's public spans.
+patch -p1 -d "$root" < "$here/prism_ripper_spans.patch"
 ver="$(sed -n 's/^#define PRISM_VERSION "\(.*\)"/\1/p' "$out/include/prism/version.h")"
 echo "gen_prism_src: vendor/prism is now Prism $ver from $src"

@@ -85,3 +85,103 @@ remain private historical evidence, and their never-started full sweeps were par
 Code, fixtures, benchmark and completed records will be pushed together. No full
 unit/Rails suite, workflow change, reference gem installation or unrelated process
 termination.
+
+## R5: completed acceptance
+
+Ripper scanner diagnostics preserve native escape spans and entry states. The
+integration merges main 83bc5735, retaining its parser callbacks, regexp diagnostics and
+real heredoc/stray-closer recovery before scanner diagnostic preparation. Both private
+native patches compose in tools/gen_prism_src.sh, and the embedded Prism library is
+regenerated.
+
+Fresh local acceptance uses clean Ruby 4.0.10 through tools/ref_ruby.sh. The two full
+sweeps use the same freshly built O2 candidate, with hash indexing ON and OFF.
+
+- `sh run_corpus.sh --both`: **1007/1007 PASS**, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: **1007/1007 PASS**, exit 0.
+
+Focused corpus 1122, 1128, 1129, 1131, 1132 and 1133 matches the reference on both
+engines (stdout, stderr and exit status). Related original CRuby selections are run
+unchanged, one file at a time, against the exact matching main 83bc5735. Every
+invocation uses `MERE_RUBY_GC_TIGHT=1` and parsed `--seed=1`. The selected test counts
+below do not claim whole-file or full-suite passes.
+
+| Original selection | Ruby 4.0.10 | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | --- | --- | --- | --- | --- |
+| ripper/test_lexer.rb (8 selected) | 8 / 120 PASS | 8 / 85, 4 failures, 0 errors | 8 / 120 PASS | 8 / 85, 4 failures, 0 errors | 8 / 120 PASS |
+| ripper/test_scanner_events.rb (8 selected) | 8 / 33 PASS | 8 / 24, 6 failures, 1 errors | 8 / 33 PASS | 8 / 24, 6 failures, 1 errors | 8 / 33 PASS |
+| prism/errors_test.rb (12 selected) | 12 / 24 PASS | 12 / 24 PASS | 12 / 24 PASS | 12 / 24 PASS | 12 / 24 PASS |
+| ripper/test_parser_events.rb (6 selected) | 6 / 43 PASS | 6 / 43 PASS | 6 / 43 PASS | 6 / 43 PASS | 6 / 43 PASS |
+| ripper/test_ripper.rb (6 selected) | 6 / 28 PASS | 6 / 28 PASS | 6 / 28 PASS | 6 / 28 PASS | 6 / 28 PASS |
+| ripper/test_lexer.rb (3 selected) | 3 / 3 PASS | 3 / 3 PASS | 3 / 3 PASS | 3 / 3 PASS | 3 / 3 PASS |
+
+RSS values below are measured maximum resident set sizes of the test driver from
+`/usr/bin/time -l`, in bytes.
+
+| Max RSS bytes, same selections | Reference | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ripper/test_lexer.rb (8 selected) | 23248896 | 217006080 | 217513984 | 217989120 | 218202112 |
+| ripper/test_scanner_events.rb (8 selected) | 22986752 | 216776704 | 217169920 | 218611712 | 219037696 |
+| prism/errors_test.rb (12 selected) | 32063488 | 214876160 | 214876160 | 216154112 | 216137728 |
+| ripper/test_parser_events.rb (6 selected) | 23691264 | 231653376 | 232079360 | 229523456 | 231915520 |
+| ripper/test_ripper.rb (6 selected) | 23265280 | 215744512 | 215990272 | 217972736 | 218447872 |
+| ripper/test_lexer.rb (3 selected) | 22790144 | 216891392 | 217382912 | 217858048 | 218202112 |
+
+Cost measurements use three alternating main/candidate O2 pairs, tight GC and parsed
+--seed=1. Instructions and elapsed seconds are medians; RSS is the maximum of three
+runs. Elapsed time is diagnostic under shared-machine load.
+
+| Workload / engine | Instruction change | Main / candidate median seconds | Main / candidate max RSS bytes |
+| --- | ---: | --- | --- |
+| empty / evaluator | +1.260% | 1.338116 / 1.294365 | 161333248 / 170901504 |
+| ordinary / evaluator | +2.809% | 4.657606 / 4.792197 | 196149248 / 200245248 |
+| unicode / evaluator | +31.164% | 2.130855 / 2.904689 | 168640512 / 197099520 |
+| empty / VM | +1.162% | 1.363333 / 1.270333 | 161480704 / 169639936 |
+| ordinary / VM | +3.617% | 4.829633 / 4.954055 | 211206144 / 205635584 |
+| unicode / VM | +31.603% | 2.150624 / 3.018820 | 175341568 / 196050944 |
+
+Each scanner benchmark performs 1000 lex calls. Common-path empty/ordinary overhead
+remains and is reported above. The Unicode-error candidate emits two correct tokens
+where main emits one and performs native provenance parsing; those measurements include
+additional required work and do not compare equally correct outputs.
+
+Additional composition probes combine real escape errors with unterminated/terminated
+heredocs and either side of a stray right brace. Two complete heredoc/Unicode/hex rows
+match the reference on both engines; all seven complete without a crash. Main and
+published-R4 comparisons retain known follow-ups in generic stray-closer message
+wording, squiggly-heredoc indentation during error recovery, and splitting a Unicode
+character after a stray closer. The remaining five rows are not counted as full
+reference matches, and no new integration regression was identified by these
+comparisons.
+
+The seven original resource cases were also repeated unchanged with tight GC and
+--seed=1 on the matching main and this candidate. They retain their original counts,
+assertions and timeouts: reference passes, and both main and candidate time out on both
+engines. These are open throughput/resource REDs, not new regressions, measured leak
+diagnoses or claimed fixes. The no_memory_leak methods stop at their first timed-out
+empty-input subcase; later class/lambda subcases are not claimed executed.
+
+| Original resource selection | Reference tests/assertions | Main and candidate, both engines | Reference / main evaluator / candidate evaluator / main VM / candidate VM max RSS bytes |
+| --- | --- | --- | --- |
+| ripper/test_lexer.rb | 1 / 3 PASS | original timeout | 22790144 / 217169920 / 217530368 / 217792512 / 218120192 |
+| ripper/test_parser_events.rb | 2 / 9 PASS | original timeout | 24461312 / 219938816 / 220332032 / 224739328 / 225361920 |
+| ripper/test_ripper.rb | 4 / 30 PASS | original timeout | 24051712 / 215728128 / 216006656 / 218103808 / 218497024 |
+
+Resource RSS is the measured test driver only, rather than a process-family leak
+measure. Functional selections above pass all selected assertions; the resource timeouts
+remain explicitly separate.
+
+All 45 native C/header files independently regenerate byte for byte from clean Ruby
+sources a704b7cd95 with both private adaptations. The extracted reference LexCompat
+consumer and embedded library also regenerate byte for byte. Embedded SHA-256:
+`8392125e4cd2f34537b4f6c3594b4841450ccb2bc22a8a169be706b051802df4`.
+
+Candidate O2 SHA-256:
+`50624e880c2a3e9f35b24c75ed8b9110db53a78bbac6980df5e0166592d4c97b`. Matching-main
+control: 83bc573585b0e73c3266edd2f30fd7d80c2391eb. Compiler 9dec2ff6, mgz 661a01d8.
+
+Eight source gates (gc_roots, dup_defs, dead_defs, meth_writes, name_spec, rx_caps,
+ns_names, name_len), generated-C bracket depth, full/explicit completed record_hygiene
+and staged/unstaged whitespace: PASS. Code/integration and the completed loop record are
+pushed together. No full unit/Rails suite, reference gem installation or workflow
+change.

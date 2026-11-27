@@ -66,6 +66,7 @@ prism_ser(int kind, mere_bytes *src, mere_bytes *opts) {
       case 0: pm_serialize_parse(&buffer, source, size, data); break;
       case 1: pm_serialize_lex(&buffer, source, size, data); break;
       case 2: pm_serialize_parse_comments(&buffer, source, size, data); break;
+      case 4: pm_serialize_ripper_lex(&buffer, source, size, data); break;
       default: pm_serialize_parse_lex(&buffer, source, size, data); break;
     }
     return prism_take(&buffer);

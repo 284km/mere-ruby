@@ -25,6 +25,32 @@
 # translation of ITS prism.
 require "prism"
 require "rbconfig"
+# The runtime bridge validates static regexp nodes without a Ruby-level
+# Regexp.new dispatch. Keep this reference-only adapter on the actual native
+# constructor, including when a probe later replaces Regexp.new.
+native_regexp_new = Regexp.method(:new)
+Prism.define_singleton_method(:__prism_ripper_regexp_error) do |source, flags|
+  pattern = source.dup
+  encoding = flags.include?("n") ? Encoding::BINARY :
+    flags.include?("u") ? Encoding::UTF_8 :
+    flags.include?("e") ? Encoding::EUC_JP :
+    flags.include?("s") ? Encoding::Windows_31J : pattern.encoding
+  pattern.force_encoding(encoding)
+  options = (flags.include?("i") ? Regexp::IGNORECASE : 0) |
+    (flags.include?("m") ? Regexp::MULTILINE : 0) |
+    (flags.include?("x") ? Regexp::EXTENDED : 0) |
+    (flags.include?("n") ? Regexp::NOENCODING : 0) |
+    (flags.match?(/[ues]/) ? Regexp::FIXEDENCODING : 0)
+  previous_verbose, $VERBOSE = $VERBOSE, nil
+  begin
+    native_regexp_new.call(pattern, options)
+    nil
+  rescue RegexpError => error
+    error.message
+  ensure
+    $VERBOSE = previous_verbose
+  end
+end
 # (quiet: a child under -w that writes to stderr fails assert_separately)
 verbose, $VERBOSE = $VERBOSE, nil
 begin

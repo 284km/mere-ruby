@@ -105,6 +105,24 @@ module Prism
       lex_common(check_string(code), options)
     end
 
+    # Ripper alone requests continuation of native deferred heredoc headers.
+    # Public Prism.lex/lex_compat retain their existing token/diagnostic stream.
+    def __ripper_lex_compat(code, **options)
+      require 'prism/ripper_lex_compat'
+      result = LexCompat::RipperRecovery.new(code, **options).result
+      # Internal parser recovery markers carry the actual empty EOF span.
+      # LexCompat needs them to flush buffers; Ripper exposes only source.
+      result.value.reject! do |token|
+        token[2].empty? && [:on_heredoc_end, :on_embexpr_end].include?(token[1])
+      end
+      result
+    end
+
+    def __ripper_lex(code, **options)
+      code = check_string(code)
+      serialize.load_lex(code, Prism.__prism_ser(4, code, dump_options(options)), options.fetch(:freeze, false))
+    end
+
     # Mirror the Prism.lex_file API by using the serialization API.
     def lex_file(filepath, **options)
       options[:filepath] = filepath

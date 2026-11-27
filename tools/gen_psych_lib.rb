@@ -13,7 +13,16 @@ names = %w[
   handlers/document_stream handlers/recorder @psych_native_protocols
   @api core_ext
 ]
-source = root.join('vendor/psych/LICENSE').read.lines.map { |line| '# ' + line }.join
+# One source, so one magic comment, at its top. Psych's own files each begin
+# with `# frozen_string_literal: true`, and it is taken off them below -- in
+# the middle of the source it would be a comment. Without it every literal
+# was a new String each time it was evaluated: the scanner's `c == "\n"` and
+# `c == ' '`, a byte at a time, made 547 Strings a row of activerecord's
+# citations fixture, and the String store keeps a slot for each long after it
+# dies (note 559 §10). lib/psych_parser.rb, lib/psych_emitter.rb and
+# lib/psych_native_protocols.rb mutate no literal.
+source = +"# frozen_string_literal: true\n"
+source << root.join('vendor/psych/LICENSE').read.lines.map { |line| '# ' + line }.join
 source << "require 'date'\n"
 names.each do |name|
   if name.start_with?('@')
