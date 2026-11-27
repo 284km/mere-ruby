@@ -6,8 +6,10 @@ require "socket"
 p [TCPSocket.superclass.to_s, TCPServer.superclass.to_s, IPSocket.superclass.to_s]
 p [Socket::AF_INET, Socket::SOCK_STREAM, Socket::SOL_SOCKET]
 
-PORT = 53791
-server = TCPServer.new(PORT)
+# Port 0, so the kernel picks a free one: a fixed port made two corpus runs at
+# once refuse each other's listener.
+server = TCPServer.new(0)
+PORT = server.addr[1]
 client = TCPSocket.new("127.0.0.1", PORT)
 conn = server.accept
 
