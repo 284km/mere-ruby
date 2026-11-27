@@ -870,4 +870,61 @@ zf.resume
 2.times { GC.start }
 check(zf.resume == 'f' * zn)
 check((1..12).all? { |i| _, _, z = A.zeroed_steps(mb + i, ->(s) { s.bytesize }, :none); GC.start if i % 4 == 0; z.bytesize == mb + i && z.getbyte(0) == 97 && z.getbyte(mb + i - 1) == 98 })
+# A String C appends to, 32 KiB at a time, Ruby seeing it after each piece:
+# past 64 KiB only the tail goes to the interpreter (MR_STR_CAT) while
+# neither side has written what was there. Each case writes it once, from
+# Ruby (rat, rhow) or from C (at, how), and the String is compared after
+# every piece with the same steps done to a String of Ruby's own.
+cat_chunk = ->(i) { ((97 + i % 26).chr * 32768).b }
+cat_run = lambda do |steps, at, how, rat, rhow, start = nil|
+  exp = start ? start.b : ''.b
+  ok = true
+  peek = lambda do |s, i|
+    if i == at
+      case how
+      when :middle then exp.setbyte(100, 77) if exp.bytesize > 100
+      when :set_len then exp = exp.byteslice(0, exp.bytesize - 1000) if exp.bytesize > 1000
+      when :resize then exp = exp.byteslice(0, exp.bytesize / 2)
+      end
+    end
+    exp << cat_chunk.(i)
+    ok &&= s.b == exp
+    if i == rat
+      case rhow
+      when :lshift then s << 'R' * 10; exp << 'R' * 10
+      when :aset then s[5] = 'Z'; exp.setbyte(5, 90)
+      when :replace then s.replace('q' * 70000); exp = ('q' * 70000).b
+      when :force_encoding then s.force_encoding(Encoding::UTF_8)
+      when :clear then s.clear; exp = ''.b
+      when :dup then t = s.dup; t << 'x'; t[0] = 'y'
+      when :gc then GC.start
+      end
+    end
+  end
+  r = A.cat_steps(start, steps, peek, at, how)
+  [ok && r.b == exp, r]
+end
+[[-1, :none, -1, :none], [-1, :none, 4, :lshift], [-1, :none, 4, :aset], [-1, :none, 4, :replace],
+ [-1, :none, 4, :clear], [-1, :none, 4, :dup], [-1, :none, 3, :gc], [4, :middle, -1, :none],
+ [4, :set_len, -1, :none], [4, :resize, -1, :none], [5, :middle, 2, :lshift]].each do |at, how, rat, rhow|
+  check(cat_run.(8, at, how, rat, rhow)[0])
+end
+ok, r = cat_run.(8, -1, :none, 4, :force_encoding)
+check(ok && r.encoding == Encoding::UTF_8)
+# (from a String Ruby made, and from an unfrozen dup of a frozen one)
+check(cat_run.(6, -1, :none, 3, :lshift, +('f' * 70000))[0])
+check(cat_run.(6, -1, :none, 2, :aset, +('g' * 70000).freeze)[0])
+# a data object's String, appended to in calls with collections between
+zc = A.cat_holder(20)
+3.times { GC.start; 'x' * 1000 }
+check(A.cat_held_more(zc, 20, 108) == 'k' * 81920 + 'l' * 81920)
+2.times { GC.start }
+r = A.cat_held_more(zc, 4, 109)
+check(r.bytesize == 180224 && r.end_with?('m' * 16384) && r.start_with?('k' * 81920))
+# ...and one a stopped Fiber holds across collections, then appended to
+zf = Fiber.new { z = A.cat_steps(nil, 4, ->(s, i) {}, -1, :none); Fiber.yield; A.cat_steps(z, 4, ->(s, i) {}, -1, :none) }
+zf.resume
+2.times { GC.start }
+r = zf.resume
+check(r.bytesize == 8 * 32768 && r.byteslice(0, 32768) == 'a' * 32768 && r.byteslice(4 * 32768, 32768) == 'a' * 32768 && r.byteslice(3 * 32768, 1) == 'd')
 puts "api contracts: #{$count} passed"

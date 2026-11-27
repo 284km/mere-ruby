@@ -96,6 +96,51 @@ static VALUE zeroed_held(VALUE self, VALUE obj) {
     TypedData_Get_Struct(obj, struct zeroed_holder, &zeroed_holder_type, h);
     return h->str;
 }
+/* A String C builds 32 KiB at a time with rb_str_cat, calling `peek` with it
+ * and the step after each piece (so each piece crosses), from `str` or from
+ * an empty one. At step `at` C itself writes it first, by `how`: :middle
+ * (a byte in what was already there), :set_len (cut by 1000), :resize (to
+ * half), or nothing. Big enough that later pieces go to the interpreter as
+ * the tail alone (mirror.c MR_STR_CAT). */
+static VALUE cat_steps(VALUE self, VALUE str, VALUE steps, VALUE peek, VALUE at, VALUE how) {
+    (void)self;
+    VALUE s = NIL_P(str) ? rb_str_buf_new(0) : str;
+    static char chunk[32 * 1024];
+    ID h = SYM2ID(how);
+    for (long i = 0; i < NUM2LONG(steps); i++) {
+        if (i == NUM2LONG(at)) {
+            if (h == rb_intern("middle")) { rb_str_modify(s); if (RSTRING_LEN(s) > 100) RSTRING_PTR(s)[100] = 'M'; }
+            /* (rb_str_modify first: in ruby the String may share its bytes with
+             *  the `s.b` peek made, and rb_str_set_len refuses a shared one) */
+            else if (h == rb_intern("set_len") && RSTRING_LEN(s) > 1000) { rb_str_modify(s); rb_str_set_len(s, RSTRING_LEN(s) - 1000); }
+            else if (h == rb_intern("resize")) rb_str_resize(s, RSTRING_LEN(s) / 2);
+        }
+        memset(chunk, 'a' + (int)(i % 26), sizeof chunk);
+        rb_str_cat(s, chunk, (long)sizeof chunk);
+        rb_funcall(peek, rb_intern("call"), 2, s, LONG2NUM(i));
+    }
+    return s;
+}
+/* ...and one a data object holds alone, marked by its dmark, appended to
+ * in later calls */
+static VALUE cat_holder(VALUE self, VALUE n) {
+    (void)self;
+    struct zeroed_holder *h;
+    VALUE obj = TypedData_Make_Struct(rb_cObject, struct zeroed_holder, &zeroed_holder_type, h);
+    h->str = rb_str_buf_new(0);
+    char chunk[4096];
+    for (long i = 0; i < NUM2LONG(n); i++) { memset(chunk, 'k', sizeof chunk); rb_str_cat(h->str, chunk, (long)sizeof chunk); }
+    return obj;
+}
+static VALUE cat_held_more(VALUE self, VALUE obj, VALUE n, VALUE ch) {
+    (void)self;
+    struct zeroed_holder *h;
+    TypedData_Get_Struct(obj, struct zeroed_holder, &zeroed_holder_type, h);
+    char chunk[4096];
+    memset(chunk, NUM2INT(ch), sizeof chunk);
+    for (long i = 0; i < NUM2LONG(n); i++) { rb_str_cat(h->str, chunk, (long)sizeof chunk); if (i % 8 == 7) rb_funcall(rb_mGC, rb_intern("count"), 0); }
+    return h->str;
+}
 static VALUE big_fill(VALUE self, VALUE str, VALUE ch) {
     (void)self;
     memset(RSTRING_PTR(str), NUM2INT(ch), (size_t)RSTRING_LEN(str));
@@ -688,6 +733,9 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "zeroed_steps", zeroed_steps, 3);
     rb_define_singleton_method(mod, "zeroed_holder", zeroed_holder, 2);
     rb_define_singleton_method(mod, "zeroed_held", zeroed_held, 1);
+    rb_define_singleton_method(mod, "cat_steps", cat_steps, 5);
+    rb_define_singleton_method(mod, "cat_holder", cat_holder, 1);
+    rb_define_singleton_method(mod, "cat_held_more", cat_held_more, 3);
     rb_define_singleton_method(mod, "big_fill", big_fill, 2);
     rb_define_singleton_method(mod, "big_resize", big_resize, 3);
     rb_define_singleton_method(mod, "big_cat", big_cat, 2);

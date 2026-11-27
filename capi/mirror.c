@@ -29,6 +29,7 @@ struct mr_mirror {
     unsigned long head_epoch;   /* when flags and klass were last asked */
     unsigned long body_epoch;   /* when the bytes / elements were last fetched */
     uint64_t hash;              /* of the body as fetched or last written back */
+    long synced;                /* a String's length as fetched or last written back, plus 1 (0: not known) -- MR_STR_CAT */
     long version;               /* an Array's version at the last fetch */
     long capa;                  /* elements an Array's buffer holds */
     char *own;                  /* a String's buffer when its bytes are not in the struct */
@@ -509,19 +510,39 @@ static void touch(struct mr_mirror *m, VALUE obj) {
 }
 
 /* Write one struct back when C changed it. Answers whether it did. */
+/* (a String C appends to is written back as its tail once what the interpreter
+ *  has of it is this long: below it, all of it, as before) */
+#define CAT_FROM_BYTES (64 * 1024)
 static int write_back(struct mr_mirror *m, VALUE obj) {
     if (!m->body) return 0;
     uint64_t now = body_hash(m);
     if (now == m->hash) return 0;
+    uint64_t before = m->hash;
     struct mr_transit saved;
     mr_transit_save(&saved, -1);
     m->hash = now;
     if (m->body == T_STRING) {
         str_adopt(m);
-        if (m->as.string.len < 0 || m->as.string.len > str_capacity(m, str_term(m)))
+        long len = m->as.string.len;
+        if (len < 0 || len > str_capacity(m, str_term(m)))
             mr_fatal("a String's length was set past its capacity");
-        mr_put_bytes(str_ptr(m), m->as.string.len);
-        mr_up1(MR_STR_SET, obj);
+        /* Only what C appended, when the String it last synced is big, is
+         * still how this buffer starts (its hash: `before`, the hash then),
+         * and the interpreter has not written it since (MR_STR_CAT answers
+         * that, and refuses otherwise). msgpack's Buffer#read appends 32 KiB
+         * at a time between IO reads; sending all of it at each read made
+         * the whole of it again in the interpreter every time. */
+        long had = m->synced - 1;
+        int sent = 0;
+        if (had >= CAT_FROM_BYTES && len > had && hash_bytes(str_ptr(m), (size_t)had, 1) == before) {
+            mr_put_bytes(str_ptr(m) + had, len - had);
+            sent = (int)mr_up2(MR_STR_CAT, obj, (VALUE)had);
+        }
+        if (!sent) {
+            mr_put_bytes(str_ptr(m), len);
+            mr_up1(MR_STR_SET, obj);
+        }
+        m->synced = len + 1;
     }
     else {
         if (m->as.array.as.heap.len < 0 || m->as.array.as.heap.len > m->capa) mr_fatal("an Array's length was set past its capacity");
@@ -584,6 +605,7 @@ static void str_take(struct mr_give_to *to, const char *bytes, long len) {
     m->hash = copy_hash((unsigned char *)str_ptr(m), (const unsigned char *)bytes, (size_t)len, 1, &changed);
     if (changed) memset(str_ptr(m) + len, 0, (size_t)term);
     m->as.string.len = len;
+    m->synced = len + 1;
     m->body = T_STRING;
 }
 
@@ -640,6 +662,7 @@ VALUE mr_string_new_zeroed(long len, int enc) {
     m->as.string.len = len;
     m->body = T_STRING;
     m->hash = body_hash(m) ^ 1;
+    m->synced = 0 + 1;  /* (the interpreter has it empty) */
     m->body_epoch = mr_epoch;
     touch(m, obj);
     return obj;
