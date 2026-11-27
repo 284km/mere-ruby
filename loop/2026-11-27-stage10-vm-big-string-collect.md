@@ -26,11 +26,32 @@ So a loop of 22 turns reached too few safepoints for one of them to ask. Each tu
 
 ## The change
 
-`gc_body_tick` also says yes as soon as 8 MB of String bytes have been made since the pressure was last asked. It reads `str_pg_add`, which asking for the pressure sets back to 0 (`str_bytes`, through `gc_store_bytes`). The count of 32 is kept for everything else.
+`gc_body_tick` also says yes as soon as 16 MB of String bytes have been made since the pressure was last asked. It reads `str_pg_add`, which asking for the pressure sets back to 0 (`str_bytes`, through `gc_store_bytes`). The count of 32 is kept for everything else.
 
-### Why 8 MB
+### Why 16 MB
 
-The pressure test collects once the stores pass the base by the headroom. The headroom is twice what lived, at least 8 MB and at most what lived plus 32 MB. Asking every 8 MB of new String bytes puts a collection at most one floor's worth of headroom after the point where it was due, whatever the count of safepoints.
+The threshold decides only when the pressure is asked. Whether a collection then runs is the pressure test's: the stores must pass the base by the headroom. The headroom is twice what lived, at least 8 MB and at most what lived plus 32 MB.
+
+A small threshold asks as soon as the headroom is passed. A loop that makes nothing but garbage then collects as often as the headroom's floor allows. A large one lets the bytes run past the headroom before anyone asks.
+
+Collections, instructions retired (billions) and peak memory footprint (MB) for each threshold, one run each. "50%" and "100%" are a threshold of that share of the bytes that lived after the last collection, at least 8 MB.
+
+| program | engine | main | 8 MB | 16 MB | 32 MB | 64 MB | 50% | 100% |
+|---|---|---|---|---|---|---|---|---|
+| `200.times { "a".b * 6_000_000 }` | evaluator | 32, 2.523, 124 | 51, 2.683, 131 | 34, 2.481, 118 | 34, 2.487, 118 | 32, 2.447, 124 | 51, 2.663, 131 | 35, 2.496, 130 |
+| | VM | 13, 2.393, 541 | 50, 2.659, 176 | 34, 2.493, 204 | 33, 2.457, 221 | 17, 2.408, 427 | 49, 2.583, 182 | 34, 2.506, 210 |
+| the program above | evaluator | 7, 1.163, 116 | 7, 1.154, 104 | 6, 1.165, 127 | 7, 1.162, 116 | 7, 1.161, 116 | 7, 1.153, 104 | 6, 1.146, 116 |
+| | VM | 3, 1.106, 203 | 6, 1.142, 173 | 5, 1.131, 202 | 4, 1.112, 209 | 3, 1.104, 203 | 6, 1.133, 179 | 4, 1.113, 209 |
+
+A threshold in proportion to what lived does not help here. These loops keep almost nothing, so 50% of it is below the 8 MB floor, and it behaves as 8 MB does. Where much lives, the headroom grows with it anyway.
+
+At 8 MB the 6 MB loop collected every second turn, 50 times where main collected 13, for 13% more instructions on the VM. At 64 MB the VM's peak is back to 427 MB. At 16 MB:
+
+- the loop collects 34 times on either engine;
+- the VM's peak is 204 MB for main's 541;
+- the program above ends with 12 MB on the VM and 30 MB on the evaluator (main: 132 and 24).
+
+32 MB costs a little less, but leaves 30 MB on the VM there and peaks at 221 MB.
 
 ## Numbers
 
@@ -41,24 +62,18 @@ After the `GC.start`:
 | | evaluator | VM |
 |---|---|---|
 | main | 24 MB | 132 MB |
-| this branch | 18 MB | 18 MB |
+| this branch | 30 MB | 12 MB |
 
 ### Loops that keep making big Strings
 
-Collections, instructions retired (billions) and peak memory footprint, one run each:
+Collections, instructions retired (billions) and peak memory footprint. The 6 MB loop was run three times, and the collections and the peak were the same each time:
 
 | program | engine | main | this branch |
 |---|---|---|---|
-| `200.times { "a".b * 6_000_000 }` | evaluator | 32, 2.517, 124 MB | 51, 2.688, 131 MB |
-| | VM | 13, 2.338, 541 MB | 50, 2.634, 176 MB |
-| `4000.times { "a" * 300_000 }` | evaluator | 63, 2.299, 81 MB | 63, 2.292, 81 MB |
-| | VM | 62, 2.335, 135 MB | 62, 2.334, 135 MB |
-| 300 Strings of 1 MB, 100 kept at a time | evaluator | 5, 1.496, 340 MB | 5, 1.503, 340 MB |
-| | VM | 5, 1.519, 428 MB | 5, 1.502, 414 MB |
-| 200 Strings of 1 MB, all kept | evaluator | 4, 1.323, 309 MB | 4, 1.324, 309 MB |
-| | VM | 4, 1.372, 449 MB | 4, 1.354, 428 MB |
+| `200.times { "a".b * 6_000_000 }` | evaluator | 32, 2.507, 124 MB | 34, 2.524, 118 MB |
+| | VM | 13, 2.377 to 2.419, 541 MB | 34, 2.506 to 2.515, 204 MB |
 
-Only the 6 MB loop collects more often. It now collects about when the headroom says to: 1.2 GB made, with a live set of a few MB and a headroom of 8 MB to about 24 MB, comes to about 50 collections. Before, the evaluator collected late, and the VM later still, reaching 541 MB. The 50 collections cost 7% more instructions on the evaluator and 13% more on the VM.
+The VM collects 21 more times and runs 4 to 5% more instructions: collections that main did not run, because nothing asked. The evaluator runs 0.7% more.
 
 ### What the tick costs elsewhere
 
@@ -66,11 +81,11 @@ Instructions retired, in billions, the median of three runs taken alternately. B
 
 | program | evaluator: main | branch | VM: main | branch |
 |---|---|---|---|---|
-| `loop_plain` | 2.334 | 2.346 | 1.669 | 1.673 |
-| a `while` of three statements, 1M turns | 10.600 | 10.598 | 6.162 | 6.195 |
-| `300_000.times { "x#{i}" + "y" }` | 9.863 | 9.893 | 15.566 | 15.569 |
-| a method call, 1M times | 24.215 | 24.264 | 25.673 | 25.704 |
-| the program above | 1.204 | 1.195 | 1.150 | 1.184 |
+| `loop_plain` | 2.326 | 2.339 | 1.666 | 1.668 |
+| a `while` of three statements, 1M turns | 10.584 | 10.589 | 6.168 | 6.196 |
+| `300_000.times { "x#{i}" + "y" }` | 9.869 | 9.872 | 15.542 | 15.558 |
+| a method call, 1M times | 24.173 | 24.256 | 25.657 | 25.692 |
+| the program above | 1.206 | 1.204 | 1.146 | 1.171 |
 
 ## What is left: the VM's peak
 
