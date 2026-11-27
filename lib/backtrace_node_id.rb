@@ -39,8 +39,9 @@ module RubyVM::AbstractSyntaxTree
           # IDs were read from the complete compilation unit before its tree
           # was discarded. Line offsets affect lookup, not Prism node IDs.
           eval_nodes.each_line do |row|
-            line_no, type, id, name = row.chomp.split("\t", 4)
-            entry = [type.to_sym, id.to_i, [name.to_sym], nil]
+            line_no, type, id, names, target = row.chomp.split("\t", 5)
+            entry = [type.to_sym, id.to_i, names.split("\x1f").map { |name| name.to_sym },
+                     target && !target.empty? ? target.to_i : nil]
             (index[line_no.to_i] ||= []) << entry
           end
         else

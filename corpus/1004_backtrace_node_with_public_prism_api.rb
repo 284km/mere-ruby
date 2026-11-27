@@ -1,4 +1,5 @@
 require 'prism'
+require 'tmpdir'
 # An installed native Prism has no interpreter-specific helper methods.
 if Prism.respond_to?(:__node_id_for_location)
   class << Prism
@@ -133,3 +134,33 @@ box_source1004 = <<~'RUBY_BOX'
 RUBY_BOX
 print IO.popen([{'RUBY_BOX' => '1'}, RbConfig.ruby, '--disable-gems', '-W0', '-e', box_source1004, err: File::NULL], &:read)
 p $?.exitstatus
+
+# Compound writes have their own Prism nodes. Keep the file-backed lookup that
+# worked before eval metadata existed, and use the same node in synthetic files.
+operator_sources1004 = {
+  local: "  value = nil\n  value += 1",
+  instance: "  @operator_value1004 = nil\n  @operator_value1004 += 1",
+  global: "  $operator_value1004 = nil\n  $operator_value1004 += 1",
+  class_variable: "  @@operator_value1004 = nil\n  @@operator_value1004 += 1",
+  attribute: "  holder = Struct.new(:value).new\n  holder.value += 1",
+  index: "  holder = [nil]\n  holder[0] += 1",
+  attribute_and: "  nil.operator_value1004 &&= 1",
+  attribute_or: "  nil.operator_value1004 ||= 1",
+  index_and: "  nil[0] &&= 1",
+  index_or: "  nil[0] ||= 1"
+}
+Dir.mktmpdir('eval-node-operators-') do |directory|
+  operator_sources1004.each do |kind, body|
+    source = "def operator_node1004\n#{body}\nend\n"
+    path = File.join(directory, "#{kind}.rb")
+    File.write(path, source)
+    [[:file, path], [:synthetic, 'operator-template1004']].each do |label, filename|
+      EvalNodeOwner1004.module_eval(source, filename, 1)
+      begin
+        Object.new.extend(EvalNodeOwner1004).operator_node1004
+      rescue NoMethodError => error
+        eval_node_result1004([kind, label], source, error)
+      end
+    end
+  end
+end
