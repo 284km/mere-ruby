@@ -89,10 +89,10 @@ Instructions retired, in billions, the median of three runs taken alternately. B
 
 ## What is left: the VM's peak
 
-On the program above the peak is still 182 MB on the VM and 109 MB on the evaluator; on the 6 MB loop, 176 MB and 131 MB. What is known so far:
+On the program above the peak is still 202 MB on the VM and 127 MB on the evaluator; on the 6 MB loop, 204 MB and 118 MB. What is known so far:
 
-- The first collection in the middle of the loop leaves 24 MB in `str_store` on the VM, where the evaluator's leaves 6 MB. Each later one leaves 6 MB on both.
-- Leaving out the collector's routes to the running stack (`MERE_RUBY_GC_DBG` 1, 2 and 4) does not change those 24 MB. So the bytes are not live Strings: the page they are in was not compacted at that collection.
+- The first collection in the middle of the loop leaves 34 MB in `str_store` on the VM, where the evaluator's leaves 6 MB. Each later one leaves 6 MB on both. (At 8 MB the first one left 24 MB.)
+- Leaving out the collector's routes to the running stack (`MERE_RUBY_GC_DBG` 1, 2 and 4) does not change those bytes. So the bytes are not live Strings: the page they are in was not compacted at that collection.
 - Mere refuses a compaction while a suspended stack pins the arena (v0.1.651). It compacts under a pin only once the arena has doubled since the first refusal. The VM's first collection is probably refused by such a pin, and a later one goes ahead. This has not been confirmed: nothing in Mere reports a refusal.
 
 The base after that first collection is higher, so the next one comes later. That accounts for part of the difference in peak. This branch does not change it.

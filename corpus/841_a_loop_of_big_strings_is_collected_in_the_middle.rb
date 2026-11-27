@@ -3,7 +3,7 @@
 # evaluator, and each asked for the pressure one time in 32: `while` on one
 # line and a String made in a method met none that asked, and every String
 # the loop made stayed until it ended (22 turns: 132 MB where the evaluator
-# kept 24). A safepoint now asks as soon as 8 MB of String bytes are new.
+# kept 24). A safepoint now asks as soon as 16 MB of String bytes are new.
 c = GC.count
 22.times { ("a".b * 6_000_000).bytesize }
 p GC.count > c
