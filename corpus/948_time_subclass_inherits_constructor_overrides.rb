@@ -42,3 +42,27 @@ class << Time
   remove_method :original_now948, :original_at948, :original_utc948
 end
 p [:restored, TimeChild948.now.class, TimeChild948.now.to_i > 2000]
+
+# ActiveJob's argument round trip compares arrays containing ranges. The
+# Time endpoints survive serialization as distinct objects with equal values.
+first948 = Time.at(123, 456)
+copy948 = Time.at(123, 456)
+other948 = Time.at(124, 456)
+[[first948.., copy948.., other948..],
+ [first948..first948, copy948..copy948, copy948..other948],
+ [..first948, ..copy948, ..other948]].each do |left, same, different|
+  p [:range_container, left == same, [left] == [same],
+     { range: left } == { range: same }, [[left]] == [[same]],
+     [left] == [different], [left] == [Range.new(same.begin, same.end, true)]]
+end
+
+class RangeEndpoint948
+  def initialize(value) = @value = value
+  def <=>(other) = 0
+  def ==(other) = @value == other.instance_variable_get(:@value)
+end
+left948 = RangeEndpoint948.new(1)..RangeEndpoint948.new(2)
+same948 = RangeEndpoint948.new(1)..RangeEndpoint948.new(2)
+other948 = RangeEndpoint948.new(1)..RangeEndpoint948.new(3)
+p [:object_range, [left948] == [same948], [left948] == [other948],
+   { range: [left948] } == { range: [same948] }]
