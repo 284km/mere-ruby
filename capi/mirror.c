@@ -33,6 +33,7 @@ struct mr_mirror {
     long capa;                  /* elements an Array's buffer holds */
     char *own;                  /* a String's buffer when its bytes are not in the struct */
     long own_size;              /* ...and how many bytes it is */
+    int own_mapped;             /* ...and it is mapped (mr_big_alloc): unmapped, not freed. A buffer C made and the mirror took over is malloc's */
     long reserve;               /* room the interpreter asked for (mr_capi_reserve), not yet made */
     long slot;                  /* a String's: the bytes its struct is allocated in (0 until chosen) */
     int heap_only;              /* ...and the room asked for is to be a buffer, whatever it fits (rb_str_init) */
@@ -232,20 +233,49 @@ static int term_of_index(int index) {
 static int str_term(const struct mr_mirror *m) {
     return term_of_index((int)((m->as.basic.flags >> RUBY_ENCODING_SHIFT) & RUBY_ENCODING_INLINE_MAX));
 }
+/* The String's own buffer: let go, made, resized (core.c's big buffers: a
+ * buffer of 1 MiB or more is mapped). */
+static void own_free(struct mr_mirror *m) {
+    mr_big_free(m->own, (size_t)m->own_size, m->own_mapped);
+    m->own = NULL;
+    m->own_size = 0;
+    m->own_mapped = 0;
+}
+static char *own_alloc(size_t size, int *mapped) {
+    char *p = mr_big_alloc(size);
+    *mapped = mr_big(size);
+    return p;
+}
+static char *own_resize(struct mr_mirror *m, size_t size) {
+    char *p;
+    if (!m->own_mapped && !mr_big(size)) p = realloc(m->own, size);
+    else {
+        int mapped;
+        p = own_alloc(size, &mapped);
+        if (!p) return NULL;
+        memcpy(p, m->own, (size_t)m->own_size < size ? (size_t)m->own_size : size);
+        mr_big_free(m->own, (size_t)m->own_size, m->own_mapped);
+        m->own_mapped = mapped;
+    }
+    if (p) { m->own = p; m->own_size = (long)size; }
+    return p;
+}
 /* What C did to the struct's buffer since the mirror last looked. */
 static void str_adopt(struct mr_mirror *m) {
     if (str_embedded(m)) {
         /* (C moved the bytes back into the struct) */
-        if (m->own) { free(m->own); m->own = NULL; m->own_size = 0; }
+        if (m->own) own_free(m);
         return;
     }
     char *p = m->as.string.as.heap.ptr;
     if (p == m->own) return;
     /* (a pointer into its own buffer -- a substring C made by moving it -- keeps the buffer) */
     if (m->own && p > m->own && p < m->own + m->own_size) return;
-    free(m->own);
+    own_free(m);
+    /* (C's own buffer, from malloc) */
     m->own = p;
     m->own_size = p ? m->as.string.as.heap.aux.capa + 1 : 0;
+    m->own_mapped = 0;
 }
 static long str_capacity(struct mr_mirror *m, int term) {
     return str_embedded(m) ? embed_room(m) - term : (m->as.string.as.heap.ptr ? m->as.string.as.heap.aux.capa : 0);
@@ -273,25 +303,31 @@ static void string_room(struct mr_mirror *m, long need, int term, int mode) {
     long len = m->body == T_STRING ? m->as.string.len : 0;
     char *p;
     if (str_embedded(m)) {
-        p = malloc(size);
+        int mapped;
+        p = own_alloc(size, &mapped);
         if (!p) rb_memerror();
         memcpy(p, embed_ary(m), (size_t)embed_room(m) < size ? (size_t)embed_room(m) : size);
         m->as.basic.flags |= RSTRING_NOEMBED;
+        m->own = p;
+        m->own_size = (long)size;
+        m->own_mapped = mapped;
     }
     else if (m->own && m->as.string.as.heap.ptr == m->own) {
-        p = realloc(m->own, size);
+        p = own_resize(m, size);
         if (!p) rb_memerror();
     }
     else {
         /* (the bytes start inside the buffer: they move to the front of a new one) */
-        p = malloc(size);
+        int mapped;
+        p = own_alloc(size, &mapped);
         if (!p) rb_memerror();
         if (m->as.string.as.heap.ptr && len > 0) memcpy(p, m->as.string.as.heap.ptr, (size_t)(len < want ? len : want));
-        free(m->own);
+        own_free(m);
+        m->own = p;
+        m->own_size = (long)size;
+        m->own_mapped = mapped;
     }
     memset(p + want, 0, 4);
-    m->own = p;
-    m->own_size = (long)size;
     m->as.string.as.heap.ptr = p;
     m->as.string.as.heap.aux.capa = want;
 }
@@ -311,19 +347,15 @@ static int str_resize(struct mr_mirror *m, long len, int term) {
         long keep = slen < len ? slen : len;
         char *ary = embed_ary(m);
         if (keep > 0 && p) memmove(ary, p, (size_t)keep);
-        free(m->own);
-        m->own = NULL;
-        m->own_size = 0;
+        own_free(m);
         m->as.basic.flags &= ~(VALUE)RSTRING_NOEMBED;
     }
     else {
         long capa = m->as.string.as.heap.aux.capa;
         if (capa < len || capa - len > (len < 1024 ? len : 1024)) {
             if (m->as.string.as.heap.ptr == m->own) {
-                char *p = realloc(m->own, (size_t)len + 4);
+                char *p = own_resize(m, (size_t)len + 4);
                 if (!p) rb_memerror();
-                m->own = p;
-                m->own_size = len + 4;
                 m->as.string.as.heap.ptr = p;
                 m->as.string.as.heap.aux.capa = len;
             }
@@ -709,11 +741,9 @@ void mr_string_reserve(VALUE str, long capa) {
     int term = str_term(m);
     if (!str_embedded(m) && m->own && m->as.string.as.heap.ptr == m->own
         && capa >= m->as.string.len && capa != m->as.string.as.heap.aux.capa) {
-        char *p = realloc(m->own, (size_t)capa + 4);
+        char *p = own_resize(m, (size_t)capa + 4);
         if (!p) rb_memerror();
         memset(p + capa, 0, 4);
-        m->own = p;
-        m->own_size = capa + 4;
         m->as.string.as.heap.ptr = p;
         m->as.string.as.heap.aux.capa = capa;
         return;
@@ -890,7 +920,7 @@ int mr_capi_release(int number) {
             }
     }
     free(m->io);
-    if (m->body == T_STRING) { str_adopt(m); free(m->own); }
+    if (m->body == T_STRING) { str_adopt(m); own_free(m); }
     if (m->body == T_ARRAY) free((void *)m->as.array.as.heap.ptr);
     int ran = 0;
     if (m->data && mr_without("dfree")) { free(m); return 0; }
