@@ -55,3 +55,16 @@ p [:native_hash_identity, fallback1009.match?(/\A#<BadIdentityHash1009:0x[0-9a-f
 class MauvaisÉHash1009 < BadJoinHash1009; end
 fallback1009 = [MauvaisÉHash1009.new].join
 p [:unicode_hash_fallback, fallback1009.match?(/\A#<MauvaisÉHash1009:0x[0-9a-f]+>\z/), fallback1009.encoding.name]
+
+# The internal string conversion in join does not inherit the caller's
+# refinements, while a direct to_s call in that lexical scope does.
+module JoinHashRefinement1009
+  refine Hash do
+    def to_s = "refined"
+  end
+end
+module JoinHashCaller1009
+  using JoinHashRefinement1009
+  def self.values = [{}.to_s, [{}].join]
+end
+p [:native_join_scope, JoinHashCaller1009.values]
