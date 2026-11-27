@@ -261,11 +261,11 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          // the SAME source and flags whatever s was encoded in, so a side table
          // keyed by the two answered whichever was built last.
          | VRegex of str * str * str
-         // Not a Ruby value: a list the native ISeq compiler hands the VM's
-         // loader in place of an Array of a sequence's structure (false) or
-         // of a Hash's keys and values in turn (true). It lives from
-         // ic_to_val to vm_load, inside ic_vm_native's region, and is never
-         // an operand the VM keeps -- vm_lst, vm_rec.
+         // Not a Ruby value: an immutable native list. The ISeq loader uses
+         // false for sequence structure and true for interleaved Hash fields
+         // inside ic_vm_native's region -- vm_lst, vm_rec. Anonymous method
+         // rest frames and borrowed empty VM splats also own false lists.
+         // GC follows the Ruby values of a live frame or VM stack payload.
          | VIcl of bool * Val list
          | VMain;               // the top-level `self` (main), class Object
 
@@ -1158,6 +1158,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       (if map_has bind_store (str_of_int id)
                        then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
+  | VIcl (_, values) -> gc_mark_vals live values
   | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VExc (c, _) -> gc_class_mark c
@@ -1858,6 +1859,9 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = map_iter warn_pending mk in
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
+  let _ = (if vec_get anon_splat_tail 3 != 0 then
+             (let source9 = vec_get anon_splat_tail 3 in if source9 > 0 then gc_mark_val live (VArr source9) else ())
+           else ()) in
   let _ = map_iter gc_hold (fn (k: str) -> fn (v: Val) -> gc_owned_meta_add metadata live k v) in
   let _ = map_iter gc_iter_hold (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   // the Fiber objects, the value crossing a switch, and the saved contexts of
@@ -4107,7 +4111,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                   else (match fh_args_lv_get env with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
     let superblk = (match bpl9 with
-                    | Cons (be9, _) -> coerce_to_block env world blk (eval_e env world blk be9)
+                    | Cons (be9, _) -> coerce_block_arg env world blk be9
                     | Nil -> if lv_has env "__dm_yield" then lexical_yield_block env blk else blk) in
     super_vals env world superblk defcls meth recv args
   | ESuperB (zsuper, arges, bp0, bb) ->
@@ -4219,7 +4223,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (match bp with
         | Cons (c, Nil) when str_eq c block_pass_marker ->
           invoke_with_block env world blk recv name args
-            (coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil))
+            (coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil))
         // (...and a literal block carries the method's own block for its
         //  yield, as EMethodB's does: `a&.map { |x| yield x }` was "no block
         //  given (yield)")
@@ -4753,7 +4757,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let newblk = (match bp with
                   | Cons (c, Nil) ->
                     (if str_eq c block_pass_marker
-                     then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                     then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                            blk_capture blk (true, bp, bb, env) bb))
                   | _ -> (let s9 = bp_sym world bp bb in
@@ -5302,7 +5306,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     //  left unread is not this one -- `Proc.new { }` answered that pr, as
     //  ECallB's arm already knew)
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                  | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                                            blk_capture blk (true, bp, bb, env) bb)
                   | _ -> (let s9 = bp_sym world bp bb in
@@ -7207,6 +7211,63 @@ and only_block_pass = fn (items: Expr list) ->
 // The line a call reports is its own (its node's), whatever the evaluation
 // of its arguments set on the way -- an argument on a later line
 // (ln_before), a block one of them ran: put back once they have values.
+// ObjectSpace publishes live rest Arrays, including a closure's retained
+// frame and suspended Fiber stacks. Reify only at this observer boundary;
+// normal calls and count_objects retain their native representation.
+and ospace_reify_anonymous_rest = fn (u: unit) ->
+  let reveal9 = fn frame9 ->
+    if map_has frame9 "__ar~" then
+      (match map_get frame9 "__ar~" with
+       | VIcl (false, values9) -> map_set frame9 "__ar~" (arr_new values9)
+       | _ -> ())
+    else () in
+  let _ = map_iter lv_cap (fn (_id9: int) -> fn frame9 -> reveal9 frame9) in
+  let _ = map_iter lv_capx (fn (_id9: int) -> fn frame9 -> reveal9 frame9) in
+  let current9 = fb_cur () in
+  let _ = fb_stack_envs current9 reveal9 in
+  map_iter fb_state (fn (id9: int) -> fn (state9: int) ->
+    if id9 != current9 && (state9 == 1 || state9 == 2)
+    then fb_stack_envs id9 reveal9 else ())
+and arg_splat_source = fn env -> fn world -> fn blk -> fn (value9: Val) ->
+  match value9 with
+                  | VIcl (false, values) -> VIcl (false, values)
+                  | VArr id -> VArr id
+                  // *hash spreads as [k, v] pairs -- through #to_a when the
+                  // hash (or its class) defines one of its own
+                  | VHsh xs ->
+                    (if prim_user_has world (VHsh xs) "to_a" then
+                       (match invoke_own env world blk (VHsh xs) "to_a" Nil false with
+                        | VArr aid -> VArr aid
+                        | _ -> VIcl (false, hash_to_a (hderef xs)))
+                     else VIcl (false, hash_to_a (hderef xs)))
+                  | VNil -> VNil   // borrowed *nil carries frozen-empty semantics
+                  // `[*(0..2)]` is [0, 1, 2]: a splat asks for to_a, and a
+                  // Range has one. It used to spread as the Range itself.
+                  | VRange (lo, hi, excl) -> VIcl (false, range_vals world lo hi excl)
+                  // a non-array splat calls to_a if the object responds to
+                  // it: a real/singleton method, or a user respond_to? that
+                  // answers true (covering method_missing mocks).
+                  | VObj oid ->
+                    let (m2, sp2, ocls2, iv2) = world in
+                    let ocl2 = map_get ocls2 oid in
+                    let coerce =
+                      (if has_meth world ocl2 "to_a" then true
+                       // (a builtin to_a is one: `[*str.each_line]` spread
+                       //  as [the Enumerator] -- optparse's separator lines)
+                       else if responds world (VObj oid) "to_a" then true
+                       else if has_meth world ocl2 "respond_to?" then
+                         truthy (invoke_val_c env world blk (VObj oid) "respond_to?" (Cons (VSym "to_a", Nil)) false)
+                       else false) in
+                    if coerce then
+                      // to_a returning nil means "not really convertible", so
+                      // the splat wraps the original object as [obj]; a
+                      // non-Array, non-nil result is a TypeError.
+                      (match invoke_own env world blk (VObj oid) "to_a" Nil false with
+                       | VArr aid -> VArr aid
+                       | VNil -> VIcl (false, Cons (VObj oid, Nil))
+                       | other -> (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name (VObj oid) ++ " to Array (" ++ class_name (VObj oid) ++ "#to_a gives " ++ class_name other ++ ")") in VIcl (false, Cons (VObj oid, Nil))))
+                    else VIcl (false, Cons (VObj oid, Nil))
+                  | v -> VIcl (false, Cons (v, Nil))
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
   | Nil -> eval_args_go env world blk items
@@ -7218,7 +7279,13 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Nil -> (let _ = arg_notes_reset () in Nil)
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
-    let spread = eval_splat_values env world blk e in
+    let value9 = eval_e env world blk e in
+    let source9 = (match value9 with
+                   | VArr _ -> value9
+                   | VIcl (false, _) -> value9
+                   | VNil -> value9
+                   | _ -> arg_splat_source env world blk value9) in
+    let spread = match source9 with VArr id9 -> deref id9 | VIcl (false, values9) -> values9 | _ -> Nil in
     // The final splat's note belongs to this call. Publish it after the
     // tail (including &obj conversion) finishes evaluating nested calls.
     let forwarding9 = (match e with EVar n9 -> str_eq n9 "__fwd" | _ -> false) in
@@ -7231,7 +7298,33 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                      (match vlast spread with VHsh id9 -> id9 | _ -> 0) else 0) in
     let empty_id9 = if keyword9 > 0 then keyword9 else flagged9 in
     let empty9 = empty_id9 > 0 && (match hderef empty_id9 with Nil -> true | _ -> false) in
-    let tail9 = eval_args env world blk t in
+    let tail9 =
+      (match t with
+       | Nil -> eval_args env world blk t
+       | _ -> (match flow_value (iter_held source9 (fn (u: unit) -> FNext (VIcl (false, eval_args env world blk t)))) with
+               | VIcl (false, values9) -> values9 | _ -> Nil)) in
+    // Like compile.c setup_args_dup_rest_p, snapshot before keyword
+    // expressions that may change the spread, including Hash literals.
+    let rec keyword_snapshot9 = fn (items9: Expr list) -> match items9 with
+      | Nil -> false
+      | Cons (EKwSplat inner9, Cons (_, rest9)) ->
+        anon_block_dup_rest env inner9 || keyword_snapshot9 rest9
+      | Cons (item9, rest9) -> anon_block_dup_rest env item9 || keyword_snapshot9 rest9 in
+    let rec snapshot_tail9 = fn (es9: Expr list) -> match es9 with
+      | Nil -> false
+      | Cons (ESplat _, _) -> true
+      | Cons (EKwHash items9, rest9) -> keyword_snapshot9 items9 || snapshot_tail9 rest9
+      | Cons (EKwSplat inner9, rest9) -> anon_block_dup_rest env inner9 || snapshot_tail9 rest9
+      | Cons (_, rest9) -> snapshot_tail9 rest9 in
+    let srcid9 = match source9 with
+      | VArr id9 -> if snapshot_tail9 t then 0 - 2 else id9
+      | VNil -> if snapshot_tail9 t then 0 - 2 else 0 - 1
+      | _ -> 0 - 2 in
+    let _ = vec_set anon_splat_tail 3 srcid9 in
+    let _ = (if srcid9 > 0 || srcid9 == 0 - 1 then
+               (let _ = vec_set anon_splat_tail 0 (vlen tail9) in
+                vec_set anon_splat_tail 1 (vlen spread))
+             else ()) in
     if empty9 then (let _ = arg_empty_set () in list_append (vinit spread) tail9)
     else (let _ = (if flagged9 > 0 then (let _ = arg_splat_note flagged9 in mark_kw flagged9)
                    else if keyword9 > 0 then mark_kw keyword9 else ()) in
@@ -7286,44 +7379,15 @@ and eval_values_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Cons (value9, tail9) ->
     Cons (eval_e env world blk value9, eval_values env world blk tail9)
 and eval_splat_values = fn env -> fn world -> fn blk -> fn (e: Expr) ->
-    match eval_e env world blk e with
-                  | VArr id -> deref id
-                  // *hash spreads as [k, v] pairs -- through #to_a when the
-                  // hash (or its class) defines one of its own
-                  | VHsh xs ->
-                    (if prim_user_has world (VHsh xs) "to_a" then
-                       (match invoke_own env world blk (VHsh xs) "to_a" Nil false with
-                        | VArr aid -> deref aid
-                        | _ -> hash_to_a (hderef xs))
-                     else hash_to_a (hderef xs))
-                  | VNil -> Nil   // [*nil] is empty
-                  // `[*(0..2)]` is [0, 1, 2]: a splat asks for to_a, and a
-                  // Range has one. It used to spread as the Range itself.
-                  | VRange (lo, hi, excl) -> range_vals world lo hi excl
-                  // a non-array splat calls to_a if the object responds to
-                  // it: a real/singleton method, or a user respond_to? that
-                  // answers true (covering method_missing mocks).
-                  | VObj oid ->
-                    let (m2, sp2, ocls2, iv2) = world in
-                    let ocl2 = map_get ocls2 oid in
-                    let coerce =
-                      (if has_meth world ocl2 "to_a" then true
-                       // (a builtin to_a is one: `[*str.each_line]` spread
-                       //  as [the Enumerator] -- optparse's separator lines)
-                       else if responds world (VObj oid) "to_a" then true
-                       else if has_meth world ocl2 "respond_to?" then
-                         truthy (invoke_val_c env world blk (VObj oid) "respond_to?" (Cons (VSym "to_a", Nil)) false)
-                       else false) in
-                    if coerce then
-                      // to_a returning nil means "not really convertible", so
-                      // the splat wraps the original object as [obj]; a
-                      // non-Array, non-nil result is a TypeError.
-                      (match invoke_own env world blk (VObj oid) "to_a" Nil false with
-                       | VArr aid -> deref aid
-                       | VNil -> Cons (VObj oid, Nil)
-                       | other -> (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name (VObj oid) ++ " to Array (" ++ class_name (VObj oid) ++ "#to_a gives " ++ class_name other ++ ")") in Cons (VObj oid, Nil)))
-                    else Cons (VObj oid, Nil)
-                  | v -> Cons (v, Nil)
+  let value9 = eval_e env world blk e in
+  match value9 with
+  | VArr id9 -> deref id9
+  | VIcl (false, values9) -> values9
+  | VNil -> Nil
+  | _ -> (match arg_splat_source env world blk value9 with
+          | VArr id9 -> deref id9
+          | VIcl (false, values9) -> values9
+          | _ -> Nil)
 
 // ---- multiple assignment ------------------------------------------------
 // the slot a global name refers to, following any `alias` chain.
@@ -7403,7 +7467,7 @@ and ovr_name = fn acc -> fn (n: str) ->
   if str_len n > 0 && (if str_starts_with n "__" then false else true)
      && ((ord (char_at n 0) >= 97 && ord (char_at n 0) <= 122) || str_eq (char_at n 0) "_" || ord (char_at n 0) >= 128)
   then map_set acc n 1
-  else if str_eq n "__anonrest" || str_eq n "__anonkw" then map_set acc n 1
+  else if str_eq n "__ar~" || str_eq n "__anonkw" then map_set acc n 1
   else ()
 and ovr_params = fn own -> fn (ps: str list) ->
   list_iter ps (fn (p9: str) ->
@@ -10345,6 +10409,7 @@ and run_block0 = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
 //  second, entered and left at every call, was 4% of a block called from
 //  an each: issue #113)
 and run_block0x = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) -> fn (own9: bool) ->
+  let _ = anon_splat_forget () in
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
@@ -11646,6 +11711,7 @@ and nby_count = fn world -> fn (a0: Val) ->
   if n9 < 0 then (let _ = raise_exc world "ArgumentError" ("negative size (" ++ str_of_int n9 ++ ")") in 0)
   else n9
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let _ = anon_splat_forget () in
   // This native iterator owns its arguments; yields are ordinary values,
   // never a splat left over from a previous native consumer such as push.
   let _ = arg_splat_consume () in
@@ -27163,6 +27229,8 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
        // each_object requests value stores too. count_objects counts Array
        // and Hash stores separately, before making its own result objects.
        let values9 = public9 || (match args with Cons (_, Cons (VBool true, _)) -> true | _ -> false) in
+       let _ = (if values9 && (str_eq want9 "" || str_eq want9 "Array" || obj_is_a world "Array" want9)
+                then ospace_reify_anonymous_rest () else ()) in
        let _ = (if values9 then
            (let addv9 = fn (v9: Val) -> fn (base9: str) ->
               // A value store's tag already proves its builtin ancestry;
@@ -34101,6 +34169,11 @@ and proc_isolate = fn env -> fn world -> fn (pid9: int) -> fn (how9: int) -> fn 
               (let _ = raise_exc world "Ractor::IsolationError" ("cannot make a shareable Proc because the outer variable '" ++ n9 ++ "' may be reassigned.") in ())
             else
               (let v9 = lv_get cenv9 n9 in
+               let v9 = (if str_eq n9 "__ar~" then
+                           (match v9 with
+                            | VIcl (false, values9) -> (let array9 = arr_new values9 in let _ = lv_set cenv9 n9 array9 in array9)
+                            | _ -> v9)
+                         else v9) in
                if ractor_shareable env world v9 then map_set e9 n9 v9
                else (let _ = raise_exc world "Ractor::IsolationError"
                                ("cannot make a shareable Proc because it can refer unshareable object " ++ inspect_w env world v9 ++ " from variable '" ++ ovr_shown n9 ++ "'") in ()))) in
@@ -34153,7 +34226,7 @@ and proc_outer_names = fn (pid9: int) ->
              (match fh_params_lv_get cenv9 with
               | VArr pid -> list_iter (deref pid) (fn (pv: Val) ->
                               (match pv with
-                               | VStr ph -> (let q9 = pbase (sget ph) in if str_eq q9 "" then () else add9 q9)
+                               | VStr ph -> (let raw9 = sget ph in let q9 = if str_eq raw9 "*__ar~" then "__ar~" else pbase raw9 in if str_eq q9 "" then () else add9 q9)
                                | _ -> ()))
               | _ -> ())
            else ()) in
@@ -34162,7 +34235,7 @@ and proc_outer_names = fn (pid9: int) ->
 // (the walk's note of a bare `super`: no local's name)
 and ovr_zsuper_key = fn (u: unit) -> chr 6 ++ "zsuper"
 // a local's name as ruby shows it: the anonymous `*` and `**` by their signs
-and ovr_shown = fn (n: str) -> if str_eq n "__anonrest" then "*" else if str_eq n "__anonkw" then "**" else n
+and ovr_shown = fn (n: str) -> if str_eq n "__ar~" then "*" else if str_eq n "__anonkw" then "**" else n
 and list_map_sv = fn (xs: str list) -> match xs with Nil -> (Nil : Val list) | Cons (x, t) -> Cons (VSym x, list_map_sv t)
 and isolate_refusal = fn world -> fn (names: str list) ->
   raise_exc world "ArgumentError" ("can not isolate a Proc because it accesses outer variables (" ++ str_join_c names ++ ").")
@@ -34778,7 +34851,62 @@ and brk_home_flow = fn cenv -> fn (f: Flow) ->
      | VInt h9 -> (if h9 > 0 && fb_frame_live h9 then (let _ = flow_throw_breakret h9 v in FNext VNil) else f)
      | _ -> f)
   | _ -> f
+// A block expression/to_proc can call Ruby after splat evaluation. Keep this
+// call's Array provenance scoped across that callback, not on its callee.
+and anon_splat_block_scope = fn body9 ->
+  let source9 = vec_get anon_splat_tail 3 in
+  let tail9 = vec_get anon_splat_tail 0 in
+  let span9 = vec_get anon_splat_tail 1 in
+  let hold9 = vec_get gc_iter_hold_n 0 in
+  let _ = vec_set gc_iter_hold_n 0 (hold9 + 1) in
+  let _ = (if source9 > 0 then map_set gc_iter_hold hold9 (VArr source9) else ()) in
+  let _ = anon_splat_forget () in
+  let result9 = try_or_msg body9 (fn (message9: str) ->
+    (let _ = (if source9 > 0 then map_delete gc_iter_hold hold9 else ()) in
+     let _ = anon_splat_forget () in fail message9)) in
+  let _ = (if source9 > 0 then map_delete gc_iter_hold hold9 else ()) in
+  let _ = vec_set anon_splat_tail 3 source9 in
+  let _ = vec_set anon_splat_tail 0 tail9 in
+  let _ = vec_set anon_splat_tail 1 span9 in
+  result9
+// CRuby compile.c setup_args_dup_rest_p snapshots a splat before a block
+// expression which can modify it. Variable/literal reads keep the source.
+and anon_block_dup_rest = fn env -> fn (expression9: Expr) ->
+  match expression9 with
+  | EVar name9 -> not (lv_has env name9 || str_starts_with name9 "$" || str_starts_with name9 "@@")
+  | EIVar _ -> false | EConst _ -> false | EConstOrNil _ -> false
+  | EInt _ -> false | EBig _ -> false | ERat _ -> false
+  | EImag _ -> false | EImagF _ -> false | EImagRat _ -> false | EFlt _ -> false
+  | EStrL _ -> false | ESym _ -> false | ERegex _ -> false
+  | ESelf -> false | ENil -> false | EBool _ -> false | ELambda _ -> false
+  | EScopedRead (inner9, _) -> anon_block_dup_rest env inner9
+  | EArr expressions9 ->
+    (let rec any9 = fn (xs9: Expr list) -> match xs9 with
+       | Nil -> false
+       | Cons (h9, t9) -> anon_block_dup_rest env h9 || any9 t9 in any9 expressions9)
+  | EMethod (EStrL _, name9, Nil) when str_starts_with name9 "__lit_" -> false
+  | _ -> true
+and coerce_block_arg = fn env -> fn world -> fn blk -> fn (expression9: Expr) ->
+  match expression9 with
+  // A plain live local cannot run Ruby while being read. Keep pseudo and
+  // implicit-numbered variables on eval_e's full visibility path. A Proc
+  // already held here needs no callback scope or temporary root.
+  | EVar name9 when (str_eq name9 "__b" || str_eq name9 "__anonblk" || str_starts_with name9 "__vm~"
+                     || (str_len name9 > 0 && ord (char_at name9 0) >= 97 && ord (char_at name9 0) <= 122))
+                    && lv_has env name9 -> coerce_to_block env world blk (lv_get env name9)
+  | ENil -> coerce_to_block_value env world blk VNil
+  | _ ->
+    if vec_get anon_splat_tail 3 != 0 then
+      (let _ = (if anon_block_dup_rest env expression9 then vec_set anon_splat_tail 3 (0 - 2) else ()) in
+       anon_splat_block_scope (fn (u: unit) -> coerce_to_block_value env world blk (eval_e env world blk expression9)))
+    else coerce_to_block_value env world blk (eval_e env world blk expression9)
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
+  match bv with
+  | VProc _ -> coerce_to_block_value env world blk bv
+  | VNil -> coerce_to_block_value env world blk bv
+  | _ -> if vec_get anon_splat_tail 3 != 0 then anon_splat_block_scope (fn (u: unit) -> coerce_to_block_value env world blk bv)
+         else coerce_to_block_value env world blk bv
+and coerce_to_block_value = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
   | VProc pid ->
     // forward the proc's home frame so the callee's `break` targets it.
@@ -41137,6 +41265,7 @@ and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val li
 // The native bound entry is shared by public Method#call and Method#to_proc.
 // A generated Proc never performs public lookup of its Method object's call.
 and method_call_native = fn env -> fn world -> fn blk -> fn (id: int) -> fn (args: Val list) ->
+  let _ = anon_splat_forget () in
   let (_, _, _, ivars) = world in
   let mnm = method_text (method_core_field id 0) in
   let mown = method_text (method_core_field id 1) in
@@ -41292,6 +41421,7 @@ and method_call_native = fn env -> fn world -> fn blk -> fn (id: int) -> fn (arg
                | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | VSym h -> h | _ -> "exception") else "exception"))
             else invoke_val_c env world blk mrecv mnm args false)
 and method_block_native = fn env -> fn world -> fn blk -> fn (mid: int) -> fn (args: Val list) -> fn newblk ->
+  let _ = anon_splat_forget () in
   (let args = (if arg_splat_any () then r2k_method_args world args else args) in
           let (_, _, _, ivars9) = world in
           let mnm = (method_text (method_core_field mid 0)) in
@@ -41321,7 +41451,7 @@ and method_block_native = fn env -> fn world -> fn blk -> fn (mid: int) -> fn (a
 // Native argument copies preserve Hash state without invoking user dup or
 // initialize_copy hooks. Frozen/singleton state is not copied by rb_hash_dup.
 and r2k_hash_copy = fn world -> fn (id9: int) ->
-  let copy9 = prim_method (VHsh id9) "dup" Nil in
+  let copy9 = prim_method_raw (VHsh id9) "dup" Nil in
   let (_, supers9, _, ivars9) = world in
   let oldkey9 = hng_key (VHsh id9) in
   let newkey9 = hng_key copy9 in
@@ -41359,7 +41489,10 @@ and r2k_unflag_tail = fn world -> fn (args: Val list) ->
   | VHsh id ->
     (if map_has r2k_marks (str_of_int id) && arg_splat_has id
      then
-       (let rest9 = (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)) in
+       (// The copied/dropped Hash changes the positional spread. Its source
+        // Array is no longer the rest value the callee must retain.
+        let _ = (if vec_get anon_splat_tail 3 != 0 then vec_set anon_splat_tail 3 (0 - 2) else ()) in
+        let rest9 = (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)) in
         // ...and an EMPTY one is no keywords at all, which pass nothing
         // (`args.last.clear; opt(*args)` reaches opt's default)
         match hderef id with
@@ -42909,6 +43042,7 @@ and str_lines_of = fn (h: int) -> fn (args: Val list) ->
         | other -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")))
 
 and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let _ = anon_splat_forget () in
   // Leaf native arguments are consumed here; they do not run a Ruby binder.
   let _ = arg_splat_consume () in
   // what the call WAS, for the NoMethodError this may become: the leaf has no
@@ -49432,6 +49566,7 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
 // dispatch_prim, which asks the class for a user method of the same name
 // first, and the usual reason for the alias is that there is one.
 and native_sender_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn actualblk ->
+  let _ = anon_splat_forget () in
   // The native entry consumes its bypass before a name coercion or target
   // can call another receiver's Ruby sender override.
   let _ = (if map_len bi_skip > 0 && str_eq (map_get bi_skip "n") name then map_clear bi_skip else ()) in
@@ -53103,6 +53238,7 @@ and run_meth_result = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -
       (match params with
        | Cons (p, Nil) -> str_len p > 1 && str_eq (char_at p 0) "*"
                           && not (str_eq (char_at p 1) "*") && not (str_eq p "*__fwd")
+                          && not (str_eq p "*__ar~")
        | _ -> false) && (match vlast args with VHsh _ -> false | _ -> true) in
     // Empty argument and parameter lists carry no heap references. Keep an
     // explicit empty parameter sentinel so zsuper does not fall back to an
@@ -62998,7 +63134,7 @@ and bind_params_m = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (para
   if (match params with Nil -> true | _ -> false)
      && (match defaults with Nil -> true | _ -> false)
      && (match args with Nil -> true | _ -> false)
-     && not (arg_splat_any ())
+     && not (arg_splat_any ()) && vec_get anon_splat_tail 3 == 0
      && not (map_has pending_home "v" || map_has pending_srcproc "v") then ()
   else
   let pd9 = vec_get bind_mark_v 0 in
@@ -63047,6 +63183,37 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                  | _ -> ())
               else ())
            else ()) in
+  // A call without a pending splat pays one state check. Every target still
+  // retires an active source before defaults or callbacks can invoke Ruby.
+  let _ = (let src9 = vec_get anon_splat_tail 3 in
+           if src9 == 0 then ()
+           else (let _ = (if str_list_has params0 "*__ar~" then
+             (let eligible9 = (if src9 == 0 - 2 then false else
+                (let tail9 = vec_get anon_splat_tail 0 in
+                 let wants9 = (let ps8 = strip_block_params params0 in
+                   match kw_params ps8 with Nil -> not (str_eq (dsplat_name ps8) "") | _ -> true) in
+                 let keywords9 = wants9 && is_kw_hash (vlast args0) in
+                 // Keyword methods snapshot an unaccompanied positional
+                 // splat, even when no keyword Hash needs peeling. Explicit
+                 // keywords after a spread leave its source intact.
+                 (tail9 == 0 && (not wants9 || vec_get arg_notes 0 == 1))
+                 || (tail9 == 1 && keywords9))) in
+              match params0 with
+              | Cons (p9, Nil) when str_eq p9 "*__ar~" ->
+                vec_set anon_splat_tail 2
+                  (if not eligible9 then 0 - 2
+                   else if src9 > 0 then
+                     (if vlen args0 - vec_get anon_splat_tail 0 - vec_get anon_splat_tail 1 == 0 then src9 else 0 - 2)
+                   else src9)
+              | _ ->
+                map_set frame "__as~"
+                  (if not eligible9 then VBool false
+                   else if src9 > 0 then
+                     (let prefix9 = vlen args0 - vec_get anon_splat_tail 0 - vec_get anon_splat_tail 1 in
+                      VIcl (false, Cons (VArr src9, Cons (VInt prefix9, Nil))))
+                   else if src9 == 0 - 1 then VNil else VBool false))
+           else ()) in
+                 vec_set anon_splat_tail 3 0)) in
   // (the splat notes are this call's; none may outlive it)
   let _ = (if arg_splat_any () then arg_splat_forget () else ()) in
   // a block forwarded as `&proc` carries its home frame in pending_home;
@@ -63200,7 +63367,22 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
     // Its list is immutable; arr_new gives the rest parameter its own Array.
     let rest_args = vdrop args (npre + kopt) in
     let rest_values = if na == 0 then rest_args else vtake rest_args sc in
-    let rest_array = (if sc < 4096 then arr_new rest_values
+    let rest_array = (if str_eq sname "__ar~" then
+                        (let pending9 = vec_get anon_splat_tail 2 in
+                         let native9 = pending9 != 0 in
+                         let _ = (if native9 then vec_set anon_splat_tail 2 0 else ()) in
+                         let noted9 = native9 || map_has frame "__as~" in
+                         let source9 = if native9 then
+                                         (if pending9 > 0 then VArr pending9 else if pending9 == 0 - 1 then VNil else VBool false)
+                                       else if noted9 then map_get frame "__as~" else VNil in
+                         let _ = (if noted9 && not native9 then map_delete frame "__as~" else ()) in
+                         match source9 with
+                         | VArr _ when nopt == 0 && na == 0 && not (map_has frame "__r2k") -> source9
+                         | VIcl (false, Cons (VArr id9, Cons (VInt prefix9, Nil)))
+                           when prefix9 == npre && nopt == 0 && na == 0 && not (map_has frame "__r2k") -> VArr id9
+                         | VNil when nv == npre && na == 0 && (not noted9 || nopt == 0) -> VNil
+                         | _ -> VIcl (false, rest_values))
+                      else if sc < 4096 then arr_new rest_values
                       else (match arr_new Nil with
                             | VArr id -> let _ = arr_push_many id rest_values in VArr id
                             | v -> v)) in
@@ -70748,7 +70930,7 @@ and vm_lname = fn (locs: Val list) -> fn (i: int) -> fn (depth: int) ->
   //  them, which it reports as ruby does: param_meta_of)
   // (...and the `$!` a rescue or an ensure sequence holds its exception in,
   //  per depth: the sequence runs in the frame around it)
-  | VSym s -> if str_eq s "*" then "__anonrest" else if str_eq s "**" then "__anonkw" else if str_eq s "&" then "__anonblk"
+  | VSym s -> if str_eq s "*" then "__ar~" else if str_eq s "**" then "__anonkw" else if str_eq s "&" then "__anonblk"
               else if str_eq s "$!" then "__vm~e" ++ str_of_int depth
               // (`...`: the evaluator's name for what a forwarding method was given)
               else if str_eq s "..." then "__fwd" else s
@@ -72330,7 +72512,7 @@ and vm_blk_send = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (mid: str
   let (_, _, _, _, _, _, _, _, bp0, bb, _, _, _, _) = vec_get vm_meta bid in
   let bp = blk_own_locals env bp0 in
   let newblk = (match bp with
-                | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                | Cons (c, Nil) -> if str_eq c block_pass_marker then coerce_block_arg env world blk (match bb with Cons (SExpr be, _) -> be | _ -> ENil)
                                    else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                                          blk_capture blk (true, bp, bb, env) bb)
                 | _ -> (let s9 = bp_sym world bp bb in
@@ -72944,6 +73126,9 @@ and vm_step = fn env -> fn world -> fn blk -> fn cd -> fn st -> fn (pc: int) ->
                 (let h9 = vm_pop st in
                  let a9 = vm_pop st in
                  vm_push st (match (a9, h9) with
+                             | (VNil, VHsh hid9) -> arr_new (match hderef hid9 with Nil -> Nil | _ -> Cons (h9, Nil))
+                             | (VIcl (false, values9), VHsh hid9) ->
+                               arr_new (match hderef hid9 with Nil -> values9 | _ -> vappend values9 (Cons (h9, Nil)))
                              | (VArr id9, VHsh hid9) -> (match hderef hid9 with
                                                         | Nil -> a9
                                                         | _ -> arr_new (vappend (deref id9) (Cons (h9, Nil))))
@@ -73403,13 +73588,20 @@ and vm_value_op = fn env -> fn world -> fn blk -> fn st -> fn (o: int) -> fn (n:
   else if o == 41 then
     (let x = vm_pop st in
      match x with
+     // Borrowed *nil is an empty argument list, not an observable Array.
+     // A copying/Array-producing splat keeps the ordinary materialization.
+     | VNil when a == 0 -> vm_push st VNil
+     | VIcl (false, _) when a == 0 -> vm_push st x
      | VArr _ when a == 0 -> vm_push st x
+     | _ when a == 0 -> vm_push st (arg_splat_source env world blk x)
      | _ -> vm_push st (vm_eval env world blk (Cons (x, Nil)) (fn (es: Expr list) -> EArr (Cons (ESplat (vm_nth_e es 0), Nil)))))
   else if o == 42 || o == 43 then
     vm_push st (vm_eval env world blk (vm_popn st 2) (fn (es: Expr list) -> EArr (Cons (ESplat (vm_nth_e es 0), Cons (ESplat (vm_nth_e es 1), Nil)))))
   else if o == 44 then
     (let xs = vm_popn st a in
      match vm_pop st with
+     | VNil -> vm_push st (arr_new xs)
+     | VIcl (false, values) -> vm_push st (arr_new (vappend values xs))
      | VArr id -> vm_push st (arr_new (vappend (deref id) xs))
      | y -> vm_push st (arr_new (Cons (y, xs))))
   else vm_expand env world blk st a b
