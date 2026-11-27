@@ -28,6 +28,17 @@ The refusals of a negative length or offset now come before the read (second rev
 
 `IO.read` is the prelude's. It refused a negative length before the offset and before the seek, and `File#seek` here does not refuse a pipe, so `IO.read(pipe, -1, 0)` answered ArgumentError where ruby answers ESPIPE. It now refuses the offset, asks `File.pipe?` when an offset is given, seeks, and then refuses the length. (`File#seek` on a File over a pipe still moves without ESPIPE; that is outside this change.)
 
+A length or an offset that is not an Integer was taken for "none given" (third review, Major). The early refusals and the length looked only at an Integer, so `File.read("/dev/urandom", -1.0)`, an object whose `#to_int` answers -1, and `File.read("/dev/urandom", "bad")` read a device without an end. main answered "" at once; ruby raises ArgumentError and TypeError. Now `nil` (or nothing) is "none given", and anything else is converted as ruby's NUM2LONG converts it, before anything is read (`file_read_num`):
+
+- a Float truncates;
+- `#to_int` is asked, and an answer that is not an Integer is a TypeError naming it;
+- a String is a TypeError ("no implicit conversion from string" for binread's offset, an off_t);
+- a Bignum is a RangeError.
+
+`binread` converts the length first, `read` the offset first. `IO.read` (the prelude's) converts the length after the open and the seek, as ruby does.
+
+A File reopened onto another path kept what it had read of the old one as a stream (third review, Major). Read over a pipe and then reopened onto a file, it answered the pipe's "old\n" again. `__f_reopen` now drops `__f_whole`, the bytes and the mark that the path was not a stream alike.
+
 A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
 
 `read_file` is still used where the path is known to be regular:
@@ -49,6 +60,8 @@ Corpus 838 covers:
 - character devices with a length: `/dev/urandom` (16 and 8 bytes), `/dev/zero` (with an offset, and with a length of 0), and the encodings of reads with and without a length;
 - a pipe read with an offset, and with an offset of 0: ESPIPE;
 - a negative length, a negative offset and both, for `File` and `IO`, `read` and `binread`, over `/dev/zero`, a pipe and a regular file;
+- lengths and offsets that are not Integers: a Float, an object with `#to_int` (answering -1, 2, and a String), a String, nil and a Bignum;
+- a File read over a pipe and then reopened onto a file;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
 

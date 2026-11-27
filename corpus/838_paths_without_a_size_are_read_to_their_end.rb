@@ -83,3 +83,34 @@ t("pipe offset 0") { piped("abc") { |p| File.binread(p, 2, 0) } }
     t("#{k}.#{m} file 1 -1")  { k.send(m, __FILE__, 1, -1) }
   end
 end
+
+# a length or an offset that is not an Integer is converted as ruby converts
+# it (a Float truncates, #to_int is asked, a String is refused), before
+# anything is read: /dev/urandom never ends
+neg = Object.new; def neg.to_int = -1
+two = Object.new; def two.to_int = 2
+bad = Object.new; def bad.to_int = "x"
+%i[read binread].each do |m|
+  [File, IO].each do |k|
+    t("#{k}.#{m} -1.0")       { k.send(m, "/dev/urandom", -1.0) }
+    t("#{k}.#{m} 2.7")        { k.send(m, "/dev/zero", 2.7) }
+    t("#{k}.#{m} to_int -1")  { k.send(m, "/dev/urandom", neg) }
+    t("#{k}.#{m} to_int 2")   { k.send(m, "/dev/zero", two) }
+    t("#{k}.#{m} to_int bad") { k.send(m, "/dev/zero", bad) }
+    t("#{k}.#{m} string")     { k.send(m, "/dev/urandom", "bad") }
+    t("#{k}.#{m} nil")        { k.send(m, __FILE__, nil).size > 0 }
+    t("#{k}.#{m} nil 1")      { k.send(m, __FILE__, nil, 1)[0, 3] }
+    t("#{k}.#{m} 2 1.5")      { k.send(m, "/dev/zero", 2, 1.5) }
+    t("#{k}.#{m} 2 string")   { k.send(m, "/dev/zero", 2, "x") }
+    t("#{k}.#{m} 2 to_int")   { k.send(m, "/dev/zero", 2, two) }
+    t("#{k}.#{m} bignum")     { k.send(m, "/dev/zero", 2**70) }
+    t("#{k}.#{m} string -1")  { k.send(m, "/dev/zero", "x", -1) }
+  end
+end
+
+# a File read over a pipe and then reopened onto a file reads the file
+Dir.mktmpdir do |d|
+  f = File.join(d, "fresh.txt"); File.write(f, "fresh\n")
+  t("pipe reopened") { piped("old\n") { |p| File.open(p) { |io| [io.read, io.reopen(f).class, io.read] } } }
+  t("pipe reopened, gets") { piped("old\n") { |p| File.open(p) { |io| [io.gets, (io.reopen(f, "r"); io.gets), io.gets] } } }
+end
