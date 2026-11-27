@@ -42,8 +42,23 @@ CASE_END = re.compile(r'^([0-9.]+) s = ([.FES])$')
 # The worse of two verdicts for one name, when a transcript reports it twice
 SEVERITY = {'.': 0, 'S': 1, 'F': 2, 'E': 3}
 VERDICTS = ('MATCH', 'RED', 'MISSING', 'UNCONFIRMED', 'BOTH', 'EXTRA')
-CASE_IDENTITY_POLICIES = ('literal', 'opaque-class-addresses')
+CASE_IDENTITY_POLICIES = ('literal', 'opaque-class-addresses', 'rails-argument-descriptions')
 ANONYMOUS_CLASS = re.compile(r'#<Class:0x([0-9a-fA-F]+)>')
+# Only this unchanged Rails file generates these three test names from the
+# current clock. Its assertions still run on the original, unmodified values.
+ARGUMENT_SOURCE_SHA256 = '6ab0a13d10a0c5a881a66bf37908a0381ed507ae8dc99b5b3e4093575b128a2c'
+_DATE = r'\d{4}-\d{2}-\d{2}'
+_CLOCK = r'\d{2}:\d{2}:\d{2}(?:\.\d+)?'
+_TIME = _DATE + '_' + _CLOCK + r'_([+-]\d{4})'
+_DATETIME = r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),_\d{2}_(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)_\d{4}_' + _CLOCK + r'_([+-]\d{4})'
+_DATE_INSPECT = r'#<Date:_' + _DATE + r'_\(\(-?\d+j,0s,0n\),\+0s,2299161j\)>'
+_ARGUMENT_PREFIX = r'ArgumentSerializationTest#test_serializes_Range_-_'
+ARGUMENT_CLOCK_CASES = [
+    (kind, re.compile(_ARGUMENT_PREFIX + body + r'_verbatim\Z'))
+    for kind, body in (('days-ago-to-date', _TIME + r'\.\.' + _DATE_INSPECT),
+                       ('hours-ago-to-time', _TIME + r'\.\.' + _TIME),
+                       ('weeks-ago-to-datetime', _DATETIME + r'\.\.' + _DATETIME))
+]
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
 
 # Only these unchanged tagged files legitimately contain no runnable tests.
@@ -368,7 +383,7 @@ def parse(stdout, outcome):
 UNTRUSTED = ('COUNT_MISMATCH', 'REPORT_MISMATCH')
 
 
-def case_identity_aliases(reference, mere, policy='literal'):
+def case_identity_aliases(reference, mere, policy='literal', source_sha256=None):
     """Pair unique opaque class descriptions, preserving address relationships.
 
     Raw identities stay in the record. Incomplete inventories and ambiguous
@@ -380,6 +395,13 @@ def case_identity_aliases(reference, mere, policy='literal'):
         return {}
 
     def shape(name):
+        if policy == 'rails-argument-descriptions' and source_sha256 == ARGUMENT_SOURCE_SHA256:
+            for kind, pattern in ARGUMENT_CLOCK_CASES:
+                match = pattern.fullmatch(name)
+                if match:
+                    # Preserve each endpoint's UTC offset. Only the clock's
+                    # date/time text is volatile, not the test's type or form.
+                    return (('rails-clock', kind, *match.groups()),), [], True
         pieces, addresses, slots, start = [], [], {}, 0
         for match in ANONYMOUS_CLASS.finditer(name):
             address = int(match.group(1), 16)
@@ -387,14 +409,14 @@ def case_identity_aliases(reference, mere, policy='literal'):
             addresses.append(address)
             start = match.end()
         pieces.append(name[start:])
-        return tuple(pieces), addresses
+        return tuple(pieces), addresses, bool(addresses)
 
     inventories = []
     for side in (reference, mere):
         groups = {}
         for name in side['cases']:
-            key, addresses = shape(name)
-            if addresses:
+            key, addresses, volatile = shape(name)
+            if volatile:
                 groups.setdefault(key, []).append(name)
         inventories.append(groups)
     left, right = inventories
@@ -415,9 +437,9 @@ def case_identity_aliases(reference, mere, policy='literal'):
                     for raddr, maddr in zip(shape(rname)[1], shape(mname)[1]))}
 
 
-def classify(reference, mere, identity_policy='literal'):
+def classify(reference, mere, identity_policy='literal', source_sha256=None):
     """Every reference test name gets one verdict; mere-only names are EXTRA."""
-    aliases = case_identity_aliases(reference, mere, identity_policy)
+    aliases = case_identity_aliases(reference, mere, identity_policy, source_sha256)
     mere_cases = {aliases.get(name, name): verdict for name, verdict in mere['cases'].items()} if aliases else mere['cases']
     verdicts = {}
     untrusted = mere.get('state') in UNTRUSTED
@@ -537,7 +559,8 @@ def all_pass(record, selected_files):
         sides = entry['sides']
         if set(sides) != {'reference', 'mere'}:
             return False
-        aliases = case_identity_aliases(sides['reference'], sides['mere'], record.get('case_identity_policy', 'literal'))
+        aliases = case_identity_aliases(sides['reference'], sides['mere'],
+                                       record.get('case_identity_policy', 'literal'), entry.get('source_sha256'))
         mere_names = {aliases.get(name, name) for name in sides['mere']['cases']}
         if sides['reference']['cases'].keys() != mere_names:
             return False
@@ -593,7 +616,7 @@ def summarize(record):
             continue
         reference, mere = sides['reference'], sides['mere']
         policy = record.get('case_identity_policy', 'literal')
-        aliases = case_identity_aliases(reference, mere, policy)
+        aliases = case_identity_aliases(reference, mere, policy, entry.get('source_sha256'))
         if policy != 'literal':
             entry['case_identity_aliases'] = aliases
         if empty_entry(name, entry):
@@ -604,7 +627,7 @@ def summarize(record):
             entry['verdict'] = 'REFERENCE_' + reference['state']
             verdicts = {}
         else:
-            verdicts = classify(reference, mere, policy)
+            verdicts = classify(reference, mere, policy, entry.get('source_sha256'))
             entry['verdict'] = 'COMPARED'
         # Did both sides run the common tests in the same order? (the same
         # --seed is not enough: a library that draws random numbers between
@@ -650,7 +673,8 @@ def compare(args):
         a, b = old['files'].get(name), new['files'].get(name)
         before, after = (classify_entry(a, policy) if a else {}), (classify_entry(b, policy) if b else {})
         if policy != 'literal' and a and b and 'reference' in a['sides'] and 'reference' in b['sides']:
-            aliases = case_identity_aliases(a['sides']['reference'], b['sides']['reference'], policy)
+            source_sha = a.get('source_sha256') if a.get('source_sha256') == b.get('source_sha256') else None
+            aliases = case_identity_aliases(a['sides']['reference'], b['sides']['reference'], policy, source_sha)
             # An EXTRA with the old spelling must not collide with a mapped test.
             aliases = {key: value for key, value in aliases.items() if value not in after}
             after = {aliases.get(key, key): value for key, value in after.items()}
@@ -676,7 +700,7 @@ def classify_entry(entry, identity_policy='literal'):
     sides = entry['sides']
     if entry.get('verdict') != 'COMPARED' or 'mere' not in sides or 'reference' not in sides:
         return {}
-    return classify(sides['reference'], sides['mere'], identity_policy)
+    return classify(sides['reference'], sides['mere'], identity_policy, entry.get('source_sha256'))
 
 
 def main():
@@ -701,7 +725,7 @@ def main():
     parser.add_argument('--framework-bootstrap', action='store_true',
                         help='run: restore bundled_gems, did_you_mean and error_highlight startup (recorded)')
     parser.add_argument('--case-identity-policy', choices=CASE_IDENTITY_POLICIES, default='literal',
-                        help='run: explicitly pair unique anonymous-class addresses; raw names are retained')
+                        help='run: opt into named description pairing; original names and aliases are retained')
     parser.add_argument('--require-all-pass', action='store_true',
                         help='run: exit 1 unless every selected file completes on both sides with all tests passing')
     parser.add_argument('--base', type=Path)

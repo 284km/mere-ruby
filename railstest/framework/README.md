@@ -105,6 +105,22 @@ Failures, skips, extra tests and incomplete runs retain their original meaning.
 policy it also pairs their COMPLETE reference inventories, so changed process
 addresses cannot conceal a lost MATCH. Ambiguities still fail conservatively.
 
+`rails-argument-descriptions` additionally pairs the three current-clock Range
+descriptions in Rails 8.1.4.1's unchanged `argument_serialization_test.rb`.
+Its source SHA-256 must match the runner's pin; changed or unknown sources
+retain literal clock names. Each description must be unique on both COMPLETE
+inventories. Endpoint UTC offsets, test types and range forms remain part of
+the identity. Assertions run unchanged; a paired failure remains RED. Both
+original names and accepted aliases remain available in the record. The
+existing policies retain their behavior.
+
+ActiveJob's `exceptions_test.rb` eagerly loads SneakersAdapter even when using
+a built-in adapter. Its real gem dependencies are locked here; no RabbitMQ
+worker is started. Run that file with `--env AJ_ADAPTER=test` to exercise its
+scheduling tests: inline skips the entire test class. `continuation_test.rb`
+also needs test, and `async_adapter_test.rb` needs async. Keep the disjoint
+adapter cohorts and their environments visible when reporting a component.
+
 
 Each test name the reference reports gets one verdict:
 
