@@ -19,6 +19,7 @@
  * ⚠ A boundary `int` is C's 32-bit int (Mere docs, language-reference "FFI
  * types"); lengths travel inside the bytes, never as an int.
  */
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "prism.h"
@@ -68,6 +69,39 @@ prism_ser(int kind, mere_bytes *src, mere_bytes *opts) {
       case 4: pm_serialize_ripper_lex(&buffer, source, size, data); break;
       default: pm_serialize_parse_lex(&buffer, source, size, data); break;
     }
+    return prism_take(&buffer);
+}
+
+/* Private Ripper scanner provenance: [error index, start, length, state], each
+ * little-endian uint32. Public Prism serialization above stays unchanged. */
+mere_bytes *
+prism_error_spans(mere_bytes *src, mere_bytes *opts) {
+    pm_buffer_t buffer;
+    pm_buffer_init(&buffer);
+    pm_options_t options = { 0 };
+    pm_options_read(&options, (const char *) opts->data);
+    pm_parser_t parser;
+    pm_parser_init(&parser, (const uint8_t *) src->data, (size_t) src->len, &options);
+    pm_node_t *node = pm_parse(&parser);
+    uint32_t index = 0;
+    for (pm_list_node_t *item = parser.error_list.head; item != NULL; item = item->next, index++) {
+        pm_diagnostic_t *diagnostic = (pm_diagnostic_t *) item;
+        pm_location_t loc = diagnostic->ripper_escape_location;
+        if (loc.start == NULL || loc.end == NULL) continue;
+        size_t start = (size_t) (loc.start - parser.start);
+        size_t end = (size_t) (loc.end - parser.start);
+        if (end < start || end > (size_t) src->len || end > UINT32_MAX) continue;
+        uint32_t values[4] = { index, (uint32_t) start, (uint32_t) (end - start),
+            diagnostic->ripper_has_lex_state ? diagnostic->ripper_lex_state : UINT32_MAX };
+        uint8_t bytes[16];
+        for (size_t i = 0; i < 4; i++) {
+            for (size_t j = 0; j < 4; j++) bytes[i * 4 + j] = (uint8_t) (values[i] >> (j * 8));
+        }
+        pm_buffer_append_bytes(&buffer, bytes, sizeof(bytes));
+    }
+    pm_node_destroy(&parser, node);
+    pm_parser_free(&parser);
+    pm_options_free(&options);
     return prism_take(&buffer);
 }
 

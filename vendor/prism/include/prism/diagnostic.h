@@ -372,6 +372,13 @@ typedef struct {
     /** The location of the diagnostic in the source. */
     pm_location_t location;
 
+    /** Private scanner provenance; public location/serialization is unchanged. */
+    pm_location_t ripper_escape_location;
+
+    /** Actual lexer state before reading a character escape. */
+    uint32_t ripper_lex_state;
+    bool ripper_has_lex_state;
+
     /** The ID of the diagnostic. */
     pm_diagnostic_id_t diag_id;
 

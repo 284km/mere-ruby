@@ -604,7 +604,24 @@ let psych_lib_src = fn (u: unit) ->
   "    FLOW_BREAKS = [':', \"\\r\", \"\\n\", '#', ',', '[', ']', '\{', '\}'].freeze\n" ++
   "    SINGLE_BREAKS = [\"'\", \"\\n\"].freeze\n" ++
   "    DOUBLE_BREAKS = ['\"', '\\\\', \"\\n\"].freeze\n" ++
-  "    private_constant :ESCAPES, :PLAIN_BREAKS, :FLOW_BREAKS, :SINGLE_BREAKS, :DOUBLE_BREAKS\n" ++
+  "    # The scanner reads BYTES (Integers): the syntax of YAML is ASCII, and a\n" ++
+  "    # one-byte String per character read was most of what a load made -- about\n" ++
+  "    # 110 Strings a row of activerecord's citations fixture, 6 of them kept.\n" ++
+  "    # What a token holds is cut from the source by byte position, as before.\n" ++
+  "    PUNCTUATION = \{91 => [:sequence, '['], 93 => [:sequence_end, ']'], 123 => [:mapping, '\{'],\n" ++
+  "                   125 => [:mapping_end, '\}'], 44 => [:comma, ',']\}.freeze\n" ++
+  "    INDICATORS = \{45 => [:entry, '-'], 63 => [:key, '?'], 58 => [:value, ':']\}.freeze\n" ++
+  "    BYTE_ESCAPES = ESCAPES.to_h \{ |k, v| [k.ord, v.b] \}.freeze\n" ++
+  "    HEX_ESCAPES = \{120 => 2, 117 => 4, 85 => 8\}.freeze\n" ++
+  "    DOCUMENT_ENDS = [:eof, :document, :end_document].freeze\n" ++
+  "    PROPERTIES = [:anchor, :tag].freeze\n" ++
+  "    KEY_KINDS = [:scalar, :alias, :sequence, :mapping].freeze\n" ++
+  "    OPENERS = [:sequence, :mapping].freeze\n" ++
+  "    CLOSERS = [:sequence_end, :mapping_end].freeze\n" ++
+  "    DOCUMENT_MARKS = ['---', '...'].freeze\n" ++
+  "    private_constant :ESCAPES, :PLAIN_BREAKS, :FLOW_BREAKS, :SINGLE_BREAKS, :DOUBLE_BREAKS,\n" ++
+  "                     :PUNCTUATION, :INDICATORS, :BYTE_ESCAPES, :HEX_ESCAPES, :DOCUMENT_ENDS,\n" ++
+  "                     :PROPERTIES, :KEY_KINDS, :OPENERS, :CLOSERS, :DOCUMENT_MARKS\n" ++
   "    attr_accessor :handler\n" ++
   "    attr_writer :external_encoding\n" ++
   "\n" ++
@@ -658,6 +675,9 @@ let psych_lib_src = fn (u: unit) ->
   "        prefix = source[0, invalid.begin(0)].split(\"\\n\", -1)\n" ++
   "        raise SyntaxError.new(path, [prefix.length, 1].max, (prefix.last || '').length + 1, 0, 'control characters are not allowed', nil)\n" ++
   "      end\n" ++
+  "      # (an ASCII-only source has one character per byte: a run's length is\n" ++
+  "      #  its byte count, with no String cut out to count it -- __skip)\n" ++
+  "      @ascii = source.ascii_only?\n" ++
   "      @source, @path, @pos = source.b, path, 0\n" ++
   "      @length = @source.bytesize\n" ++
   "      @window_start = 0\n" ++
@@ -693,13 +713,13 @@ let psych_lib_src = fn (u: unit) ->
   "        ending = explicit ? __take[3] : __peek[2]\n" ++
   "        __error(\"did not find expected <document start>\") if (!version.empty? || !tags.empty?) && !explicit\n" ++
   "        __event(:start_document, [version, tags, !explicit], start, ending)\n" ++
-  "        if [:eof, :document, :end_document].include?(__peek[0])\n" ++
+  "        if DOCUMENT_ENDS.include?(__peek[0])\n" ++
   "          __empty(__peek[2])\n" ++
   "        else\n" ++
   "          __node(-1)\n" ++
   "        end\n" ++
   "        token = __peek\n" ++
-  "        unless [:eof, :document, :end_document].include?(token[0])\n" ++
+  "        unless DOCUMENT_ENDS.include?(token[0])\n" ++
   "          # libyaml ends the document (implicitly) before it looks for the\n" ++
   "          # start of the next one, so a handler has this document whole --\n" ++
   "          # Psych.parse returns from its block there -- and only then is what\n" ++
@@ -745,14 +765,30 @@ let psych_lib_src = fn (u: unit) ->
   "\n" ++
   "    # Keep hot byte reads on a small source window. Repeated VM operations on\n" ++
   "    # a multi-megabyte String otherwise promote that entire value repeatedly.\n" ++
-  "    def __char(position)\n" ++
+  "    def __byte(position)\n" ++
   "      return nil if position < 0 || position >= @length\n" ++
   "      if position < @window_start || position >= @window_end\n" ++
   "        @window_start = position\n" ++
   "        @window = @source.byteslice(position, 65536)\n" ++
   "        @window_end = position + @window.bytesize\n" ++
   "      end\n" ++
-  "      @window[position - @window_start]\n" ++
+  "      @window.getbyte(position - @window_start)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # (what /\\s/ matched on a one-character String: \\f and \\v never reach the\n" ++
+  "    #  scanner, parse refuses them as control characters)\n" ++
+  "    def __blank?(byte)\n" ++
+  "      byte == 32 || byte == 10 || byte == 9 || byte == 13\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # A-Z a-z 0-9 _ -\n" ++
+  "    def __name_byte?(byte)\n" ++
+  "      (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # , [ ] \{ \}\n" ++
+  "    def __flow_indicator?(byte)\n" ++
+  "      byte == 44 || byte == 91 || byte == 93 || byte == 123 || byte == 125\n" ++
   "    end\n" ++
   "\n" ++
   "    def __slice(position, count)\n" ++
@@ -780,12 +816,14 @@ let psych_lib_src = fn (u: unit) ->
   "      nil\n" ++
   "    end\n" ++
   "\n" ++
+  "    # One character's first byte on, counted as libyaml counts its marks: a\n" ++
+  "    # line at \"\\n\", and a column and an index per character (a UTF-8\n" ++
+  "    # continuation byte, 128..191, is not one). Answers the byte.\n" ++
   "    def __advance\n" ++
-  "      c = __char(@pos)\n" ++
-  "      byte = c.nil? ? nil : c.ord\n" ++
+  "      byte = __byte(@pos)\n" ++
   "      __error('found unexpected end of stream') unless byte\n" ++
   "      @pos += 1\n" ++
-  "      if c == \"\\n\"\n" ++
+  "      if byte == 10\n" ++
   "        @line += 1\n" ++
   "        @column = 0\n" ++
   "        @line_content = false\n" ++
@@ -793,15 +831,14 @@ let psych_lib_src = fn (u: unit) ->
   "        @column += 1\n" ++
   "      end\n" ++
   "      @index += 1 if byte < 128 || byte >= 192\n" ++
-  "      @line_content = true unless c == ' ' || c == \"\\t\" || c == \"\\r\" || c == \"\\n\"\n" ++
-  "      c\n" ++
+  "      @line_content = true unless __blank?(byte)\n" ++
+  "      byte\n" ++
   "    end\n" ++
   "\n" ++
   "    # Skip a run without line breaks in one operation. A character loop makes\n" ++
   "    # large scalars spend most of their time allocating transient Ruby strings.\n" ++
   "    def __skip(finish)\n" ++
-  "      text = __slice(@pos, finish - @pos).force_encoding('UTF-8')\n" ++
-  "      count = text.length\n" ++
+  "      count = @ascii ? finish - @pos : __slice(@pos, finish - @pos).force_encoding('UTF-8').length\n" ++
   "      @index += count\n" ++
   "      @column += count\n" ++
   "      @line_content = true if finish > @pos\n" ++
@@ -825,11 +862,11 @@ let psych_lib_src = fn (u: unit) ->
   "\n" ++
   "    def __space\n" ++
   "      loop do\n" ++
-  "        c = __char(@pos)\n" ++
-  "        __error('found character that cannot start any token') if c == \"\\t\" && !@line_content\n" ++
-  "        if c == ' ' || c == \"\\t\" || c == \"\\r\" || c == \"\\n\"\n" ++
+  "        c = __byte(@pos)\n" ++
+  "        __error('found character that cannot start any token', nil, 'while scanning for the next token') if c == 9 && !@line_content\n" ++
+  "        if __blank?(c)\n" ++
   "          __advance\n" ++
-  "        elsif c == '#'\n" ++
+  "        elsif c == 35\n" ++
   "          __skip(__index(\"\\n\", @pos) || @length)\n" ++
   "        else\n" ++
   "          break\n" ++
@@ -864,50 +901,65 @@ let psych_lib_src = fn (u: unit) ->
   "    def __scan\n" ++
   "      __space\n" ++
   "      start = __at\n" ++
-  "      c = __char(@pos)\n" ++
+  "      c = __byte(@pos)\n" ++
   "      unless c\n" ++
   "        start = [@index, @column == 0 ? @line : @line + 1, 0]\n" ++
   "        return [:eof, nil, start, start, nil]\n" ++
   "      end\n" ++
-  "      if @column == 0 && c == '%'\n" ++
-  "        value = +''\n" ++
-  "        value << __advance while @pos < @length && __char(@pos) != \"\\n\"\n" ++
-  "        return [:directive, value.force_encoding('UTF-8'), start, __at, nil]\n" ++
+  "      if @column == 0 && c == 37\n" ++
+  "        from = @pos\n" ++
+  "        __skip(__index(\"\\n\", @pos) || @length)\n" ++
+  "        return [:directive, __slice(from, @pos - from).force_encoding('UTF-8'), start, __at, nil]\n" ++
   "      end\n" ++
-  "      head = __slice(@pos, 3)\n" ++
-  "      if @column == 0 && (head == '---' || head == '...') && (__char(@pos + 3).nil? || __char(@pos + 3) =~ /\\s/)\n" ++
-  "        3.times \{ __advance \}\n" ++
-  "        return [head == '---' ? :document : :end_document, nil, start, __at, nil]\n" ++
-  "      end\n" ++
-  "      punctuation = \{'[' => :sequence, ']' => :sequence_end, '\{' => :mapping, '\}' => :mapping_end, ',' => :comma\}\n" ++
-  "      if punctuation.key?(c)\n" ++
-  "        __advance\n" ++
-  "        @flow += 1 if c == '[' || c == '\{'\n" ++
-  "        @flow -= 1 if c == ']' || c == '\}'\n" ++
-  "        return [punctuation[c], c, start, __at, nil]\n" ++
-  "      end\n" ++
-  "      if (c == '-' || c == '?' || c == ':') && (__char(@pos + 1).nil? || __char(@pos + 1) =~ /\\s/ || (@flow > 0 && c == ':'))\n" ++
-  "        __advance\n" ++
-  "        return [\{'-' => :entry, '?' => :key, ':' => :value\}[c], c, start, __at, nil]\n" ++
-  "      end\n" ++
-  "      if c == '&' || c == '*'\n" ++
-  "        __advance\n" ++
-  "        value = +''\n" ++
-  "        while @pos < @length && __char(@pos) !~ /[\\s,\\[\\]\{\}]/\n" ++
-  "          value << __advance\n" ++
+  "      if @column == 0 && (c == 45 || c == 46)\n" ++
+  "        head = __slice(@pos, 3)\n" ++
+  "        if (head == '---' || head == '...') && (__byte(@pos + 3).nil? || __blank?(__byte(@pos + 3)))\n" ++
+  "          3.times \{ __advance \}\n" ++
+  "          return [head == '---' ? :document : :end_document, nil, start, __at, nil]\n" ++
   "        end\n" ++
-  "        __error('did not find expected alphabetic or numeric character') if value.empty?\n" ++
-  "        return [c == '&' ? :anchor : :alias, value.force_encoding('UTF-8'), start, __at, nil]\n" ++
   "      end\n" ++
-  "      if c == '!'\n" ++
-  "        value = +''\n" ++
-  "        if __char(@pos + 1) == '<'\n" ++
+  "      if (punctuation = PUNCTUATION[c])\n" ++
+  "        __advance\n" ++
+  "        @flow += 1 if c == 91 || c == 123\n" ++
+  "        @flow -= 1 if c == 93 || c == 125\n" ++
+  "        return [punctuation[0], punctuation[1], start, __at, nil]\n" ++
+  "      end\n" ++
+  "      if (indicator = INDICATORS[c])\n" ++
+  "        following = __byte(@pos + 1)\n" ++
+  "        if following.nil? || __blank?(following) || (@flow > 0 && c == 58)\n" ++
+  "          __advance\n" ++
+  "          return [indicator[0], indicator[1], start, __at, nil]\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      if c == 38 || c == 42\n" ++
+  "        # (libyaml's name: letters, digits, '_' and '-', ended by a blank or\n" ++
+  "        #  one of ? : , ] \} % @ ` -- anything else is an error at the & or *)\n" ++
+  "        __advance\n" ++
+  "        from = @pos\n" ++
+  "        __advance while (b = __byte(@pos)) && __name_byte?(b)\n" ++
+  "        following = __byte(@pos)\n" ++
+  "        if @pos == from || !(following.nil? || __blank?(following) || following == 63 || following == 58 ||\n" ++
+  "                             following == 44 || following == 93 || following == 125 || following == 37 ||\n" ++
+  "                             following == 64 || following == 96)\n" ++
+  "          __error('did not find expected alphabetic or numeric character', start,\n" ++
+  "                  c == 38 ? 'while scanning an anchor' : 'while scanning an alias')\n" ++
+  "        end\n" ++
+  "        return [c == 38 ? :anchor : :alias, __slice(from, @pos - from).force_encoding('UTF-8'), start, __at, nil]\n" ++
+  "      end\n" ++
+  "      if c == 33\n" ++
+  "        if __byte(@pos + 1) == 60\n" ++
   "          2.times \{ __advance \}\n" ++
-  "          value << __advance while @pos < @length && __char(@pos) != '>'\n" ++
-  "          __error('did not find expected >') unless __char(@pos) == '>'\n" ++
+  "          from = @pos\n" ++
+  "          __advance while @pos < @length && __byte(@pos) != 62\n" ++
+  "          value = __slice(from, @pos - from)\n" ++
+  "          __error('did not find expected >') unless __byte(@pos) == 62\n" ++
   "          __advance\n" ++
   "        else\n" ++
-  "          value << __advance while @pos < @length && __char(@pos) !~ /[\\s,\\[\\]\{\}]/\n" ++
+  "          from = @pos\n" ++
+  "          while @pos < @length && !(__blank?(__byte(@pos)) || __flow_indicator?(__byte(@pos)))\n" ++
+  "            __advance\n" ++
+  "          end\n" ++
+  "          value = __slice(from, @pos - from)\n" ++
   "          if (m = /\\A(![^!]*!)(.*)\\z/.match(value))\n" ++
   "            __error('found undefined tag handle') unless @tag_handles.key?(m[1])\n" ++
   "            value = @tag_handles[m[1]] + m[2]\n" ++
@@ -917,12 +969,12 @@ let psych_lib_src = fn (u: unit) ->
   "        end\n" ++
   "        return [:tag, value.force_encoding('UTF-8'), start, __at, nil]\n" ++
   "      end\n" ++
-  "      if c == \"'\" || c == '\"'\n" ++
+  "      if c == 39 || c == 34\n" ++
   "        quote = __advance\n" ++
   "        value = []\n" ++
   "        closed = false\n" ++
   "        while @pos < @length\n" ++
-  "          finish = __separator(quote == \"'\" ? SINGLE_BREAKS : DOUBLE_BREAKS)\n" ++
+  "          finish = __separator(quote == 39 ? SINGLE_BREAKS : DOUBLE_BREAKS)\n" ++
   "          if finish > @pos\n" ++
   "            value << __slice(@pos, finish - @pos)\n" ++
   "            __skip(finish)\n" ++
@@ -930,17 +982,16 @@ let psych_lib_src = fn (u: unit) ->
   "          end\n" ++
   "          c = __advance\n" ++
   "          if c == quote\n" ++
-  "            if quote == \"'\" && __char(@pos) == \"'\"\n" ++
-  "              value << __advance\n" ++
+  "            if quote == 39 && __byte(@pos) == 39\n" ++
+  "              __advance\n" ++
+  "              value << \"'\"\n" ++
   "              next\n" ++
   "            end\n" ++
   "            closed = true\n" ++
   "            break\n" ++
-  "          elsif c == '\\\\' && quote == '\"'\n" ++
+  "          elsif c == 92 && quote == 34\n" ++
   "            escape = __advance\n" ++
-  "            table = ESCAPES\n" ++
-  "            if ['x', 'u', 'U'].include?(escape)\n" ++
-  "              count = \{'x' => 2, 'u' => 4, 'U' => 8\}[escape]\n" ++
+  "            if (count = HEX_ESCAPES[escape])\n" ++
   "              hex = __slice(@pos, count)\n" ++
   "              __error('did not find expected hexadecimal number') unless hex && hex.length == count && hex =~ /\\A[0-9a-fA-F]+\\z/\n" ++
   "              count.times \{ __advance \}\n" ++
@@ -949,37 +1000,42 @@ let psych_lib_src = fn (u: unit) ->
   "              rescue RangeError\n" ++
   "                __error('found invalid Unicode character escape code')\n" ++
   "              end\n" ++
-  "            elsif escape == \"\\n\"\n" ++
-  "              __advance while __char(@pos) == ' ' || __char(@pos) == \"\\t\"\n" ++
-  "            elsif table.key?(escape)\n" ++
-  "              value << table[escape].b\n" ++
+  "            elsif escape == 10\n" ++
+  "              __advance while __byte(@pos) == 32 || __byte(@pos) == 9\n" ++
+  "            elsif (text = BYTE_ESCAPES[escape])\n" ++
+  "              value << text\n" ++
   "            else\n" ++
   "              __error('found unknown escape character')\n" ++
   "            end\n" ++
-  "          elsif c == \"\\n\"\n" ++
+  "          elsif c == 10\n" ++
   "            value[-1] = value.last.rstrip unless value.empty?\n" ++
   "            count = 0\n" ++
-  "            while __char(@pos) == ' ' || __char(@pos) == \"\\t\" || __char(@pos) == \"\\n\"\n" ++
-  "              count += 1 if __advance == \"\\n\"\n" ++
+  "            while __byte(@pos) == 32 || __byte(@pos) == 9 || __byte(@pos) == 10\n" ++
+  "              count += 1 if __advance == 10\n" ++
   "            end\n" ++
   "            value << (count == 0 ? ' ' : \"\\n\" * count)\n" ++
   "          else\n" ++
-  "            value << c\n" ++
+  "            value << c.chr\n" ++
   "          end\n" ++
   "        end\n" ++
   "        __error('found unexpected end of stream', start, 'while scanning a quoted scalar') unless closed\n" ++
-  "        return [:scalar, value.join.force_encoding('UTF-8'), start, __at, quote == \"'\" ? 2 : 3]\n" ++
+  "        return [:scalar, value.join.force_encoding('UTF-8'), start, __at, quote == 39 ? 2 : 3]\n" ++
   "      end\n" ++
-  "      if c == '|' || c == '>'\n" ++
-  "        style = __advance == '|' ? 4 : 5\n" ++
-  "        modifiers = +''\n" ++
-  "        modifiers << __advance while __char(@pos) && __char(@pos) =~ /[-+1-9]/\n" ++
-  "        __advance while __char(@pos) == ' '\n" ++
-  "        if __char(@pos) == '#'\n" ++
-  "          __advance while __char(@pos) && __char(@pos) != \"\\n\"\n" ++
+  "      if c == 124 || c == 62\n" ++
+  "        style = __advance == 124 ? 4 : 5\n" ++
+  "        from = @pos\n" ++
+  "        while (m = __byte(@pos)) && (m == 45 || m == 43 || (m >= 49 && m <= 57))\n" ++
+  "          __advance\n" ++
   "        end\n" ++
-  "        __error('did not find expected comment or line break') unless __char(@pos).nil? || __char(@pos) == \"\\n\"\n" ++
-  "        __advance if __char(@pos) == \"\\n\"\n" ++
+  "        modifiers = __slice(from, @pos - from)\n" ++
+  "        __advance while __byte(@pos) == 32\n" ++
+  "        if __byte(@pos) == 35\n" ++
+  "          __advance while __byte(@pos) && __byte(@pos) != 10\n" ++
+  "        end\n" ++
+  "        # (a CRLF is one line break, as libyaml reads it)\n" ++
+  "        __advance if __byte(@pos) == 13 && __byte(@pos + 1) == 10\n" ++
+  "        __error('did not find expected comment or line break') unless __byte(@pos).nil? || __byte(@pos) == 10\n" ++
+  "        __advance if __byte(@pos) == 10\n" ++
   "        lines = []\n" ++
   "        indent = modifiers[/[1-9]/]&.to_i\n" ++
   "        # Explicit indentation is relative to the enclosing block, not '|'.\n" ++
@@ -987,17 +1043,19 @@ let psych_lib_src = fn (u: unit) ->
   "        loop do\n" ++
   "          break if @pos >= @length\n" ++
   "          p = @pos\n" ++
-  "          p += 1 while __char(p) == ' '\n" ++
+  "          p += 1 while __byte(p) == 32\n" ++
   "          width = p - @pos\n" ++
-  "          blank = __char(p).nil? || __char(p) == \"\\n\" || __char(p) == \"\\r\"\n" ++
+  "          blank = __byte(p).nil? || __byte(p) == 10 || __byte(p) == 13\n" ++
   "          indent ||= width unless blank\n" ++
   "          break if !blank && (width < indent || width <= (@block_indent || -1))\n" ++
   "          width.times \{ __advance \}\n" ++
   "          body_start = @pos\n" ++
   "          __skip(__index(\"\\n\", @pos) || @length)\n" ++
-  "          body = __slice(body_start, @pos - body_start).force_encoding('UTF-8')\n" ++
+  "          body_end = @pos\n" ++
+  "          body_end -= 1 if body_end > body_start && __byte(body_end - 1) == 13 && __byte(body_end) == 10\n" ++
+  "          body = __slice(body_start, body_end - body_start).force_encoding('UTF-8')\n" ++
   "          body = (' ' * [width - (indent || width), 0].max) + body unless blank\n" ++
-  "          newline = __char(@pos) == \"\\n\"\n" ++
+  "          newline = __byte(@pos) == 10\n" ++
   "          __advance if newline\n" ++
   "          lines << [body, newline]\n" ++
   "        end\n" ++
@@ -1026,7 +1084,7 @@ let psych_lib_src = fn (u: unit) ->
   "        value = +'' if !modifiers.include?('+') && lines.all? \{ |body, _| body.empty? \}\n" ++
   "        return [:scalar, value, start, __at, style]\n" ++
   "      end\n" ++
-  "      __error('found character that cannot start any token') if ['`', '@', '%', \"\\t\"].include?(c)\n" ++
+  "      __error('found character that cannot start any token', nil, 'while scanning for the next token') if c == 96 || c == 64 || c == 37 || c == 9\n" ++
   "      parts = []\n" ++
   "      part_start = @pos\n" ++
   "      while @pos < @length\n" ++
@@ -1035,37 +1093,39 @@ let psych_lib_src = fn (u: unit) ->
   "          __skip(finish)\n" ++
   "          next\n" ++
   "        end\n" ++
-  "        c = __char(@pos)\n" ++
-  "        if c == \"\\n\" || c == \"\\r\"\n" ++
+  "        c = __byte(@pos)\n" ++
+  "        if c == 10 || c == 13\n" ++
   "          p = @pos\n" ++
   "          breaks = 0\n" ++
   "          line_start = p\n" ++
-  "          while __char(p) && __char(p) =~ /[ \\t\\r\\n]/\n" ++
-  "            if __char(p) == \"\\n\"\n" ++
+  "          while (b = __byte(p)) && __blank?(b)\n" ++
+  "            if b == 10\n" ++
   "              breaks += 1\n" ++
   "              line_start = p + 1\n" ++
   "            end\n" ++
   "            p += 1\n" ++
   "          end\n" ++
   "          indentation = p - line_start\n" ++
-  "          next_text = __slice(p, 3)\n" ++
-  "          break if !__char(p) || (@flow == 0 && indentation <= @block_indent) || __char(p) == '#' || (indentation == 0 && ['---', '...'].include?(next_text))\n" ++
+  "          following = __byte(p)\n" ++
+  "          break if !following || (@flow == 0 && indentation <= @block_indent) || following == 35 ||\n" ++
+  "                   (indentation == 0 && (following == 45 || following == 46) && DOCUMENT_MARKS.include?(__slice(p, 3)))\n" ++
   "          __advance while @pos < p\n" ++
   "          parts << __slice(part_start, @pos - part_start).rstrip\n" ++
   "          parts << (breaks > 1 ? \"\\n\" * (breaks - 1) : ' ')\n" ++
   "          part_start = @pos\n" ++
   "          next\n" ++
   "        end\n" ++
-  "        break if @flow > 0 && [',', '[', ']', '\{', '\}'].include?(c)\n" ++
-  "        following = __char(@pos + 1)\n" ++
-  "        break if c == ':' && (following.nil? || following =~ /\\s/ || (@flow > 0 && [',', '[', ']', '\{', '\}'].include?(following)))\n" ++
-  "        break if c == '#' && (@pos == part_start || __char(@pos - 1) =~ /\\s/)\n" ++
+  "        break if @flow > 0 && __flow_indicator?(c)\n" ++
+  "        following = __byte(@pos + 1)\n" ++
+  "        break if c == 58 && (following.nil? || __blank?(following) || (@flow > 0 && __flow_indicator?(following)))\n" ++
+  "        break if c == 35 && (@pos == part_start || __blank?(__byte(@pos - 1)))\n" ++
   "        __advance\n" ++
   "      end\n" ++
-  "      parts << __slice(part_start, @pos - part_start)\n" ++
-  "      value = parts.join.force_encoding('UTF-8')\n" ++
+  "      last = __slice(part_start, @pos - part_start)\n" ++
+  "      value = (parts.empty? ? last : (parts << last).join).force_encoding('UTF-8')\n" ++
   "      __error('did not find expected node content') if value.empty?\n" ++
-  "      trimmed = value.rstrip\n" ++
+  "      # (a copy only when there is a blank to trim)\n" ++
+  "      trimmed = __blank?(value.getbyte(value.bytesize - 1)) ? value.rstrip : value\n" ++
   "      finish = [@index - value.length + trimmed.length, @line, @column - value.length + trimmed.length]\n" ++
   "      [:scalar, trimmed, start, finish, 1]\n" ++
   "    end\n" ++
@@ -1084,7 +1144,7 @@ let psych_lib_src = fn (u: unit) ->
   "        __take\n" ++
   "        token = __peek\n" ++
   "      end\n" ++
-  "      if property_end && ([:eof, :document, :end_document].include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))\n" ++
+  "      if property_end && (DOCUMENT_ENDS.include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))\n" ++
   "        return __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], start, property_end)\n" ++
   "      end\n" ++
   "      if token[0] == :sequence || token[0] == :mapping\n" ++
@@ -1133,7 +1193,7 @@ let psych_lib_src = fn (u: unit) ->
   "          entry = __take\n" ++
   "          @block_indent = indent\n" ++
   "          following = __peek\n" ++
-  "          if [:eof, :document, :end_document].include?(following[0]) || (following[2][1] > entry[2][1] && following[2][2] <= indent)\n" ++
+  "          if DOCUMENT_ENDS.include?(following[0]) || (following[2][1] > entry[2][1] && following[2][2] <= indent)\n" ++
   "            __empty(entry[3])\n" ++
   "          else\n" ++
   "            __node(indent)\n" ++
@@ -1163,19 +1223,19 @@ let psych_lib_src = fn (u: unit) ->
   "    def __mapping_key?\n" ++
   "      return true if __peek[0] == :key\n" ++
   "      index = 0\n" ++
-  "      while [:anchor, :tag].include?(__peek(index)[0])\n" ++
+  "      while PROPERTIES.include?(__peek(index)[0])\n" ++
   "        index += 1\n" ++
   "      end\n" ++
   "      # Properties on their own line apply to the enclosing collection.\n" ++
   "      return false if index > 0 && __peek(index)[2][1] != __peek[2][1]\n" ++
   "      kind = __peek(index)[0]\n" ++
-  "      return false unless [:scalar, :alias, :sequence, :mapping].include?(kind)\n" ++
+  "      return false unless KEY_KINDS.include?(kind)\n" ++
   "      if kind == :sequence || kind == :mapping\n" ++
   "        depth = 0\n" ++
   "        loop do\n" ++
   "          current = __peek(index)[0]\n" ++
-  "          depth += 1 if [:sequence, :mapping].include?(current)\n" ++
-  "          depth -= 1 if [:sequence_end, :mapping_end].include?(current)\n" ++
+  "          depth += 1 if OPENERS.include?(current)\n" ++
+  "          depth -= 1 if CLOSERS.include?(current)\n" ++
   "          return false if current == :eof\n" ++
   "          break if depth == 0\n" ++
   "          index += 1\n" ++
@@ -1203,7 +1263,7 @@ let psych_lib_src = fn (u: unit) ->
   "      __event(:start_mapping, [anchor, tag, tag.nil?, 1], start, __peek[2])\n" ++
   "      loop do\n" ++
   "        key = __peek\n" ++
-  "        break if [:eof, :document, :end_document].include?(key[0]) || key[2][2] != indent\n" ++
+  "        break if DOCUMENT_ENDS.include?(key[0]) || key[2][2] != indent\n" ++
   "        explicit_key = key[0] == :key\n" ++
   "        __error('did not find expected key') if key[0] == :value\n" ++
   "        __take if explicit_key\n" ++
@@ -1213,7 +1273,7 @@ let psych_lib_src = fn (u: unit) ->
   "          __take\n" ++
   "          @block_indent = indent\n" ++
   "          following = __peek\n" ++
-  "          if [:eof, :document, :end_document].include?(following[0]) || (following[2][1] > colon[2][1] && (following[2][2] < indent || (following[2][2] == indent && following[0] != :entry)))\n" ++
+  "          if DOCUMENT_ENDS.include?(following[0]) || (following[2][1] > colon[2][1] && (following[2][2] < indent || (following[2][2] == indent && following[0] != :entry)))\n" ++
   "            __empty(colon[3])\n" ++
   "          else\n" ++
   "            __node(indent, true, true)\n" ++
@@ -3674,6 +3734,30 @@ let psych_lib_src = fn (u: unit) ->
   "    [0, 2, 5]\n" ++
   "  end\n" ++
   "\n" ++
+  "  # Takes apart a tree that safe_load or unsafe_load built for itself, once its\n" ++
+  "  # Ruby value is made (tools/gen_psych_lib.rb puts the call there, and says\n" ++
+  "  # why). Only those: a tree Psych.parse or parse_stream returns is the\n" ++
+  "  # caller's.\n" ++
+  "  # (the spine only: the stream, its document, and down while a node has one\n" ++
+  "  #  child -- the mapping or sequence the document holds, whose children are\n" ++
+  "  #  the rows. A stale handle on the C stack is the root's or near it; with\n" ++
+  "  #  the spine cleared it keeps one row at most. Walking the whole tree was\n" ++
+  "  #  the first version, and it cost more than it saved: iterating an Array\n" ++
+  "  #  built by appends folds it into a list, so the walk copied every\n" ++
+  "  #  children Array once more, and the 65,536-row fixture's load reached a\n" ++
+  "  #  2.3 GB footprint where the spine's reaches 1.5 to 1.9.)\n" ++
+  "  def self.__drop_tree(node)\n" ++
+  "    while node\n" ++
+  "      kids = node.children\n" ++
+  "      break unless kids\n" ++
+  "      following = kids.size == 1 ? kids[0] : nil\n" ++
+  "      kids.clear\n" ++
+  "      node = following\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  private_class_method :__drop_tree\n" ++
+  "\n" ++
   "  class ClassLoader\n" ++
   "    private\n" ++
   "\n" ++
@@ -3816,7 +3900,9 @@ let psych_lib_src = fn (u: unit) ->
   "  def self.unsafe_load yaml, filename: nil, fallback: false, symbolize_names: false, freeze: false, strict_integer: false, parse_symbols: true\n" ++
   "    result = parse(yaml, filename: filename)\n" ++
   "    return fallback unless result\n" ++
-  "    result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols)\n" ++
+  "    __value = result.to_ruby(symbolize_names: symbolize_names, freeze: freeze, strict_integer: strict_integer, parse_symbols: parse_symbols)\n" ++
+  "    __drop_tree(result)\n" ++
+  "    __value\n" ++
   "  end\n" ++
   "\n" ++
   "  ###\n" ++
@@ -3876,7 +3962,9 @@ let psych_lib_src = fn (u: unit) ->
   "              else\n" ++
   "                Visitors::NoAliasRuby.new scanner, class_loader, symbolize_names: symbolize_names, freeze: freeze\n" ++
   "              end\n" ++
-  "    result = visitor.accept result\n" ++
+  "    __value = visitor.accept result\n" ++
+  "    __drop_tree(result)\n" ++
+  "    result = __value\n" ++
   "    result\n" ++
   "  end\n" ++
   "\n" ++
