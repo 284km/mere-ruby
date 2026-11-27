@@ -37,3 +37,26 @@ It runs `prism/templates/template.rb` with the reference ruby for each
 generated file and copies the hand-written ones. The templates are driven by
 `prism/config.yml`, so a version bump regenerates everything; the diff that
 needs reading is `src/prism.c`.
+
+The generator then applies `tools/prism_ripper_heredoc.patch`. This private
+Ripper serializer enables EOF recovery while the actual parser and its local
+scopes remain live. An internal empty interpolation-end marker lets the
+parser unwind into its heredoc's normal EOF recovery, which resumes the
+actual saved header cursor. Ripper hides the empty recovery markers after
+LexCompat has flushed its buffers. No source fragment is reparsed and no
+source location is synthesized. Ordinary Prism parse/lex/lex_compat do not
+enable this entry point.
+
+`tools/gen_prism_ripper_lex.rb` extracts the reference LexCompat#result using
+its actual Prism DefNode span and changes only its native token producer.
+The resulting `lib/prism_ripper_lex.rb` is a private subclass for this cold
+recovery path. The public producer and ordinary valid Ripper lexing retain
+their original path.
+
+The private lexer also returns a zero-brace-nesting right brace with its
+actual pre-closer state, as CRuby's tSTRING_DEND branch does. This is a real
+source token, distinct from the hidden empty EOF recovery markers. Ripper
+selects the private path only for a heredoc diagnostic or an actual stray
+right-brace diagnostic. Public Prism lex/parse keeps its original behavior.
+The extracted Ruby consumer preserves the reference file's frozen-string
+pragma as well as its original lexical constant scope.
