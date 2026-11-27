@@ -1,40 +1,27 @@
 # actionview-eval-node
 
-Eval-generated template methods had no file-backed Prism index, so error highlighting
-could not locate their call nodes. Attach compact compilation-unit node metadata to the
-method and retain it through backtrace locations, aliases, old Method objects and GC,
-without keeping source trees or defining frames.
+Twelve ActionView render tests failed because eval-generated template methods had no
+compilation-unit node IDs. Retain compact metadata with methods/backtrace locations, including
+aliases, old Method objects, Ruby::Box and GC.
 
-Measured runtime `0fef6ef1718f8a2cd9494e9b62ad7aeb19487144`, main control
-`b9ca06d6700c44ded301131930a5dbd9107202be`. Ordinary O2; Mere 9dec2ff6, mgz 661a01d8.
-Reference `tools/ref_ruby.sh`, clean Ruby 4.0.10, revision
+Measured runtime `c6497f659c95e9f0d3ae42250a610ce44e684256`; this follow-up compares against
+reviewed head `c9c97f7f` (binary from unchanged runtime `0fef6ef1`). Original main-control
+acceptance remains in the historical record: 524 MATCH /12 RED →536 MATCH /0 RED on both engines.
+
+The Major/P2 heredoc regression is fixed structurally: serialized nodes are preorder, so a reverse
+pass computes each subtree end from its child fields. Indexing follows that subtree rather than
+DefNode source offsets. This includes heredoc interpolation beyond the definition location while
+keeping sibling definitions separate. Corpus 1004 covers endless/regular heredocs, neighboring
+definitions, and real/synthetic filenames. All 8 engine/hash/GC combinations now match Ruby; the old
+head reproduces the failure in all 8. Existing ordinary-file corpus 1022 matches in all 4
+engine/hash combinations.
+
+Ordinary O2; Mere 9dec2ff6, mgz 661a01d8. Reference `tools/ref_ruby.sh`: clean Ruby 4.0.10, revision
 a704b7cd95a42cc0cf5f307137bf3aac0285b915, Prism 1.8.2, no extra gems.
 
-- `run_corpus.sh --both`: 1013/1013, hash index ON/OFF.
-- VM corpus: 1013 VM / 0 evaluator fallback / 0 differences.
-- Source gates, generated-C bracket check and default record hygiene pass. Explicit
-changed-record hygiene is checked after writing this record.
-- Related CRuby checks complete on the reference and both before/after engines; no
-previously passing selected case is lost. Existing failures remain visible in the
-record.
-
-An unpublished R11 candidate lost existing compound-write node lookup in eval-defined
-methods. It was rejected before publication. Corpus 1004 now covers ten operator-write
-shapes with real and synthetic filenames, and compact rows preserve every
-kind/name/target used by the existing file index. The focused corpus also runs with
-tight GC and hash indexes ON/OFF. The bounded native scan uses each definition subtree;
-the embedded Ruby helper is regenerated from its source. The regressions include class-
-eval block labels and zero-line Object instance_eval, primitive and Ruby raises, aliases
-and old Method objects. Primitive failures capture indexed frame metadata before pooled
-frames unwind; the original complete backtrace/eval files remain compared. The control
-includes the merged SyntaxError formatter fix, so no template SyntaxError failures are
-allowed. Ruby::Box journals restore the original compact metadata together with method
-rows after replacement or removal; switching boxes allocates no new Ruby objects. A
-separate lambda arity-entry comparison preserves current-main file-backed node lookup;
-synthetic lambda entry lookup remains unsupported on both main and this candidate. On
-ordinary alias/send caller frames the node lookup still returns nil on both main and
-head, while Ruby returns a call node. Those pre-existing gaps are retained separately
-and are not counted as passing reference comparisons.
+- `run_corpus.sh --both`: 1013/1013, hash ON/OFF.
+- VM corpus: 1013 VM / 0 fallback / 0 differences.
+- Source gates, generated-C bracket check, default and explicit changed-record hygiene pass.
 
 | Core file / selection | Mode | Tests | Assertions | Failures | Errors | Skips |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -59,47 +46,52 @@ and are not counted as passing reference comparisons.
 | ruby/test_ast.rb (selected node-ID cases) | before-vm | 5 | 1 | 0 | 0 | 4 |
 | ruby/test_ast.rb (selected node-ID cases) | after-vm | 5 | 1 | 0 | 0 | 4 |
 
-Targeted Rails files: all reference and mere executions COMPLETE, no bounds events.
+No previously passing selected core case is lost. Existing baseline failures/skips remain; AST rows
+cover only the selected node-ID cases.
 
-| Mode | MATCH | RED | MISSING | BOTH | UNCF | EXTRA |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| before-evaluator-1 | 524 | 12 | 0 | 0 | 0 | 0 |
-| after-evaluator-1 | 536 | 0 | 0 | 0 | 0 | 0 |
-| before-vm | 524 | 12 | 0 | 0 | 0 | 0 |
-| after-vm | 536 | 0 | 0 | 0 | 0 | 0 |
+`actionview/test/template/render_test.rb`: all 12 runs (3 alternating evaluator pairs, the original
+VM pair, and 2 fresh VM pairs) have **536 MATCH /0 RED**, all other counts 0; reference and mere
+states COMPLETE, with no runner-reported wall/memory limit event. Each uses seed 12345, jobs 2
+and 600 s / 2 GiB.
 
-Fixed-seed full-file RSS samples (KiB): three new candidate executions compared with
-three unchanged-main samples reused from R11, collected in separate cohorts. Original
-record digests and times are retained; these are not alternating pairs.
-
-| File | Before samples | After samples | Median change |
+| Engine | Before RSS samples (KiB) | After RSS samples (KiB) | Median change |
 | --- | --- | --- | ---: |
-| actionview/test/template/render_test.rb | 698208 / 664928 / 652112 | 565008 / 570304 / 544784 | -15.03% |
+| evaluator | 595552 / 563728 / 590512 | 633232 / 598400 / 434000 | +1.34% |
+| vm | 469424 / 490272 | 477232 / 489984 | +0.78% |
 
-Instructions retired, median of three alternating pairs on unchanged workloads: 200
-string module_eval calls containing 80 one-line definitions, and -c on the pinned Rails
-action_dispatch/routing/mapper.rb (100,374 bytes). Exact workload text/digests are in
-the record. String eval now performs an extra native Prism pass to obtain compilation-
-unit node IDs, which adds about 16% instructions in the definition-heavy workload. This
-cost is disclosed; no zero-overhead claim is made for eval compilation.
+Evaluator RSS uses the three R13 pairs; VM RSS above uses two fresh R14 pairs. The original R13 VM
+pair remains in the record: before 449200 KiB, after 482864 KiB. Its before run has an unexplained
+roughly four-hour wall-clock gap, although the runner reports 254.9 s and no limit event; it is
+excluded from the fresh VM RSS table.
+
+`ruby/test_method.rb` VM RSS, three pairs including the original sample:
+
+| Side | Samples (KiB) | Median (KiB) |
+| --- | --- | ---: |
+| before | 1189952 / 1661248 / 1612704 | 1612704 |
+| after | 1449360 / 1174640 / 1655344 | 1449360 |
+
+These repeats retain the same 99 tests, one existing failure and one skip. RSS varies substantially
+even on the unchanged control; no stable memory improvement is claimed.
+
+Instructions retired, median of 3 alternating pairs vs reviewed c9 head:
 
 | Workload | Engine | Before | After | Change |
 | --- | --- | ---: | ---: | ---: |
-| valid_class_eval | evaluator | 1703236488 | 1977642721 | +16.11% |
-| valid_class_eval | VM | 1706432426 | 1977752846 | +15.90% |
-| large_syntax_check | evaluator | 173423856 | 174313896 | +0.51% |
-| large_syntax_check | VM | 173682553 | 173511215 | -0.10% |
+| valid_class_eval | evaluator | 1970549933 | 1987002293 | +0.83% |
+| valid_class_eval | VM | 1971750725 | 1989148593 | +0.88% |
+| large_syntax_check | evaluator | 172982541 | 173306970 | +0.19% |
+| large_syntax_check | VM | 172525147 | 173120706 | +0.35% |
 
-RSS samples vary with machine load; no stable memory improvement is claimed. Native
-extensions explicitly reused from runtime63213030 / binary c7800ad2; the record retains
-installation provenance.
+The original feature adds a native Prism pass during string eval (historically about 16%
+instructions on the definition-heavy workload); the table isolates the structural follow-up. Exact
+workload text/digests and prior measurements are in the record. RSS is load-sensitive; no stable
+improvement is claimed.
 
-Separate prospective integration `74856ce33741c3da09f303f906ef9cc68d32ddda` with newer
-main `ad289755a37de94e5faddf61763d49edda849c03` also passes corpus --both 1026/1026, VM
-1026 /0 fallback /0 differences and all gates, including the new class-watermark
-control. That binary freshly installed its own native gems; its source/binary/install
-provenance and focused 34-row node matrix are retained separately from the PR-head
-evidence. No full component sweep is claimed.
+Native gems explicitly reused from runtime 63213030 / binary c7800ad2 (targeted R3 install); not a
+fresh install with this binary. The historical prospective integration 74856 still has the old
+heredoc scanner and is not evidence for this fix. Full component sweeps have not been rerun. Known
+external GC/Ripper/reference sanitizer residuals remain separately recorded (#312/#339/#345).
 
-Evidence: `railstest/framework/records/actionview-eval-node.json`. This is targeted
-acceptance; a complete ActionView passing result is not claimed.
+Evidence: `railstest/framework/records/actionview-eval-node.json`, including historical acceptance.
+Owner merges after exact-head bot review and clearing the global merge hold.
