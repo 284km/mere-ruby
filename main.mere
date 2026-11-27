@@ -2666,6 +2666,7 @@ let gc_collect = fn env -> fn world ->
     // (wound back into the pool, not just forgotten: see hidx_release)
     let rec relI = fn (i: int) -> (if i >= vec_len dHI then () else (let _ = hidx_release (vec_get dHI i) in relI (i + 1))) in
     let _ = relI 0 in
+    let _ = (if nc then () else map_compact_big hentry_rows) in
     let dHM = vec_new () in
     let _ = map_iter hash_indexed (fn (k: int) -> fn (b: bool) ->
       if gc_live_has live (k * 8 + 3) then () else vec_push dHM k) in
@@ -2798,6 +2799,7 @@ let gc_collect = fn env -> fn world ->
     // pools, now that every stack is suspended (note 303)
     let _ = (if nc then () else qv_drain ()) in
     let _ = (if nc then () else hidx_drain ()) in
+    let _ = (if nc then () else hentry_drain ()) in
     // (the marking's tables, for the next mark: gc_pend_release)
     let _ = (if nc then () else gc_pend_release ()) in
     let _ = vec_set qv_ctr 3 0 in
@@ -15341,7 +15343,9 @@ and hstored_seed = fn env -> fn world -> fn (h9: Val) ->
 and hstored_seed_go = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) ->
   match xs with
   | Cons (k9, Cons (_, t9)) ->
-    (let _ = (if key_has_user_hash world k9 then hstored_put env world hid k9 else ()) in
+    (let _ = (if key_has_user_hash world k9 then
+                (let _ = hstored_put env world hid k9 in hidx_drop hid)
+              else ()) in
      hstored_seed_go env world hid t9)
   | _ -> ()
 
@@ -15569,14 +15573,36 @@ and hix_key_now = fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
   | VArr _ -> hash_haskey_x ci xs k
   | VHsh _ -> hash_haskey_x ci xs k
   | _ -> true
+// The independent walk reads the value from the actual pair. Digest rows
+// contain no values and identify the stored bucket of each individual pair.
+and hentry_lookup = fn (hid: int) -> fn (ci: bool) -> fn (xs: Val list) -> fn (key: Val) ->
+  let rows = map_get hentry_rows hid in
+  let query = hkey_dig hid key in
+  let rec go = fn (pairs: Val list) -> fn (i: int) ->
+    match pairs with
+    | Cons (stored, Cons (value, tail)) ->
+      if str_eq (vec_get rows i) query && hkey_same ci stored key then (true, value)
+      else go tail (i + 1)
+    | _ -> (false, VNil) in
+  go xs 0
+and hentry_query = fn (hid: int) -> fn (key: Val) ->
+  match key with
+  | VArr _ -> map_len hentry_rows > 0 && map_has hentry_rows hid
+  | VHsh _ -> map_len hentry_rows > 0 && map_has hentry_rows hid
+  | VStr _ -> map_len hentry_rows > 0 && map_has hentry_rows hid
+  | _ -> false
 and hix_has = fn (hid: int) -> fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
-  if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
+  if hentry_query hid k then
+    (let (found, _) = hentry_lookup hid ci xs k in
+     found && (if hidx_use hid then hidx_has hid (hkey_dig hid k) else true))
+  else if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
   then hidx_has hid (hkey_dig hid k) && hix_key_now ci xs k
   else hash_haskey_x ci xs k
 // Membership does not need the settled pair list for immutable indexed keys.
 // Folding pending inserts here made key?-then-store loops quadratic.
 and hix_has_lazy = fn (hid: int) -> fn (ci: bool) -> fn (k: Val) ->
-  if hidx_use hid then
+  if hentry_query hid k then hix_has hid ci (hderef hid) k
+  else if hidx_use hid then
     (let digest = hkey_dig hid k in
      if str_eq digest "" then hash_haskey_x ci (hderef hid) k
      else hidx_has hid digest && (match k with
@@ -15585,7 +15611,13 @@ and hix_has_lazy = fn (hid: int) -> fn (ci: bool) -> fn (k: Val) ->
             | _ -> true))
   else hash_haskey_x ci (hderef hid) k
 and hix_get = fn (hid: int) -> fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
-  if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
+  if hentry_query hid k then
+    (let (found, value) = hentry_lookup hid ci xs k in
+     if not found then VNil
+     else if hidx_use hid then
+       (let d = hkey_dig hid k in if hidx_has hid d then hidx_get hid d else VNil)
+     else value)
+  else if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
   then (if hidx_has hid (hkey_dig hid k) && hix_key_now ci xs k then hidx_get hid (hkey_dig hid k) else VNil)
   else (if hash_haskey_x ci xs k then hash_get_x ci xs k else VNil)
 and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: Val) -> fn (slow: unit -> Val list) ->
@@ -15595,8 +15627,10 @@ and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: V
   // already flat. The index knows every key in an indexed hash, so its answer
   // is the whole answer -- and when it says "present" the old path runs, which
   // is what rewrites the value in place.
-  if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
-  then (if hidx_has hid (hkey_dig hid k)
+  if hidx_on hid && (if str_eq (hkey_dig hid k) "" then false else true)
+  then (if (if map_has hentry_rows hid then
+              (let (found, _) = hentry_lookup hid ident (hderef hid) k in found)
+            else hidx_has hid (hkey_dig hid k))
         // an overwrite goes to the index alone (see hash_stale)
         then (let _ = hput_over hid (hkey_dig hid k) v in v)
         else (let _ = hput_new_check hid in let _ = hpush_new hid k v in v))
@@ -19105,7 +19139,13 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
           (match xs with
            | Cons (k9, Cons (v9, t9)) -> re9 hd9 ci9 t9 (hash_put_wx env world hd9 ci9 acc k9 v9)
            | _ -> acc) in
-        let _ = hset hid9 (re9 hid9 (hcbi_on hid9) (hderef hid9) Nil) in recv)
+        let pairs = re9 hid9 (hcbi_on hid9) (hderef hid9) Nil in
+        let _ = hset hid9 pairs in
+        let rec native_keys = fn (xs: Val list) ->
+          match xs with
+          | Cons (key, Cons (_, tail)) -> not (key_has_user_hash world key) && native_keys tail
+          | _ -> true in
+        let _ = (if hcbi_on hid9 || native_keys pairs then hidx_reseed hid9 else ()) in recv)
      | _ -> recv)
   // Hash#initialize on a FROZEN hash refuses (it replaces the default either
   // way), and the primitive has no way to know it was frozen.
@@ -40407,7 +40447,7 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
   let uh9 = (if ci then false else key_has_user_hash world k) in
   let _ = (if uh9 then (let _ = hstored_put env world hid k in
                         let _ = map_set hput_search "k" k in map_set hput_search "pre" k) else ()) in
-  let found9 = (if hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true)
+  let found9 = (if hidx_on hid && (if str_eq (hkey_dig hid k) "" then false else true)
                 then (Nil : Val list)
                 else (match find9 (hsettled hid) with
                       | Cons (kk, _) -> Cons (kk, Nil)
@@ -44784,10 +44824,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // key in it has a digest -- so a MISS here is a real miss.
      | VHsh hid ->
        (match args with
+        | Cons (k, _) when hentry_query hid k ->
+          (let xs = hderef hid in let ci = hcbi_on hid in
+           if hix_has hid ci xs k then hix_get hid ci xs k else hdflt_get hid)
         | Cons (k, _) when hidx_use hid && (if str_eq (hkey_dig hid k) "" then false else true) ->
           (let d = hkey_dig hid k in if hidx_has hid d && hix_key_now (hcbi_on hid) (hderef hid) k then hidx_get hid d else hdflt_get hid)
         | _ ->
-          let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hash_haskey_x ci xs k then hash_get_x ci xs k else hdflt_get hid | _ -> VNil))
+          let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hix_has hid ci xs k then hix_get hid ci xs k else hdflt_get hid | _ -> VNil))
      // Integer#[i]: bit i of the number (0 for out-of-range high bits).
      // `n[i, len]` and `n[i..j]` take a RUN of bits, low bit first: the bits
      // are shifted down to zero and masked, so 255[0, 4] is 15.

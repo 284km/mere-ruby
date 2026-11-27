@@ -1854,6 +1854,46 @@ let hkey_dig = fn (id: int) -> fn (k: Val) -> if hcbi_fwd id then hkey_ident k e
 // (the off-switch lives in main.mere, where env_get is in scope; this is the
 //  plain question "does this hash have an index", asked while maintaining it)
 let hidx_off = map_new ();
+let fn sfrozen_fwd: int -> bool;
+// Stored digests belong to entries, not to key object identities. Only
+// hashes with mutable native keys need these rows; immutable-key hashes
+// retain their compact-list/index representation. The rows contain native
+// strings only, never Ruby handles, and have their own recyclable arenas.
+let hentry_rows = (let t = map_new () in let _ = map_compact t in t);
+let hentry_pool = vec_new ();
+let hentry_quar = vec_new ();
+let hentry_counts = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+let hentry_take = fn (u: unit) ->
+  let n = vec_get hentry_counts 0 in
+  let _ = vec_set qv_ctr 3 (vec_get qv_ctr 3 + 4096) in
+  if n > 0 then (let _ = vec_set hentry_counts 0 (n - 1) in vec_get hentry_pool (n - 1))
+  else (let v = vec_new () in let _ = vec_recycle v in v);
+let hentry_drop = fn (id: int) ->
+  if map_has hentry_rows id then
+    (let v = map_get hentry_rows id in
+     let _ = map_delete hentry_rows id in
+     let n = vec_get hentry_counts 1 in
+     let _ = (if n < vec_len hentry_quar then vec_set hentry_quar n v else vec_push hentry_quar v) in
+     vec_set hentry_counts 1 (n + 1))
+  else ();
+let hentry_drain = fn (u: unit) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_get hentry_counts 1 then () else
+      (let v = vec_get hentry_quar i in
+       let _ = vec_recycle v in
+       let n = vec_get hentry_counts 0 in
+       let _ = (if n < vec_len hentry_pool then vec_set hentry_pool n v else vec_push hentry_pool v) in
+       let _ = vec_set hentry_counts 0 (n + 1) in go (i + 1)) in
+  let _ = go 0 in vec_set hentry_counts 1 0;
+let hentry_mutable = fn (k: Val) ->
+  match k with VArr _ -> true | VHsh _ -> true | VStr h -> not (sfrozen_fwd h) | _ -> false;
+let rec hentry_needed = fn (xs: Val list) ->
+  match xs with Cons (k, Cons (_, t)) -> hentry_mutable k || hentry_needed t | _ -> false;
+let hentry_make = fn (id: int) -> fn (xs: Val list) ->
+  let v = hentry_take () in
+  let rec go = fn (ys: Val list) ->
+    match ys with Cons (k, Cons (_, t)) -> let _ = vec_push v (hkey_dig id k) in go t | _ -> () in
+  let _ = go xs in map_set hentry_rows id v;
 let fn hidx_lazy_fwd: int -> bool;
 let hidx_on = fn (id: int) ->
   if map_has hash_indexed id then true
@@ -1900,6 +1940,14 @@ let hpend_drop = fn (id: int) ->
         qv_drop q)
   else ();
 let hash_stale = (let t = map_new () in let _ = map_compact t in t);  // (its own arena: a write per hash / string made, compacted at the sweep -- note 441)
+let rec hstale_vals_at = fn (id: int) -> fn (xs: Val list) -> fn rows -> fn (pos: int) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (let current = hkey_dig id k in
+     let d = vec_get rows pos in
+     let ix = map_get hash_index id in
+     Cons (k, Cons ((if str_len d > 0 && str_eq d current && map_has ix d then map_get ix d else v), hstale_vals_at id t rows (pos + 1))))
+  | other -> other;
 let rec hstale_vals = fn (id: int) -> fn (xs: Val list) ->
   match xs with
   | Cons (k, Cons (v, t)) ->
@@ -1915,7 +1963,8 @@ let hstale_fold = fn (id: int) ->
     (let _ = hpend_fold id in
      let _ = map_delete hash_stale id in
      if map_has hash_index id then
-       (let ys = hstale_vals id (hst_get id) in
+       (let ys = (if map_has hentry_rows id then hstale_vals_at id (hst_get id) (map_get hentry_rows id) 0
+                  else hstale_vals id (hst_get id)) in
         let _ = hst_publish id ys in ())
      else ())
   else ();
@@ -1945,6 +1994,7 @@ let hidx_pool_n =
    v);
 let hidx_quar = vec_new ();
 let hidx_release = fn (id: int) ->
+  let _ = hentry_drop id in
   if map_has hash_index id then
     (let ix = map_get hash_index id in
      let _ = map_delete hash_index id in
@@ -1999,7 +2049,6 @@ let hidx_start = fn (id: int) ->
 // #hash, a NaN, ... keep the index's "digest taken at the store" rule.
 // (a String key is plain only FROZEN: Hash[] stores the caller's own string,
 //  which the caller may still change -- test_s_AREF_key_tampering)
-let fn sfrozen_fwd: int -> bool;
 let hplain_key = fn (k: Val) ->
   match k with
   | VInt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true | VStr h -> sfrozen_fwd h
@@ -2025,14 +2074,35 @@ let hidx_get = fn (id: int) -> fn (d: str) -> map_get (map_get hash_index id) d;
 // `{}` filled in a loop -- which it was not: 0.574 s against 0.010 s for the
 // same 8,000 insertions, because starting from a literal left it unindexed
 // for its whole life.
-let rec hidx_seed = fn (id: int) -> fn (ys: Val list) ->
+let rec hidx_seed_go = fn (id: int) -> fn (ys: Val list) ->
   match ys with
   | Nil -> true
   | Cons (k, Cons (v, t)) ->
     (let d = hkey_dig id k in
      if str_eq d "" then false
-     else (let _ = hidx_put id d v in hidx_seed id t))
+     else (let _ = hidx_put id d v in hidx_seed_go id t))
   | _ -> false;
+let hidx_seed = fn (id: int) -> fn (xs: Val list) ->
+  if hidx_seed_go id xs then
+    (let _ = (if not (hcbi_fwd id) && hentry_needed xs then hentry_make id xs else ()) in true)
+  else false;
+// Copy the stored-entry association, including a key changed before dup.
+// This does not read values back from the index being checked by the walk.
+let hentry_copy = fn (src: int) -> fn (dst: int) -> fn (xs: Val list) ->
+  if map_has hentry_rows src then
+    (let from = map_get hentry_rows src in
+     let _ = hidx_drop dst in
+     let _ = hidx_start dst in
+     let into = hentry_take () in
+     let rec go = fn (ys: Val list) -> fn (i: int) ->
+       match ys with
+       | Cons (_, Cons (v, t)) ->
+         let d = vec_get from i in
+         let _ = vec_push into d in
+         let _ = hidx_put dst d v in go t (i + 1)
+       | _ -> () in
+     let _ = go xs 0 in map_set hentry_rows dst into)
+  else ();
 // HOW MANY PAIRS a hash holds, kept once it has been counted: Hash#size and
 // #length walked the whole list (hash_len) each time. The doors that change
 // the count keep it -- a new key queued (hpush_new) +1, a key deleted
@@ -2120,14 +2190,18 @@ let hshare_snapshot = fn (id: int) ->
            | _ -> 0 - 1));
 let hcopy_shared = fn (src: int) ->
   let snapshot9 = hshare_snapshot src in
-  if snapshot9 < 0 then mkhash (hst_get src)
+  if snapshot9 < 0 then
+    (let xs = hst_get src in
+     let copy = mkhash xs in
+     let _ = (match copy with VHsh dst -> hentry_copy src dst xs | _ -> ()) in copy)
   else (let copy9 = mkhash Nil in
         let _ = (match copy9 with
                  | VHsh dst -> (let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1)
                  | _ -> ()) in copy9);
 let hreplace_shared = fn (dst: int) -> fn (src: int) ->
   let snapshot9 = hshare_snapshot src in
-  if snapshot9 < 0 then hset dst (hst_get src)
+  if snapshot9 < 0 then
+    (let xs = hst_get src in let _ = hset dst xs in hentry_copy src dst xs)
   else (let _ = hset dst Nil in
         let _ = map_set hash_shared dst snapshot9 in map_set hash_lazy dst 1);
 let hderef_fwd = fn (id: int) -> hderef id;
@@ -2138,6 +2212,23 @@ let hderef_fwd = fn (id: int) -> hderef id;
 // that hash back into a walk: 8,000 insertions after a single delete took
 // 0.583 s against 0.010 s without it.
 let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
+  // A changed key can appear in several stored buckets. Delete the entry
+  // selected by its stored digest, rather than the first equal key object.
+  let xs = (if map_has hentry_rows id then
+    (let old = map_get hentry_rows id in
+     let next = hentry_take () in
+     let query = hkey_dig id k in
+     let rec go = fn (ys: Val list) -> fn (i: int) -> fn (removed: bool) ->
+       match ys with
+       | Cons (key, Cons (value, tail)) ->
+         let d = vec_get old i in
+         if not removed && str_eq d query && str_eq (hkey_dig id key) query then go tail (i + 1) true
+         else (let _ = vec_push next d in Cons (key, Cons (value, go tail (i + 1) removed)))
+       | _ -> (Nil : Val list) in
+     let pairs = go (hst_get id) 0 false in
+     let _ = hentry_drop id in
+     let _ = map_set hentry_rows id next in pairs)
+    else xs) in
   let _ = hcnt_add id (0 - 1) in
   let keep = hidx_on id && (if str_eq (hkey_dig id k) "" then false else true) in
   let _ = (if keep then (let _ = map_delete (map_get hash_index id) (hkey_dig id k) in ()) else ()) in
@@ -2162,14 +2253,16 @@ let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   // loop runs, so the copies piled up, 961 -> 1601 MB for 300k hashes of ten
   // insertions, note 302.)
   let qn9 = (if map_len hash_pending > 0 && map_has hash_pending id then vec_len (map_get hash_pending id) / 2 else 0) in
-  let plain9 = (if hidx_on id then false
-                else if map_has hidx_off "o" then (match map_get hidx_off "o" with 1 -> false | _ -> true)
-                else true) in
+  let plain9 = not (hidx_on id) in
   let _ = (if plain9 && (if hplain_key k && hpairs_upto (hsettled id) 0 hsmall_max + qn9 < hsmall_max then false else true)
               && hplain_small (hsettled id)
            then (let _ = hpend_fold id in
                  let _ = hidx_start id in
                  if hidx_seed id (hsettled id) then () else hidx_drop id)
+           else ()) in
+  let _ = (if hidx_on id && not (hcbi_fwd id) && (map_has hentry_rows id || hentry_mutable k) then
+             (let _ = (if map_has hentry_rows id then () else hentry_make id (hderef id)) in
+              vec_push (map_get hentry_rows id) (hkey_dig id k))
            else ()) in
   // keep the index in step, or give it up: a key it cannot digest means the
   // index no longer knows everything in this hash.
