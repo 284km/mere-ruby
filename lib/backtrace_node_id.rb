@@ -107,7 +107,21 @@ module RubyVM::AbstractSyntaxTree
     def __nid_names(node)
       case node.type
       when :lambda_node, :block_node then []
-      when :call_node, :constant_read_node, :constant_path_node, :def_node then [node.name]
+      when :call_node
+        names = [node.name]
+        # A literal forwarding target describes the call represented by
+        # this node as well as its sender. Keep ambiguity handling above:
+        # several possible calls still have no uniquely justified node id.
+        if %i[send __send__ public_send const_get].include?(node.name)
+          arg = node.arguments&.arguments&.first
+          if arg && (arg.type == :symbol_node || arg.type == :string_node)
+            target = arg.unescaped
+            target = target.split("::").last || target if node.name == :const_get
+            names << target.to_sym
+          end
+        end
+        names
+      when :constant_read_node, :constant_path_node, :def_node then [node.name]
       when :call_operator_write_node then [node.read_name, node.write_name, node.binary_operator]
       when :call_and_write_node, :call_or_write_node then [node.read_name, node.write_name]
       when :index_operator_write_node then [:[], :[]=, node.binary_operator]

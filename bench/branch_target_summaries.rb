@@ -14,6 +14,15 @@ elsif kind == 'array'
 elsif kind == 'hash'
   value = eval('{' + 50_000.times.map { |i| "a#{i}: 1" }.join(',') + '}')
   p [value.size, value[:a0], value[:a49999]]
+elsif kind == 'implicit' || kind == 'explicit'
+  flag = true
+  sum = 0
+  if kind == 'implicit'
+    iterations.times { if flag; sum += 1; end }
+  else
+    iterations.times { |_i| if flag; sum += 1; end }
+  end
+  p [kind, iterations, sum]
 else
   raise ArgumentError, kind
 end

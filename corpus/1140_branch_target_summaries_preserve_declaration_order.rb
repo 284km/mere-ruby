@@ -79,3 +79,43 @@ end
 case_summary1140(1)
 case_summary1140(2)
 case_summary1140(3)
+
+# Metadata must not introduce unused implicit argument slots into a frame
+# captured by a child Proc. Conservative GC may keep some objects, but it
+# must not retain every unused argument through all the returned children.
+$collected1140 = Hash.new(0)
+def callback1140(tag)
+  proc { |_id| $collected1140[tag] += 1 }
+end
+def if_factory1140
+  proc { if true; proc { :ok }; end }
+end
+def unless_factory1140
+  proc { unless false; proc { :ok }; end }
+end
+def used_factory1140
+  proc { held = _1; if true; proc { held }; end }
+end
+def make_child1140(factory, tag)
+  object = Object.new
+  ObjectSpace.define_finalizer(object, callback1140(tag))
+  factory.call(object)
+end
+def check_retention1140(factory, tag, used)
+  children = Fiber.new { Array.new(100) { make_child1140(factory, tag) } }.resume
+  30.times do
+    100.times { Object.new }
+    GC.start
+  end
+  collected = $collected1140[tag]
+  if used
+    raise 'a used captured argument was collected' unless collected == 0
+    p [tag, children.length, children.first.call.class]
+  else
+    raise 'all unused arguments remain retained by child Procs' unless collected > 0
+    p [tag, children.length, children.first.call]
+  end
+end
+check_retention1140(if_factory1140, :if, false)
+check_retention1140(unless_factory1140, :unless, false)
+check_retention1140(used_factory1140, :used, true)
