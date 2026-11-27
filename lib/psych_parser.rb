@@ -1,3 +1,6 @@
+# (frozen string literals: tools/gen_psych_lib.rb puts the magic comment at the
+#  top of the embedded source. An empty scalar's value is +'', as libyaml's is
+#  not frozen.)
 # YAML event parsing has its own state; loading Ruby objects is a separate visitor.
 module Psych
   class SyntaxError < Exception
@@ -115,7 +118,14 @@ module Psych
           __node(-1)
         end
         token = __peek
-        __error("did not find expected <document start>") unless [:eof, :document, :end_document].include?(token[0])
+        unless [:eof, :document, :end_document].include?(token[0])
+          # libyaml ends the document (implicitly) before it looks for the
+          # start of the next one, so a handler has this document whole --
+          # Psych.parse returns from its block there -- and only then is what
+          # follows it an error.
+          __event(:end_document, [true], token[2], token[2])
+          __error("did not find expected <document start>")
+        end
         explicit_end = token[0] == :end_document
         end_start = token[2]
         end_finish = explicit_end ? __take[3] : end_start
@@ -267,7 +277,7 @@ module Psych
     end
 
     def __empty(at, anchor = nil, tag = nil)
-      __event(:scalar, ['', anchor, tag, tag.nil?, false, 1], at, at)
+      __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], at, at)
     end
 
     def __scan
@@ -432,7 +442,7 @@ module Psych
         value = value.join
         value = value.sub(/\n*\z/, '') if modifiers.include?('-')
         value = value.sub(/\n*\z/, "\n") unless modifiers.include?('-') || modifiers.include?('+') || value.empty?
-        value = '' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
+        value = +'' if !modifiers.include?('+') && lines.all? { |body, _| body.empty? }
         return [:scalar, value, start, __at, style]
       end
       __error('found character that cannot start any token') if ['`', '@', '%', "\t"].include?(c)
@@ -494,7 +504,7 @@ module Psych
         token = __peek
       end
       if property_end && ([:eof, :document, :end_document].include?(token[0]) || (token[2][1] > property_end[1] && token[2][2] <= parent_indent && !(indentless && token[0] == :entry && token[2][2] == parent_indent)))
-        return __event(:scalar, ['', anchor, tag, tag.nil?, false, 1], start, property_end)
+        return __event(:scalar, [+'', anchor, tag, tag.nil?, false, 1], start, property_end)
       end
       if token[0] == :sequence || token[0] == :mapping
         opener = __take

@@ -59,6 +59,12 @@ wrote into one (`RSTRING_PTR(str)[0] = 'x'`, `rb_str_set_len`,
 into it. A frozen String written through its pointer raises FrozenError at
 that point.
 
+A String's bytes reach its mirror straight from the interpreter's String,
+while the request that asks for them is answered: compared with what the
+mirror holds, copied where they differ and hashed, in one pass
+(`mirror.c`, `str_take`). The hash is how a write is found -- at each
+crossing the bytes are hashed again (`write_back`).
+
 A pointer C took stays good across a Fiber switch: a mirror that a C call
 in progress touched is watched -- written back at every crossing -- until
 the last such call has ended, so two Fibers stopped inside C calls that hold
@@ -104,8 +110,10 @@ The collector is the interpreter's own. For the C API it adds:
 - the elements a live Array's or String's mirror holds.
 
 An entry nothing reaches is dropped at the sweep; a data object's `dfree`
-runs then, once. `MERE_RUBY_GC_STRESS=1` collects at every safepoint, and
-the checks below run under it.
+runs then, once. `MERE_RUBY_GC_STRESS=1` collects at every safepoint -- in
+a C call, at every 16th request that makes something (a String's bytes
+fetched, a call, a new String); without it the interpreter is asked whether
+a collection is due at every 32nd -- and the checks below run under it.
 
 ## Exceptions and non-local exits
 
@@ -224,7 +232,11 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   print the same on both sides, and again on this side with a collection at
   every safepoint. Then six guarantees are switched off one at a time
   (`MERE_RUBY_CAPI_WITHOUT=dmark|dfree|ensure|switch|fileprobe|builtin`) and the
-  contracts that depend on each must fail.
+  contracts that depend on each must fail. CI runs it a second time with
+  `--vm`: all of that again with this side on the ISeq VM. The runs start
+  with none of the caller's `MERE_RUBY_*` settings, so `MERE_RUBY_VM=1` in
+  front of the command does nothing -- the flag is how the VM is asked for,
+  and a contract script the VM does not take itself fails the run.
 - The unit test run builds all of `ext/-test-` and runs `test/-ext-` against
   it, file by file, like every other directory of ruby's tests.
 - `tools/capi_mkmf_check.py` (CI, macOS and Linux): an extension whose

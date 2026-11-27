@@ -50,6 +50,42 @@ class TimingCheck(unittest.TestCase):
         self.assertIsNone(row['execution_seconds'])
         self.assertEqual(row['start_delay_seconds'], 11091)
 
+    def test_cancelled_before_job_record_keeps_raw_times_and_unknown_wait(self):
+        # PR309, run45728827971: cancellation materialized dependent jobs
+        # one second after their recorded workflow cancellation time.
+        cancelled = job(id=139607831066, name='corpus', conclusion='cancelled',
+                        created_at='2026-11-26T00:33:11Z',
+                        started_at='2026-11-26T00:33:11Z',
+                        completed_at='2026-11-26T00:33:10Z',
+                        runner_name='', runner_id=0)
+        metadata = run(); metadata['created_at'] = '2026-11-26T00:27:09Z'
+        report = timing.summarize(metadata, [cancelled],
+                                  datetime(2026, 11, 26, 0, 34, tzinfo=timezone.utc))
+        row = report['jobs'][0]
+        for key in ('created_at', 'started_at', 'completed_at'):
+            self.assertEqual(row[key], cancelled[key])
+        self.assertFalse(row['execution_started'])
+        self.assertIsNone(row['execution_seconds'])
+        self.assertIsNone(row['start_delay_seconds'])
+        self.assertEqual(row['start_delay_unavailable_reason'],
+                         'cancellation_precedes_job_record')
+        self.assertEqual(report['unknown_start_delay_jobs'], 1)
+        self.assertEqual(report['sum_start_delay_seconds'], 0)
+        self.assertEqual(report['sum_execution_seconds'], 0)
+        self.assertTrue(report['measured_jobs_complete'])
+        self.assertFalse(report['measured_jobs_successful'])
+        self.assertIn('cancelled', timing.markdown(report))
+
+    def test_cancelled_started_execution_still_rejects_inverted_times(self):
+        with self.assertRaisesRegex(ValueError, 'out of order'):
+            timing.job_timing(job(conclusion='cancelled',
+                                  completed_at='2026-11-18T05:57:29Z'), OBSERVED)
+
+    def test_non_cancelled_unstarted_job_still_rejects_inverted_times(self):
+        with self.assertRaisesRegex(ValueError, 'out of order'):
+            timing.job_timing(job(conclusion='failure', runner_name='', runner_id=0,
+                                  completed_at='2026-11-18T05:57:29Z'), OBSERVED)
+
     def test_skipped_job_and_steps_have_no_execution(self):
         row = timing.job_timing(job(conclusion='skipped', runner_name='', runner_id=0,
                                     steps=[dict(name='step', status='completed', conclusion='skipped',
@@ -57,6 +93,16 @@ class TimingCheck(unittest.TestCase):
                                                 completed_at='2026-11-18T09:02:21Z')]), OBSERVED)
         self.assertIsNone(row['start_delay_seconds'])
         self.assertIsNone(row['steps'][0]['seconds'])
+
+    def test_a_skipped_job_leaves_the_report_complete_and_successful(self):
+        # unittest-vm runs on a schedule and on dispatch only: a push's run skips it.
+        skipped = job(id=11, name='unittest-vm', conclusion='skipped', started_at='2026-11-18T05:57:30Z',
+                      completed_at='2026-11-18T05:57:30Z', runner_name='', runner_id=0)
+        report = timing.summarize(run(), [job(), skipped], OBSERVED)
+        self.assertTrue(report['measured_jobs_complete'])
+        self.assertTrue(report['measured_jobs_successful'])
+        self.assertEqual(report['unknown_start_delay_jobs'], 0)
+        self.assertEqual(report['sum_execution_seconds'], 44)
 
     def test_running_and_cancelled_after_start_keep_elapsed_runtime(self):
         running = timing.job_timing(job(status='in_progress', conclusion=None, completed_at=None), OBSERVED)

@@ -57,12 +57,168 @@ class FrameworkCheck(unittest.TestCase):
         self.assertEqual({'A#test_a': 'MATCH', 'A#test_b': 'RED', 'A#test_c': 'MISSING', 'A#test_d': 'BOTH',
                           'A#test_e': 'BOTH', 'A#test_x': 'EXTRA'}, run.classify(reference, mere))
 
+    @staticmethod
+    def anonymous_case(address, suffix='a', second=None):
+        second = address if second is None else second
+        return f"T#test_#<Class:0x{address}>_matches_#<Class:0x{second}>_{suffix}"
+
+    def test_opaque_class_addresses_require_explicit_policy_and_keep_raw_names(self):
+        rname, mname = self.anonymous_case('0011'), self.anonymous_case('abcd')
+        reference, mere = parsed(transcript({rname: '.'})), parsed(transcript({mname: '.'}))
+        self.assertEqual({rname: 'MISSING', mname: 'EXTRA'}, run.classify(reference, mere))
+        self.assertEqual({rname: 'MATCH'}, run.classify(reference, mere, 'opaque-class-addresses'))
+        self.assertEqual([mname], list(mere['cases']))
+        self.assertEqual({mname: rname}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+        name = 'activesupport/test/example_test.rb'
+        record = dict(files={name: dict(sides=dict(reference=reference, mere=mere))})
+        self.assertFalse(run.all_pass(record, [name]))
+        record['case_identity_policy'] = 'opaque-class-addresses'
+        self.assertTrue(run.all_pass(record, [name]))
+        run.summarize(record)
+        self.assertEqual(1, record['components']['activesupport']['MATCH'])
+        self.assertEqual({mname: rname}, record['files'][name]['case_identity_aliases'])
+        self.assertTrue(record['files'][name]['same_order'])
+
+    def test_opaque_class_aliases_preserve_results_and_require_complete_inventories(self):
+        rname, mname = self.anonymous_case('11'), self.anonymous_case('22')
+        good = parsed(transcript({rname: '.'}))
+        for verdict in 'FES':
+            bad = parsed(transcript({mname: verdict}))
+            self.assertEqual({rname: 'RED'}, run.classify(good, bad, 'opaque-class-addresses'))
+        bad_reference = parsed(transcript({rname: 'F'}))
+        self.assertEqual({rname: 'BOTH'}, run.classify(bad_reference, parsed(transcript({mname: '.'})),
+                                                    'opaque-class-addresses'))
+        for state in ('ZERO', 'INCOMPLETE', 'COUNT_MISMATCH', 'REPORT_MISMATCH', 'WALL_LIMIT',
+                      'MEMORY_LIMIT', 'EXIT_ERROR'):
+            for side in ('reference', 'mere'):
+                reference, mere = good, parsed(transcript({mname: '.'}))
+                if side == 'reference':
+                    reference = dict(reference, state=state)
+                else:
+                    mere = dict(mere, state=state)
+                self.assertEqual({}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+
+    def test_opaque_class_aliases_reject_collisions_and_repeated_address_mismatches(self):
+        rname, mname = self.anonymous_case('11'), self.anonymous_case('22')
+        for reference, mere in (
+            ({rname: '.', self.anonymous_case('33'): '.'}, {mname: '.'}),
+            ({rname: '.'}, {mname: '.', self.anonymous_case('33'): '.'}),
+            ({rname: '.', self.anonymous_case('33'): '.'}, {mname: '.', self.anonymous_case('44'): '.'}),
+            ({rname: '.'}, {self.anonymous_case('22', second='33'): '.'}),
+            ({'T#test_object_#<Object:0x11>': '.'}, {'T#test_object_#<Object:0x22>': '.'}),
+            ({'T#test_literal_0x11': '.'}, {'T#test_literal_0x22': '.'}),
+        ):
+            left, right = parsed(transcript(reference)), parsed(transcript(mere))
+            self.assertEqual({}, run.case_identity_aliases(left, right, 'opaque-class-addresses'))
+            self.assertNotIn('MATCH', run.classify(left, right, 'opaque-class-addresses').values())
+
+    def test_ambiguous_shapes_do_not_reassign_a_literal_match(self):
+        common = self.anonymous_case('11')
+        reference = parsed(transcript({common: '.', self.anonymous_case('22'): '.'}))
+        mere = parsed(transcript({common: '.', self.anonymous_case('33'): '.'}))
+        self.assertEqual(run.classify(reference, mere),
+                         run.classify(reference, mere, 'opaque-class-addresses'))
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, 'opaque-class-addresses'))
+
+    def test_opaque_class_aliases_preserve_bijections_across_test_names(self):
+        left = {self.anonymous_case('11', 'a'): '.', self.anonymous_case('11', 'b'): '.'}
+        consistent = {self.anonymous_case('22', 'a'): '.', self.anonymous_case('22', 'b'): '.'}
+        reference = parsed(transcript(left))
+        self.assertEqual(set(left), set(run.classify(reference, parsed(transcript(consistent)),
+                                                   'opaque-class-addresses')))
+        for right in (
+            {self.anonymous_case('22', 'a'): '.', self.anonymous_case('33', 'b'): '.'},
+            {self.anonymous_case('11', 'a'): '.', self.anonymous_case('22', 'b'): '.'},
+        ):
+            aliases = run.case_identity_aliases(reference, parsed(transcript(right)), 'opaque-class-addresses')
+            self.assertEqual({}, aliases)
+        reference = parsed(transcript({self.anonymous_case('11', 'a'): '.', self.anonymous_case('33', 'b'): '.'}))
+        self.assertEqual({}, run.case_identity_aliases(reference, parsed(transcript(consistent)),
+                                                     'opaque-class-addresses'))
+        with self.assertRaises(ValueError):
+            run.classify(reference, parsed(transcript(consistent)), 'unknown-policy')
+
     def test_partial_transcript_is_not_complete_and_loses_nothing(self):
         cases = {'A#test_a': '.', 'A#test_b': '.'}
         crashed = parsed('A#test_a = 0.01 s = .\n')
         self.assertEqual('INCOMPLETE', crashed['state'])
         verdicts = run.classify(parsed(transcript(cases)), crashed)
         self.assertEqual({'A#test_a': 'MATCH', 'A#test_b': 'MISSING'}, verdicts)
+
+    def test_all_pass_requires_every_selected_file_and_both_inventories(self):
+        name = 'actionpack/test/example_test.rb'
+        healthy = parsed(transcript({'A#test_a': '.', 'A#test_b': '.'}))
+        def record(reference=healthy, mere=healthy):
+            return dict(files={name: dict(sides=dict(reference=reference, mere=mere))})
+        self.assertTrue(run.all_pass(record(), [name]))
+        self.assertFalse(run.all_pass(record(), [name, 'actionpack/test/missing_test.rb']))
+        self.assertFalse(run.all_pass(dict(files={}), []))
+        self.assertFalse(run.all_pass(dict(files={name: dict(sides=dict(mere=healthy))}), [name]))
+        self.assertFalse(run.all_pass(record(mere=parsed(transcript({'A#test_a': '.'}))), [name]))
+        self.assertFalse(run.all_pass(record(mere=parsed(transcript({'A#test_a': '.', 'A#test_b': '.',
+                                                                     'A#test_extra': '.'}))), [name]))
+        for verdict in ('F', 'E', 'S'):
+            bad = parsed(transcript({'A#test_a': '.', 'A#test_b': verdict}))
+            self.assertFalse(run.all_pass(record(mere=bad), [name]))
+            self.assertFalse(run.all_pass(record(reference=bad), [name]))
+        for state in ('ZERO', 'INCOMPLETE', 'COUNT_MISMATCH', 'REPORT_MISMATCH', 'WALL_LIMIT',
+                      'MEMORY_LIMIT', 'EXIT_ERROR'):
+            bad = dict(healthy, state=state)
+            self.assertFalse(run.all_pass(record(mere=bad), [name]))
+            self.assertFalse(run.all_pass(record(reference=bad), [name]))
+
+    def test_logged_output_between_name_and_result_keeps_the_test_identity(self):
+        out = ('A#test_a = W, [timestamp] WARN -- : a real log line\n'
+               'a second diagnostic line\n0.01 s = .\n'
+               'A#test_b = 0.02 s = F\n'
+               '2 runs, 3 assertions, 1 failures, 0 errors, 0 skips\n')
+        result = parsed(out)
+        self.assertEqual('COMPLETE', result['state'])
+        self.assertEqual({'A#test_a': '.', 'A#test_b': 'F'}, result['cases'])
+        missing = parsed('A#test_a = a log line\nA#test_b = 0.02 s = .\n'
+                         '0.01 s = .\n2 runs, 3 assertions, 0 failures, 0 errors, 0 skips\n')
+        self.assertEqual('COUNT_MISMATCH', missing['state'])
+        self.assertEqual({'A#test_b': '.'}, missing['cases'])
+
+    def test_empty_upstream_files_are_accounted_for_without_inventing_tests(self):
+        zero = dict(parsed('0 runs, 0 assertions, 0 failures, 0 errors, 0 skips\n'), exit=0, limit=None)
+        name = 'actionpack/test/controller/new_base/render_xml_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES[name]
+        entry = dict(source_bytes=size, source_sha256=digest, sides=dict(reference=zero, mere=zero))
+        record = dict(files={name: entry})
+        self.assertTrue(run.all_pass(record, [name]))
+        run.summarize(record)
+        self.assertEqual('EMPTY', entry['verdict'])
+        self.assertEqual(0, entry['counts']['MATCH'])
+        self.assertEqual(1, record['components']['actionpack']['empty_files'])
+        self.assertEqual(0, record['components']['actionpack']['reference_unusable'])
+        name = 'actionpack/test/journey/nodes/symbol_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES[name]
+        no_output = dict(parsed(''), exit=0, limit=None)
+        entry = dict(source_bytes=size, source_sha256=digest,
+                     sides=dict(reference=no_output, mere=no_output))
+        record = dict(files={name: entry})
+        self.assertTrue(run.all_pass(record, [name]))
+        entry['source_bytes'] = 100
+        self.assertFalse(run.all_pass(record, [name]))
+        entry['source_bytes'] = size
+        entry['source_sha256'] = 'changed'
+        self.assertFalse(run.all_pass(record, [name]))
+        entry.update(source_sha256=digest, sides=dict(reference=no_output, mere=dict(no_output, exit=1)))
+        self.assertFalse(run.all_pass(record, [name]))
+
+    def test_missing_service_zero_runs_cannot_pass_as_an_empty_file(self):
+        zero = dict(parsed('0 runs, 0 assertions, 0 failures, 0 errors, 0 skips\n'), exit=0, limit=None)
+        name = 'actionpack/test/dispatch/session/mem_cache_store_test.rb'
+        size, digest = run.EMPTY_TEST_SOURCES['actionpack/test/controller/new_base/render_xml_test.rb']
+        entry = dict(source_bytes=size, source_sha256=digest, sides=dict(reference=zero, mere=zero))
+        record = dict(files={name: entry})
+        self.assertFalse(run.all_pass(record, [name]))
+        run.summarize(record)
+        self.assertEqual('REFERENCE_ZERO', entry['verdict'])
+        self.assertEqual(0, entry['counts']['MATCH'])
+        self.assertEqual(0, record['components']['actionpack']['empty_files'])
+        self.assertEqual(1, record['components']['actionpack']['reference_unusable'])
 
     def test_resource_limit_wins_over_a_summary(self):
         text = transcript({'A#test_a': '.'})
@@ -97,6 +253,16 @@ class FrameworkCheck(unittest.TestCase):
         with patch.dict(os.environ, dict(RUBYLIB='/foreign')):
             env = run.environment(Path('/run/mere'), '/stdlib', mere=True)
         self.assertEqual('/stdlib', env['RUBYLIB'])
+
+    def test_framework_startup_libraries_are_shared_by_both_interpreters(self):
+        for mere in (False, True):
+            env = run.side_environment(Path('/run/side'), '/stdlib', mere, {}, framework_bootstrap=True)
+            self.assertEqual('--disable-gems -r' + str(run.ROOT / 'bootstrap.rb'), env['RUBYOPT'])
+
+    def test_default_component_startup_keeps_application_bootstrap(self):
+        for mere in (False, True):
+            env = run.side_environment(Path('/run/side'), '/stdlib', mere, {})
+            self.assertEqual('--disable-gems -r' + str(run.RAILSTEST / 'bootstrap.rb'), env['RUBYOPT'])
 
     def test_shared_settings_reach_both_sides_and_stay_publishable(self):
         # --env: the same setting on both sides, recorded; never a setting the
@@ -146,6 +312,66 @@ class FrameworkCheck(unittest.TestCase):
                 self.assertEqual(1, run.compare(args))
                 args.base, args.new = new, base
                 self.assertEqual(0, run.compare(args))
+
+    def identity_record(self, reference_cases, mere_cases, mere_state=None):
+        reference, mere = parsed(transcript(reference_cases)), parsed(transcript(mere_cases))
+        if mere_state:
+            mere['state'] = mere_state
+        record = dict(case_identity_policy='opaque-class-addresses', files={
+            'activesupport/test/x_test.rb': dict(sides=dict(reference=reference, mere=mere))})
+        run.summarize(record)
+        return record
+
+    def compare_records(self, before, after):
+        with tempfile.TemporaryDirectory() as directory:
+            base, new = Path(directory) / 'base.json', Path(directory) / 'new.json'
+            base.write_text(json.dumps(before))
+            new.write_text(json.dumps(after))
+            args = type('Args', (), dict(base=base, new=new))
+            with open(os.devnull, 'w') as sink, patch('sys.stdout', sink):
+                return run.compare(args)
+
+    def test_compare_opaque_addresses_keeps_passes_and_detects_failures(self):
+        a, b, c, d = [self.anonymous_case(x) for x in ('11', '22', '33', '44')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        self.assertEqual(0, self.compare_records(before, self.identity_record({c: '.'}, {d: '.'})))
+        for verdict in 'FES':
+            self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {d: verdict})))
+        self.assertEqual(1, self.compare_records(before, self.identity_record({c: 'F'}, {d: '.'})))
+
+    def test_compare_opaque_addresses_rejects_incomplete_or_missing_tests(self):
+        a, b, c, d = [self.anonymous_case(x) for x in ('11', '22', '33', '44')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        for state in ('INCOMPLETE', 'COUNT_MISMATCH', 'REPORT_MISMATCH', 'WALL_LIMIT', 'MEMORY_LIMIT'):
+            self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {d: '.'}, state)))
+        self.assertEqual(1, self.compare_records(before, self.identity_record({c: '.'}, {})))
+        self.assertEqual(1, self.compare_records(before, dict(files={}, case_identity_policy='opaque-class-addresses')))
+
+    def test_compare_opaque_addresses_preserves_cross_case_relationships(self):
+        make = self.anonymous_case
+        old = {make('11', 'a'): '.', make('11', 'b'): '.'}
+        consistent = {make('22', 'a'): '.', make('22', 'b'): '.'}
+        inconsistent = {make('22', 'a'): '.', make('33', 'b'): '.'}
+        before = self.identity_record(old, old)
+        self.assertEqual(0, self.compare_records(before, self.identity_record(consistent, consistent)))
+        self.assertEqual(1, self.compare_records(before, self.identity_record(inconsistent, inconsistent)))
+        old = {make('11'): '.', make('22'): '.'}
+        new = {make('33'): '.', make('44'): '.'}
+        self.assertEqual(1, self.compare_records(self.identity_record(old, old), self.identity_record(new, new)))
+
+    def test_compare_opaque_addresses_does_not_hide_extra_name_collisions(self):
+        a, b, c = [self.anonymous_case(x) for x in ('11', '22', '33')]
+        before = self.identity_record({a: '.'}, {b: '.'})
+        after = self.identity_record({c: '.'}, {c: '.', a: '.'})
+        self.assertEqual(1, self.compare_records(before, after))
+
+    def test_compare_refuses_mixed_identity_policies(self):
+        a, b = self.anonymous_case('11'), self.anonymous_case('22')
+        before = self.identity_record({a: '.'}, {b: '.'})
+        after = self.identity_record({a: '.'}, {b: '.'})
+        after.pop('case_identity_policy')
+        with self.assertRaisesRegex(ValueError, 'same supported case identity policy'):
+            self.compare_records(before, after)
 
     def test_jobs_are_bounded(self):
         self.assertEqual(2, run.MAX_JOBS)

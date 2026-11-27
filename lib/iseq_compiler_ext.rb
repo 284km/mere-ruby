@@ -1092,8 +1092,12 @@ class RubyVM::InstructionSequence
         #  stays as it was written -- reaching a value, not its receiver:
         #  ruby 4.0's `for o.x, y in [[1, 2]]` calls x= on the 2. The
         #  sequence is ruby's, and so is what it does.)
+        # (...and a splat's own target is compiled with no state at all, as
+        #  pm_compile_for_node_index hands it NULL: `for *h[:k] in o` writes
+        #  h[:k] with the receiver and the key where they were pushed, no
+        #  topn and nothing left to pop)
         if t.is_a?(Prism::MultiTargetNode) then multi_target(child, t, writes, cleanup, st)
-        else target(child, t, writes, cleanup, st)
+        else target(child, t, writes, cleanup, nil)
         end
         # (the four calls are on the value, with FCALL as ruby writes them:
         #  marked for the VM, to which FCALL is a call without a receiver)
@@ -2034,6 +2038,16 @@ class RubyVM::InstructionSequence
     # (at the top level the scope itself is as a method; from a block ruby
     #  throws TAG_RETURN, which needs the catch table)
     def return_node(u, n, popped)
+      # (a file's own return answers nothing: rb_warn at compile, which a
+      #  file compiled for the VM to run says as ruby says it -- with the
+      #  file and no line. A rescue or an ensure clause's return is the
+      #  scope's around it.)
+      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
+      scope = u
+      scope = scope.parent while (scope.type == :rescue || scope.type == :ensure) && scope.parent
+      if scope.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
+        Warning.warn("#{u.path}: warning: argument of top-level return is ignored\n")
+      end
       unless u.type == :method || u.type == :top
         raise NotImplementedError, "RubyVM::InstructionSequence: return from here is not compiled yet" unless THROUGH.include?(u.type)
         return_value(u, n)
@@ -2041,12 +2055,6 @@ class RubyVM::InstructionSequence
         u.insn(:throw, 1)
         u.insn(:pop) if popped
         return
-      end
-      # (a file's own return answers nothing: rb_warn at compile, which a
-      #  file compiled for the VM to run says as ruby says it)
-      # (rb_warn: nothing at all under -W0, where $VERBOSE is nil)
-      if u.type == :top && u.opts[:vm_file] && n.arguments && !$VERBOSE.nil?
-        Warning.warn("#{u.path}:#{n.location.start_line}: warning: argument of top-level return is ignored\n")
       end
       sp_l = u.new_label
       u.emit_label(sp_l)
@@ -2164,10 +2172,16 @@ class RubyVM::InstructionSequence
         winsn(writes, t, :setconstant, t.name)
       when Prism::ConstantPathTargetNode
         if t.parent then node(u, t.parent, false) else (here(u, t); u.insn(:putobject, Object)) end
-        tn = winsn(writes, t, :topn, 1)
-        mstate_push(st, [tn], 1)
+        # (with no state -- a for loop's splat target -- the parent is
+        #  swapped under the value and written to, as ruby's is)
+        if st.nil?
+          winsn(writes, t, :swap)
+        else
+          tn = winsn(writes, t, :topn, 1)
+          mstate_push(st, [tn], 1)
+        end
         winsn(writes, t, :setconstant, t.name)
-        winsn(cleanup, t, :pop)
+        winsn(cleanup, t, :pop) if st
       when Prism::CallTargetNode
         node(u, t.receiver, false)
         safe = nil
@@ -2177,27 +2191,32 @@ class RubyVM::InstructionSequence
           u.insn(:dup)
           u.insn(:branchnil, safe)
         end
-        tn = winsn(writes, t, :topn, 1)
-        mstate_push(st, [tn], 1)
-        winsn(writes, t, :swap)
+        if st
+          tn = winsn(writes, t, :topn, 1)
+          mstate_push(st, [tn], 1)
+          winsn(writes, t, :swap)
+        end
         flag = CALL_ARGS_SIMPLE
         flag |= CALL_FCALL if t.ignore_visibility?
         winsn(writes, t, :send, CallData.new(t.name, flag, 1, nil), nil)
+        writes << safe if safe && st.nil?
         winsn(writes, t, :pop)
-        writes << safe if safe
-        winsn(cleanup, t, :pop)
+        writes << safe if safe && st
+        winsn(cleanup, t, :pop) if st
       when Prism::IndexTargetNode
         node(u, t.receiver, false)
         argc, flag, kws = setup_args(u, t.arguments, t.block, [t.location.start_line, t.node_id])
         raise NotImplementedError, "RubyVM::InstructionSequence: an index target with keywords is not compiled yet" if kws
-        topns = [winsn(writes, t, :topn, argc + 1)]
-        mstate_push(st, topns, argc + 1)
-        if argc == 0
-          winsn(writes, t, :swap)
-        else
-          # (the update reaches the first argc + 1 of them, not the last)
-          argc.times { topns << winsn(writes, t, :topn, argc + 1) }
-          winsn(writes, t, :topn, argc + 1)
+        if st
+          topns = [winsn(writes, t, :topn, argc + 1)]
+          mstate_push(st, topns, argc + 1)
+          if argc == 0
+            winsn(writes, t, :swap)
+          else
+            # (the update reaches the first argc + 1 of them, not the last)
+            argc.times { topns << winsn(writes, t, :topn, argc + 1) }
+            winsn(writes, t, :topn, argc + 1)
+          end
         end
         ci_argc = argc + 1
         if flag & CALL_ARGS_SPLAT != 0
@@ -2208,8 +2227,10 @@ class RubyVM::InstructionSequence
         flag |= CALL_ARGS_SIMPLE if (flag & (CALL_ARGS_SPLAT | CALL_ARGS_BLOCKARG | CALL_KW_SPLAT)) == 0
         winsn(writes, t, :send, CallData.new(:[]=, flag, ci_argc, nil), nil)
         winsn(writes, t, :pop)
-        winsn(writes, t, :pop) if argc != 0
-        (argc + 1).times { winsn(cleanup, t, :pop) }
+        if st
+          winsn(writes, t, :pop) if argc != 0
+          (argc + 1).times { winsn(cleanup, t, :pop) }
+        end
       when Prism::MultiTargetNode
         before = st.position
         st.position -= 1
@@ -5353,6 +5374,10 @@ class RubyVM::InstructionSequence
       end
       params[:kwrest] = pr[:kwrest] if pr[:kwrest]
       params[:ambiguous_param0] = true if pr[:ambiguous_param0]
+      # (...and that the block is a for loop's: its one parameter has no
+      #  has_lead, so an Array given is not spread over it, as it is over
+      #  `|x,|`'s -- the VM binds it as `|x|`)
+      params[:for] = true if vm && pr[:for]
       params[:accepts_no_kwarg] = true if vm && pr[:no_kwarg]
       # (...and which implicit parameters a block has: N for _1 .. _N, 0 for `it`)
       params[:implicit] = pr[:implicit] if vm && pr[:implicit]

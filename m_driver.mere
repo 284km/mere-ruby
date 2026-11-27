@@ -63,6 +63,8 @@ let core_prelude_a =
   "      bs = ENV.delete(\"BUNDLER_SETUP\")\n" ++
   "      begin\n" ++
   "        require 'rubygems'\n" ++
+  "        require 'bundled_gems'\n" ++
+  "        require 'error_highlight' if Box.__error_highlight\n" ++
   "      ensure\n" ++
   "        ENV[\"BUNDLER_SETUP\"] = bs if bs\n" ++
   "      end\n" ++
@@ -4659,7 +4661,7 @@ let core_prelude_d =
   "  end\n" ++
   "\n" ++
   "  # [[fd, interest], ...] -> the ready bits per entry; a nil fd is a File\n" ++
-  "  def self.__sel_wait(ent, ms, scheduler_wait = true)\n" ++
+  "  def self.__sel_wait(ent, ms, scheduler_wait = true, select_poll = false)\n" ++
   "    fds = []\n" ++
   "    ints = []\n" ++
   "    ent.each do |fd, b|\n" ++
@@ -4668,7 +4670,7 @@ let core_prelude_d =
   "      if i then ints[i] |= b else fds << fd; ints << b end\n" ++
   "    end\n" ++
   "    now = ent.any? \{ |fd, _| fd.nil? } ? 0 : ms\n" ++
-  "    got = IO.__poll(fds, ints, 0)\n" ++
+  "    got = select_poll ? IO.__select_poll(fds, ints, 0) : IO.__poll(fds, ints, 0)\n" ++
   "    if got.all? \{ |b| b == 0 } && now != 0 && !ent.any? \{ |fd, _| fd.nil? }\n" ++
   "      scheduler = Fiber.current_scheduler\n" ++
   "      if scheduler_wait && scheduler && ent.size == 1 && ent[0][2]\n" ++
@@ -4755,7 +4757,7 @@ let core_prelude_d =
   "    sets[2].each \{ |o, io| ent << [io.__sel_fd, 8, io] }\n" ++
   "    # bytes #getc read ahead are ready now, whatever the descriptor says\n" ++
   "    ms = 0 if sets[0].any? \{ |o, io| io.__sel_pending? }\n" ++
-  "    got = __sel_wait(ent, ms, false)\n" ++
+  "    got = __sel_wait(ent, ms, false, true)\n" ++
   "    nr = sets[0].size\n" ++
   "    rd = []\n" ++
   "    sets[0].each_with_index do |pair, i|\n" ++
@@ -6348,9 +6350,25 @@ let core_prelude_f =
   "  @__kids = \{}\n" ++
   "  @__kid_n = 0\n" ++
   "\n" ++
+  // Internal scratch files need the same usable-directory checks as tmpdir.
+  // Rails may point TMPDIR at a directory that has not been created.
   "  def self.__kid_dir\n" ++
-  "    d = ENV[\"TMPDIR\"] || \"/tmp\"\n" ++
-  "    d.end_with?(\"/\") ? d[0..-2] : d\n" ++
+  "    paths = [ENV[\"TMPDIR\"], ENV[\"TMP\"], ENV[\"TEMP\"], \"/tmp\", \".\"]\n" ++
+  "    i = 0\n" ++
+  "    while i < paths.length\n" ++
+  "      path = paths[i]\n" ++
+  "      i += 1\n" ++
+  "      next if path.nil? || path.empty?\n" ++
+  "      begin\n" ++
+  "        stat = File.stat(path)\n" ++
+  "      rescue SystemCallError\n" ++
+  "        next\n" ++
+  "      end\n" ++
+  "      next unless stat.directory? && File.writable?(path)\n" ++
+  "      next if stat.world_writable? && !stat.sticky?\n" ++
+  "      return File.expand_path(path)\n" ++
+  "    end\n" ++
+  "    raise ArgumentError, \"could not find a temporary directory\"\n" ++
   "  end\n" ++
   "\n" ++
   "  def self.__str_arg(a)\n" ++
@@ -6449,6 +6467,30 @@ let core_prelude_f =
   "    end\n" ++
   "  end\n" ++
   "\n" ++
+  "  # The child's standard three are BLOCKING, as ruby makes them just before\n" ++
+  "  # exec (process.c, stdfd_clear_nonblock: \"many programs cannot deal with\n" ++
+  "  # non-blocking stdin/stdout/stderr\"). An IO.pipe's ends are non-blocking\n" ++
+  "  # here as in ruby, and a child handed one as its stdout stopped at the\n" ++
+  "  # first full pipe -- curl's \"Resource temporarily unavailable\" after 64 KB,\n" ++
+  "  # puma's test_form_data_encoding_windows. The flag is the open file\n" ++
+  "  # description's, which the parent's copy shares, so clearing it here before\n" ++
+  "  # the child starts is what ruby's child does to it after fork. Each of 0, 1\n" ++
+  "  # and 2 is the descriptor a redirect gives it (a [:child, fd] one: that\n" ++
+  "  # fd's), or this process's own when none does; a file a redirect opens is\n" ++
+  "  # opened blocking, and a closed one is nothing to clear.\n" ++
+  "  def self.__std_blocking(rdl, latel)\n" ++
+  "    src = ->(f) do\n" ++
+  "      r = rdl.find \{ |g, _| g == f }\n" ++
+  "      next f if r.nil?\n" ++
+  "      v = r[1]\n" ++
+  "      v = v.to_io if !v.is_a?(IO) && !v.is_a?(Integer) && v.respond_to?(:to_io)\n" ++
+  "      v.is_a?(Integer) ? v : v.is_a?(IO) ? v.fileno : v == :in ? 0 : v == :out ? 1 : v == :err ? 2 : nil\n" ++
+  "    end\n" ++
+  "    [0, 1, 2].map do |f|\n" ++
+  "      l = latel.find \{ |g, _| g == f }\n" ++
+  "      l ? (l[1].is_a?(Integer) ? src.(l[1]) : nil) : src.(f)\n" ++
+  "    end.compact.uniq.each \{ |fd| IO.__fdblock(fd) if fd >= 0 }\n" ++
+  "  end\n" ++
   "  # spawn's direct path: argv and the environment as proc_spawn takes them,\n" ++
   "  # the redirects as file actions. Every SOURCE is first copied to a high\n" ++
   "  # descriptor of its own and only then put in place, so a rotation\n" ++
@@ -6761,6 +6803,7 @@ let core_prelude_f =
   "    #   deadlocked). The shell path opens it in the child's own shell.\n" ++
   "    fifo = rdl.any? \{ |_, v| pth = v.is_a?(Array) ? v[0] : v; pth.is_a?(String) && File.pipe?(pth) }\n" ++
   "    raise NotImplementedError, \"a new session needs the direct spawn\" if pty_session && (shell_only || fifo)\n" ++
+  "    __std_blocking(rdl, latel)\n" ++
   "    unless shell_only || fifo\n" ++
   "      STDOUT.flush\n" ++
   "      STDERR.flush\n" ++
@@ -6940,9 +6983,40 @@ let core_prelude_f =
   "    nil\n" ++
   "  end\n" ++
   "\n" ++
+  "  def self.__wait_flags(value)\n" ++
+  "    if value.is_a?(Float)\n" ++
+  "      unless value >= -9223372036854775808 && value < 18446744073709551616\n" ++
+  "        raise RangeError, \"float #\{'%-.10g' % value} out of range of integer\"\n" ++
+  "      end\n" ++
+  "      value = value.to_i\n" ++
+  "    elsif !value.is_a?(Integer)\n" ++
+  "      unless value.respond_to?(:to_int, true)\n" ++
+  "        name = value.equal?(true) || value.equal?(false) ? value.to_s : value.class.to_s\n" ++
+  "        raise TypeError, \"no implicit conversion of #\{name} into Integer\"\n" ++
+  "      end\n" ++
+  "      converted = value.__send__(:to_int)\n" ++
+  "      unless converted.is_a?(Integer)\n" ++
+  "        raise TypeError, \"can't convert #\{value.class} to Integer (#\{value.class}#to_int gives #\{converted.class})\"\n" ++
+  "      end\n" ++
+  "      value = converted\n" ++
+  "    end\n" ++
+  "    if value >= -2147483648 && value <= 4294967295\n" ++
+  "      return value > 2147483647 ? value - 4294967296 : value\n" ++
+  "    end\n" ++
+  "    if value > 18446744073709551615 || value < -18446744073709551615\n" ++
+  "      raise RangeError, \"bignum too big to convert into 'unsigned long'\"\n" ++
+  "    elsif value < -9223372036854775808\n" ++
+  "      raise RangeError, 'bignum out of range of unsigned long'\n" ++
+  "    elsif value < -2147483648\n" ++
+  "      raise RangeError, \"integer #\{value} too small to convert to 'unsigned int'\"\n" ++
+  "    else\n" ++
+  "      raise RangeError, \"integer #\{value} too big to convert to 'unsigned int'\"\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
   "  def self.wait(pid = -1, flags = 0)\n" ++
   "    pid = __to_pid(pid)\n" ++
-  "    flags = 0 if flags.nil?\n" ++
+  "    flags = flags.nil? ? 0 : __wait_flags(flags)\n" ++
   "    # a non-blocking fiber's Fiber scheduler waits with its process_wait,\n" ++
   "    # which answers a Process::Status (rb_process_status_wait; anything\n" ++
   "    # else is rb_waitpid's TypeError)\n" ++
@@ -7070,10 +7144,10 @@ let core_prelude_f =
   "\n" ++
   "  # ⚠ THE UNIT was ignored entirely: every clock_gettime answered a float\n" ++
   "  #   second whatever was asked for, so `clock_gettime(c, :nanosecond)` -- which\n" ++
-  "  #   ruby answers with an Integer -- came back as a Float of seconds. The unit\n" ++
-  "  #   is the part of this call a caller can actually observe here, because\n" ++
-  "  #   Most clocks retain the wall reader. The process CPU clock uses the\n" ++
-  "  #   native CPU reader shared with GC::Profiler, never elapsed wall time.\n" ++
+  "  #   ruby answers with an Integer -- came back as a Float of seconds. __in_unit\n" ++
+  "  #   converts it now. Each clock reads its own kind of clock (see\n" ++
+  "  #   clock_gettime below). The process\n" ++
+  "  #   CPU clock uses the native CPU reader shared with GC::Profiler.\n" ++
   "  UNITS = [:float_second, :float_millisecond, :float_microsecond,\n" ++
   "           :second, :millisecond, :microsecond, :nanosecond].freeze\n" ++
   "\n" ++
@@ -7117,13 +7191,36 @@ let core_prelude_f =
   "  end\n" ++
   "  private_class_method :__clock_check\n" ++
   "\n" ++
+  "  # ⚠ Every clock but the process CPU one read the WALL clock, which goes\n" ++
+  "  #   back when the time is set: minitest (CLOCK_MONOTONIC) timed a test at\n" ++
+  "  #   -3.35 s. Each clock now reads its own kind of clock (the kinds are\n" ++
+  "  #   listed in tools/process_glue.c's mr_clock_read); the CLOCK_ numbers\n" ++
+  "  #   are darwin's everywhere, so the runtime is told the kind, not them.\n" ++
+  "  #   TIME_BASED_ is time(2), whole seconds; TIMES_BASED_ is times(2), in\n" ++
+  "  #   hundredths -- a monotonic reading cut to that, as on linux.\n" ++
+  "  def self.__clock_kind(clock)\n" ++
+  "    case clock\n" ++
+  "    when CLOCK_REALTIME, :GETTIMEOFDAY_BASED_CLOCK_REALTIME, :TIME_BASED_CLOCK_REALTIME then 0\n" ++
+  "    when CLOCK_MONOTONIC_RAW then 2\n" ++
+  "    when CLOCK_UPTIME_RAW, :MACH_ABSOLUTE_TIME_BASED_CLOCK_MONOTONIC then 3\n" ++
+  "    when CLOCK_THREAD_CPUTIME_ID then 4\n" ++
+  "    when CLOCK_MONOTONIC_RAW_APPROX then 5\n" ++
+  "    when CLOCK_UPTIME_RAW_APPROX then 6\n" ++
+  "    else 1\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  private_class_method :__clock_kind\n" ++
+  "\n" ++
   "  def self.clock_gettime(clock, unit = :float_second)\n" ++
   "    clock = __clock_check(clock, \"clock_gettime\")\n" ++
-  "    if clock == CLOCK_PROCESS_CPUTIME_ID\n" ++
+  "    if clock == CLOCK_PROCESS_CPUTIME_ID || (clock.is_a?(Symbol) && clock.end_with?(\"_CLOCK_PROCESS_CPUTIME_ID\"))\n" ++
   "      seconds = __process_cpu\n" ++
   "      raise NotImplementedError, 'this platform has no process CPU clock' if seconds < 0\n" ++
   "    else\n" ++
-  "      seconds = __clock_raw\n" ++
+  "      seconds = __clock_read(__clock_kind(clock))\n" ++
+  "      raise Errno::EINVAL, \"clock_gettime(#\{clock.inspect})\" if seconds < 0\n" ++
+  "      seconds = seconds.floor.to_f if clock == :TIME_BASED_CLOCK_REALTIME\n" ++
+  "      seconds = (seconds * 100).floor / 100.0 if clock == :TIMES_BASED_CLOCK_MONOTONIC\n" ++
   "    end\n" ++
   "    __in_unit(seconds, unit)\n" ++
   "  end\n" ++
@@ -7131,7 +7228,7 @@ let core_prelude_f =
   "  # ⚠ The three SYMBOL clocks have resolutions ruby documents, so they are\n" ++
   "  #   answered as documented. The numeric ones are \"observed\", and the spec\n" ++
   "  #   only requires <= 10ms; one microsecond is what a gettimeofday-based\n" ++
-  "  #   clock gives and is the honest claim for the one behind __clock_raw.\n" ++
+  "  #   clock gives and is the honest claim for the ones behind __clock_read.\n" ++
   "  # (:hertz is the resolution's reciprocal, and only getres takes it)\n" ++
   "  def self.clock_getres(clock, unit = :float_second)\n" ++
   "    __clock_check(clock, \"clock_getres\")\n" ++
@@ -7187,6 +7284,7 @@ let core_prelude_f =
   "      'LDSHARED' => darwin ? '$(CC) -bundle' : '$(CC) -shared',\n" ++
   "      'LDSHAREDXX' => darwin ? '$(CXX) -bundle' : '$(CXX) -shared',\n" ++
   "      'OUTFLAG' => '-o ', 'COUTFLAG' => '-o ', 'CSRCFLAG' => '', 'CPPOUTFILE' => '-o conftest.i',\n" ++
+  "      'SOEXT' => darwin ? 'dylib' : 'so',\n" ++
   "      'OBJEXT' => 'o', 'LIBEXT' => 'a', 'ASMEXT' => 'S',\n" ++
   // (ENABLE_SHARED is not said. "no" would be true -- there is no libruby --
   //  but RubyGems names the directory of a gem's built extensions after it
@@ -9385,7 +9483,7 @@ let core_prelude_j =
   "# sequence and #to_a carries the header ruby's has.\n" ++
   "# (run at the top level, as main, in a scope of its own: a top-level `x = 1`\n" ++
   "#  in the sequence is not the caller's x, and a `def` defines on Object)\n" ++
-  "def __isq_eval(__isq_src, __isq_file, __isq_line) = eval(__isq_src, nil, __isq_file, __isq_line)\n" ++
+  "def __isq_eval(__isq_src, __isq_file, __isq_line, __isq_original = nil) = eval(__isq_src, nil, __isq_file, __isq_line)\n" ++
   "private :__isq_eval\n" ++
   "class RubyVM\n" ++
   // (whether the parser keeps a script's lines for AST#script_lines: the
@@ -9393,6 +9491,24 @@ let core_prelude_j =
   "  def self.keep_script_lines = (@__ksl ||= false)\n" ++
   "  def self.keep_script_lines=(v)\n" ++
   "    @__ksl = v ? true : false\n" ++
+  "  end\n" ++
+  // (vm_stat: ruby's counters of its inline constant caches, class variable
+  //  state and object shapes, by name or into a Hash. This interpreter keeps
+  //  none of them, and counts 0 for each; the names, the Hash filled in
+  //  place and the errors are ruby's)
+  "  def self.stat(*a)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given #\{a.size}, expected 0..1)\" if a.size > 1\n" ++
+  "    keys = %i[constant_cache_invalidations constant_cache_misses global_cvar_state next_shape_id shape_cache_size]\n" ++
+  "    arg = a.empty? ? \{} : a[0]\n" ++
+  "    case arg\n" ++
+  "    when Symbol\n" ++
+  "      raise ArgumentError, \"unknown key: #\{arg.name}\" unless keys.include?(arg)\n" ++
+  "      0\n" ++
+  "    when Hash\n" ++
+  "      keys.each \{ |k| arg[k] = 0 }\n" ++
+  "      arg\n" ++
+  "    else raise TypeError, \"non-hash or symbol given\"\n" ++
+  "    end\n" ++
   "  end\n" ++
   // (the two thread sizes that are this interpreter's own: the VM stack size
   //  its call depth budget follows (m_state), and the machine stack a thread
@@ -9427,7 +9543,7 @@ let core_prelude_j =
   "      code = src.b\n" ++
   "      code.sub!(/\\A(?:\\xef\\xbb\\xbf)?(\\s*\\#.*$)*(\\n)?/n) \{ \"#$&#\{\"\\n\" if $1 && !$2}BEGIN\{throw :__isq_ok, :ok}\\n\" }\n" ++
   "      code = code.force_encoding(src.encoding)\n" ++
-  "      catch(:__isq_ok) \{ TOPLEVEL_BINDING.receiver.__send__(:__isq_eval, code, file, line - 1) }\n" ++
+  "      catch(:__isq_ok) \{ TOPLEVEL_BINDING.receiver.__send__(:__isq_eval, code, file, line - 1, src) }\n" ++
   "    end\n" ++
   "    def self.compile(src, file = nil, path = nil, line = 1, opt = nil, **kw)\n" ++
   "      # (a File is read by its path, open or closed: pm_load_parse_file)\n" ++
@@ -9843,11 +9959,12 @@ let core_prelude_j =
   "      raise RuntimeError, \"cannot get AST for ISEQ compiled by prism\"\n" ++
   "    end\n" ++
   "    # (the node of the file's Prism tree the frame was running: see\n" ++
-  "    #  Prism.__node_id_for_location in lib/prism_ext.rb)\n" ++
+  "    #  the helper in lib/backtrace_node_id.rb)\n" ++
   "    def self.node_id_for_backtrace_location(loc)\n" ++
   "      raise TypeError, \"Thread::Backtrace::Location object expected\" unless loc.class.name == \"Thread::Backtrace::Location\"\n" ++
   "      require \"prism\"\n" ++
-  "      Prism.__node_id_for_location(loc)\n" ++
+  "      require \"mere/backtrace_node_id\"\n" ++
+  "      __node_id_for_location(loc)\n" ++
   "    end\n" ++
   "    def self.parse_file(path, **kw)\n" ++
   "      src = File.read(path)\n" ++
@@ -12678,6 +12795,15 @@ let store_stats = fn world ->
   let _ = row "bytes_arr_store" (map_bytes arr_store) in
   let _ = row "bytes_hash_store" (map_bytes hash_store) in
   let _ = row "bytes_ivars" (map_bytes ivars) in
+  // (note 559 step 2b: the shaped objects, the slab's slots and arena, the shapes)
+  let _ = row "obj_iv" (map_len obj_iv) in
+  let _ = row "iv_slab_slots" (vec_len iv_slab) in
+  let _ = row "iv_shapes" (sh_count ()) in
+  let _ = row "sh_cls_var" (map_len sh_cls_var) in
+  let _ = row "sh_cls_cap" (map_len sh_cls_cap) in
+  let _ = row "bytes_obj_iv" (map_bytes obj_iv) in
+  let _ = row "bytes_iv_slab" (vec_bytes iv_slab) in
+  let _ = row "bytes_sh_slot" (map_bytes sh_slot) in
   let _ = row "bytes_ocls" (map_bytes ocls) in
   let _ = row "bytes_meths" (map_bytes meths) in
   // Logical method counts alone do not show which definition metadata
@@ -12722,8 +12848,8 @@ let store_stats = fn world ->
   // the compaction would look like the memory vanished when it only left the
   // frame the other meter can see.
   let _ = row "bytes_call_names" (map_bytes call_names_s) in
-  let _ = row "bytes_call_files" (map_bytes call_files_s) in
-  let _ = row "bytes_call_meths" (map_bytes call_meths_s) in
+  let _ = row "bytes_call_files" (map_bytes call_file_ids) in
+  let _ = row "bytes_call_meths" (map_bytes call_meth_ids) in
   let _ = row "pos_names" (vec_len pos_names) in
   let _ = row "isa_memo" (map_len isa_memo) in
   let _ = row "bytes_isa_memo" (map_bytes isa_memo) in
@@ -12797,7 +12923,7 @@ let cli_syntax_report = fn (name: str) ->
 // with the class after its first line. The eval is parse-only (cli_opt
 // "evpo": a source that parses there runs nothing); what it cannot say keeps
 // the short report.
-let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+let cli_syntax_message = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (held9: bool) ->
   let (_, _, _, iv9) = world in
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let _ = map_set cli_opt "evpo" "y" in
@@ -12806,10 +12932,17 @@ let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) ->
   let m9 = (if ok9 then ""
             else (match (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) with
                   | VNil -> ""
-                  | e9 -> (match try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil with
+                  | e9 -> (match (if held9 then exc_msg_held world e9
+                                  else try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil) with
                            | VStr h9 -> sget h9
                            | _ -> ""))) in
   let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+  m9;
+// Constructing the printer's exception uses the held parser message, so a
+// user #message override runs only when detailed_message asks it. The plain
+// printer retains its existing normal #message dispatch.
+let cli_syntax_framed = fn env -> fn world -> fn (name: str) -> fn (src: str) -> fn (dflt: str) ->
+  let m9 = cli_syntax_message env world name src false in
   if str_eq m9 "" then dflt
   else (let nl9 = str_find_from m9 "\n" 0 in
         if nl9 < 0 then name ++ ": " ++ m9 ++ " (SyntaxError)"
@@ -12902,7 +13035,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
     if map_has enc_objs nm then map_get enc_objs nm else
     let id = alloc_oid ocls in
     let _ = map_set ocls id "Encoding" in
-    let _ = iv_put ivars (str_of_int id ++ "@name") (mkstr nm) in
+    let _ = iv_set ivars id "name" (mkstr nm) in
     let o = VObj id in
     let _ = map_set enc_objs nm o in
     let _ = map_set enc_alias_canon (enc_norm_name nm) nm in
@@ -13015,8 +13148,8 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   //   answered [] and nil for everything). Its local_variables are the names
   //   the script DECLARES -- all of them, known when it was parsed, as ruby's
   //   are -- plus any set through the binding itself (tl_decl / tl_dyn).
-  let _ = (let _ = map_set env "__cref" (mkstr "") in
-           let _ = map_set env "self" VMain in
+  let _ = (let _ = fh_cref_set env (mkstr "") in
+           let _ = fh_self_set env VMain in
            let bid = (handle_base + map_len bind_store) in
            let _ = map_set bind_store (str_of_int bid) env in
            let _ = map_set tl_bid "v" bid in
@@ -13046,6 +13179,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = set_meth meths "(sng:Kernel)#require_relative"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
   let _ = set_meth meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("__exception_message", EVar "msg"), Nil))) in
+  let _ = set_private "Exception#initialize" VNil in
   // An Errno class's message is the SYSTEM's text, and `.new` has to say the
   // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
   // not the class name, and with an argument it reads "<text> - <arg>". raise
@@ -13138,6 +13272,9 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
            Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (ESym "INT", Nil))),
              Cons (SIVarAssign ("__exception_message",
                      EBin ("||", EVar "msg", EStrL "Interrupt")), Nil)))) in
+  let _ = set_private "SystemCallError#initialize" VNil in
+  let _ = set_private "SignalException#initialize" VNil in
+  let _ = set_private "Interrupt#initialize" VNil in
   let _ = set_meth meths "SignalException#signo"
     (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
   // #signm is the MESSAGE, not the resolved name: `SignalException.new(2)`
@@ -13420,7 +13557,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = warn_flush world in
   let _ = register_builtin_consts () in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
-  let _ = lv_set env "self" VMain in   // top-level self is `main`
+  let _ = fh_self_lv_set env VMain in   // top-level self is `main`
   // the top-level env is the main stack's bottom frame for the fiber reclaim
   // pass, which may run in the middle of a statement (fb_env_at, key -1)
   let _ = map_set fb_env_at (0 - 1) env in
@@ -13479,7 +13616,8 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   // are globals holding the same objects.
   let outid = alloc_oid ocls in
   let _ = map_set ocls outid "IO" in
-  let _ = iv_put ivars (str_of_int outid ++ "@__io_fd") (VInt 1) in
+  let _ = iv_set ivars outid "__io_fd" (VInt 1) in
+  let _ = iv_set ivars outid "__io_label" (mkstr_e "<STDOUT>" "ASCII-8BIT") in
   // The RUBY_* description constants. RUBY_ENGINE says "ruby" rather than
   // "mere-ruby" on purpose: every gate here is a byte comparison against
   // MRI, so MRI's is the behaviour being emulated, and a library that
@@ -13609,7 +13747,14 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
                      //  hands this to that library's configure.)
                      Cons (mkstr "host", Cons (mkstr (rcpu ++ "-" ++ rvend ++ "-" ++ ros ++ (if str_eq (mr_capi_libc ()) "" then "" else "-" ++ mr_capi_libc ())),
                      Cons (mkstr "host_alias", Cons (mkstr "",
-                     rbc_facts))))))))))))
+                     // (the OpenSSL the build linked, as ruby's configure is
+                     //  told it -- mkmf's dir_config("openssl") reads it from
+                     //  here, and an extension with TLS of its own, puma's
+                     //  MiniSSL, finds the same headers and library. No
+                     //  directory named, no argument: the prelude's '' stands.)
+                     (if str_eq (mr_capi_openssl_dir ()) "" then rbc_facts
+                      else Cons (mkstr "configure_args", Cons (mkstr ("'--with-openssl-dir=" ++ mr_capi_openssl_dir () ++ "'"),
+                      rbc_facts)))))))))))))))
                    else rbc_facts) in
   let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr ros, Cons (mkstr "arch", Cons (mkstr rarch, Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "EXECUTABLE_EXTS", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr (rlp ++ "/site_ruby/" ++ rver), Cons (mkstr "rubylibprefix", Cons (mkstr rlpgem, Cons (mkstr "rubylibdir", Cons (mkstr rld, Cons (mkstr "rubyarchdir", Cons (mkstr rad, Cons (mkstr "DLEXT", Cons (mkstr (if str_eq (sys_os ()) "darwin" then "bundle" else "so"), Cons (mkstr "UNICODE_VERSION", Cons (mkstr "17.0.0", Cons (mkstr "UNICODE_EMOJI_VERSION", Cons (mkstr "17.0", rbc_facts))))))))))))))))))))))))))))))) in
   // UNICODE_VERSION / UNICODE_EMOJI_VERSION are the REFERENCE ruby's, asked of
@@ -13745,19 +13890,21 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = map_set globals "stdout" (VObj outid) in
   let errid = alloc_oid ocls in
   let _ = map_set ocls errid "IO" in
-  let _ = iv_put ivars (str_of_int errid ++ "@__io_fd") (VInt 2) in
+  let _ = iv_set ivars errid "__io_fd" (VInt 2) in
+  let _ = iv_set ivars errid "__io_label" (mkstr_e "<STDERR>" "ASCII-8BIT") in
   let _ = const_tbl_put "STDERR" (VObj errid) in
   let _ = map_set globals "stderr" (VObj errid) in
   let inid = alloc_oid ocls in
   let _ = map_set ocls inid "IO" in
-  let _ = iv_put ivars (str_of_int inid ++ "@__io_fd") (VInt 0) in
+  let _ = iv_set ivars inid "__io_fd" (VInt 0) in
+  let _ = iv_set ivars inid "__io_label" (mkstr_e "<STDIN>" "ASCII-8BIT") in
   let _ = const_tbl_put "STDIN" (VObj inid) in
   let _ = map_set globals "stdin" (VObj inid) in
   // the main Thread object (always index 0 of the registry), the default
   // ThreadGroup, and the thread-related constants.
   let mainid = alloc_oid ocls in
   let _ = map_set ocls mainid "Thread" in
-  let _ = iv_put ivars (str_of_int mainid ++ "@__tst") (mkstr "run") in
+  let _ = iv_set ivars mainid "__tst" (mkstr "run") in
   let _ = map_set cur_thr "v" (VObj mainid) in
   let _ = map_set cur_thr "t" (VObj mainid) in
   let _ = map_set all_thr "0" (VObj mainid) in
@@ -13767,6 +13914,7 @@ let driver_setup = fn env -> fn (src: str) -> fn (name: str) ->
   let _ = map_set sch_fb mainid 0 in
   // (a long division looks at the scheduler and the traps too: m_numeric.mere)
   let _ = map_set long_op_hook 0 (fn (u: unit) -> long_op_tick world) in
+  let _ = map_set public_big_float_hook 0 (fn (u9: unit) -> numeric_float_overflow_warning world) in
   let tgid = alloc_oid ocls in
   let _ = map_set ocls tgid "ThreadGroup" in
   let _ = map_set dfl_tg "v" (VObj tgid) in
@@ -13976,7 +14124,12 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  operating_system.rb warns and re-raises, test_rubygems)
   let gems_ok = (if str_eq (env_get "MERE_RUBY_NO_GEMS") "" && (if map_has cli_opt "nogems" then false else true)
               && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
-           then try_or_msg (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> let _ = vec_set box_st 4 1 in true))
+           then try_or_msg (fn (u: unit) ->
+                  (let _ = do_require env world noblk false "rubygems" in
+                   let _ = vec_set box_st 4 1 in
+                   let _ = do_require env world noblk false "bundled_gems" in
+                   let _ = (if map_has cli_opt "noerror_highlight" then ()
+                            else (let _ = do_require env world noblk false "error_highlight" in ())) in true))
                   (fn (m: str) -> let _ = note_extern_refused m in false)
            else true) in
   // -r's libraries, required as the script itself would require them.
@@ -13984,7 +14137,14 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //   raising BEGIN does (pre_ok below): reported, at_exit, nothing else
   //   runs. It went to the runtime as "fail: mere-ruby: (ruby exception
   //   raised)", naming nothing.
-  let req_ok = gems_ok && (if map_has cli_reqs "v" then
+  // CRuby's gem_prelude loads this before -r libraries and the main script.
+  // Keeping that order also preserves user prepends to detailed_message.
+  let diagnostics_ok = gems_ok &&
+    (if map_has cli_opt "nosyntax_suggest" || map_has cli_opt "nogems"
+        || (if str_eq (env_get "MERE_RUBY_NO_GEMS") "" then false else true) then true
+     else try_or_msg (fn (u9: unit) -> (let _ = do_require env world noblk false "syntax_suggest/core_ext" in true))
+            (fn (message9: str) -> let _ = note_extern_refused message9 in false)) in
+  let req_ok = diagnostics_ok && (if map_has cli_reqs "v" then
              (let rec reqs9 = fn (xs: str list) ->
                 (match xs with
                  | Nil -> ""
@@ -14014,10 +14174,24 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
              else (let (_, _, ocls9, ivars9) = world in
               let txt9 = (if has_meth world "SyntaxError" "detailed_message" then
                             (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr (map_get cli_opt "synmsg"), Nil)) false) VNil with
+                             // Ruby appends a newline to every -e fragment (ruby.c,
+                             // add_e_script). Our fragments already contain separators;
+                             // include the final newline in Prism's actual CLI input.
+                             // Its EOF diagnostics can differ from eval of the raw text.
+                             let source9 = (if str_eq name "-e" then src ++ "\n" else src) in
+                             let report9 = try_or (fn (u: unit) -> prism_report source9 name 1) "" in
+                             let frame9 = (if str_len report9 > 0 then report9
+                                           else cli_syntax_message env world name src true) in
+                             // Construct from the held parser message. Only the real
+                             // detailed_message dispatch may invoke a user's #message.
+                             let message9 = (if str_len frame9 > 0 then frame9 else map_get cli_opt "synmsg") in
+                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr message9, Nil)) false) VNil with
                              | VObj eid9 ->
-                               (let _ = iv_put ivars9 (str_of_int eid9 ++ "@__path") (mkstr name) in
-                                match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message" Nil false) VNil with
+                               (let _ = iv_set ivars9 eid9 "__path" (mkstr name) in
+                                match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message"
+                                         (let options9 = mkhash (Cons (VSym "highlight", Cons (VBool false, Nil))) in
+                                          let _ = (match options9 with VHsh id9 -> mark_kw id9 | _ -> ()) in
+                                          Cons (options9, Nil)) false) VNil with
                                 | VStr h9 -> name ++ ": " ++ sget h9
                                 | _ -> map_get cli_opt "synerr")
                              | _ -> map_get cli_opt "synerr")
@@ -14139,6 +14313,8 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
   //  of it, when it takes the whole file: main.mere's vm_file_stmts)
   let gc_mids = (if req_ok && pre_st == 0 && (if embedded then false else true) && map_has cli_opt "vm"
                  then vm_file_stmts env world noblk src name "<main>" gc_mids else gc_mids) in
+  // (ruby's warning of a top-level `return <value>`, before the script runs)
+  let _ = (if req_ok && pre_st == 0 && (if embedded then false else true) then top_ret_warn world name gc_mids else ()) in
   let gc_total = list_len gc_mids in
   let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -14250,8 +14426,8 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
             // with the status it carries and says nothing: that is what exit
             // means. Everything else is reported.
             if str_eq ec "SystemExit" || str_list_has (ancestors_of world ec) "SystemExit" then
-              (let st = (if map_has ivars (str_of_int eid ++ "@__status")
-                         then (match map_get ivars (str_of_int eid ++ "@__status") with VInt n -> n | _ -> 0)
+              (let st = (if iv_has ivars eid "__status"
+                         then (match iv_get ivars eid "__status" with VInt n -> n | _ -> 0)
                          else 0) in
                exit (ae9 exc st))
             // ...and an unrescued SignalException (Interrupt too) ends it OF
@@ -14264,7 +14440,7 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
             // Process::Status does not: signaled? was false.)
             else if str_eq ec "SignalException" || str_eq ec "Interrupt"
                     || str_list_has (ancestors_of world ec) "SignalException" then
-              (let sg9 = (match (if map_has ivars (str_of_int eid ++ "@__sigpair") then map_get ivars (str_of_int eid ++ "@__sigpair") else VNil) with
+              (let sg9 = (match (iv_get_or ivars eid "__sigpair" VNil) with
                           | VArr a9 -> (match deref a9 with Cons (VInt n9, _) -> n9 | _ -> 0)
                           | _ -> 0) in
                let st9 = ae9 exc (128 + sg9) in
@@ -14273,10 +14449,10 @@ let run_src_mode = fn (embedded: bool) -> fn (src0: str) -> fn (print_result: bo
             // ...and an Errno a write to stdout raised with SIGPIPE attached
             // (out_refused, ruby's rb_sys_fail_on_write): unrescued, it ends
             // the process of that signal, and says nothing
-            else if (match (if map_has ivars (str_of_int eid ++ "@__signo") then map_get ivars (str_of_int eid ++ "@__signo") else VNil) with
+            else if (match (iv_get_or ivars eid "__signo" VNil) with
                      | VInt _ -> str_list_has (ancestors_of world ec) "SystemCallError"
                      | _ -> false) then
-              (let sg9 = (match map_get ivars (str_of_int eid ++ "@__signo") with VInt n9 -> n9 | _ -> 0) in
+              (let sg9 = (match iv_get ivars eid "__signo" with VInt n9 -> n9 | _ -> 0) in
                die_of_signal sg9 (ae9 exc (128 + sg9)))
             else
             let st9 = ae9 exc 1 in
@@ -14434,7 +14610,8 @@ let cli_chdir = fn (d: str) ->
 // warning and nothing else. Only three of them switch anything here: gems
 // (whether rubygems is required first), frozen_string_literal (what a literal
 // with no magic comment is) and rubyopt (whether RUBYOPT is read at all);
-// the rest are accepted and have nothing to switch.
+// syntax_suggest controls the bundled SyntaxError annotation hook. The
+// remaining feature names are accepted and have nothing to switch.
 let cli_feature_names = Cons ("gems", Cons ("error_highlight", Cons ("did_you_mean", Cons ("syntax_suggest",
                           Cons ("rubyopt", Cons ("frozen_string_literal", Cons ("yjit", Cons ("zjit", Nil))))))));
 let rec cli_us = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
@@ -14448,6 +14625,12 @@ let rec cli_feat_find = fn (nm: str) -> fn (fs: str list) ->
     else cli_feat_find nm t;
 let cli_feat_set = fn (f: str) -> fn (on: bool) ->
   if str_eq f "gems" then (if on then (if map_has cli_opt "nogems" then map_delete cli_opt "nogems" else ()) else map_set cli_opt "nogems" "1")
+  else if str_eq f "error_highlight" then
+    (if on then (if map_has cli_opt "noerror_highlight" then map_delete cli_opt "noerror_highlight" else ())
+     else map_set cli_opt "noerror_highlight" "1")
+  else if str_eq f "syntax_suggest" then
+    (if on then (if map_has cli_opt "nosyntax_suggest" then map_delete cli_opt "nosyntax_suggest" else ())
+     else map_set cli_opt "nosyntax_suggest" "1")
   else if str_eq f "rubyopt" then (if on then (if map_has cli_opt "norubyopt" then map_delete cli_opt "norubyopt" else ()) else map_set cli_opt "norubyopt" "1")
   else if str_eq f "frozen_string_literal" then
     (let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in

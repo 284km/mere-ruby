@@ -53,6 +53,11 @@ static VALUE answers(VALUE self) {
 #ifdef SIZEOF_LONG
     rb_hash_aset(hash, rb_str_new_cstr("sizeof(long)"), INT2FIX(SIZEOF_LONG));
 #endif
+#ifdef MKMF_PROBE_OPENSSL
+    rb_hash_aset(hash, rb_str_new_cstr("openssl"), Qtrue);
+#else
+    rb_hash_aset(hash, rb_str_new_cstr("openssl"), Qfalse);
+#endif
     rb_hash_aset(hash, rb_str_new_cstr("note"), INT2FIX(MKMF_PROBE_NOTE));
     return hash;
 }

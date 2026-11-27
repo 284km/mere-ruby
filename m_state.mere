@@ -38,6 +38,8 @@ extern fn tcp_set_timeout: int -> int -> int;
 // datagram socket (resolve, socket, connect), and send/recv move one datagram
 // through the arena; they are what UDPSocket#connect / #send / #recv are.
 extern fn mr_recvmsg_flags: int -> int;
+// accept(2): the descriptor or -errno (tools/socket_glue.c)
+extern fn mr_sock_accept: int -> int;
 extern fn mr_udp_connect: int -> str -> int -> int;
 extern fn udp_open: str -> int -> int;
 extern fn udp_send: int -> int -> int -> int;
@@ -202,6 +204,9 @@ extern fn mr_process_id: int -> str;
 // tools/process_glue.c: a file's times to the nanosecond (File::Stat).
 extern fn mr_stat_times: str -> int -> int -> str;
 extern fn mr_utimens: str -> int -> str -> int;
+// ...and O_NONBLOCK cleared, as a child's standard three are before exec
+// (1 cleared, 0 was clear, -errno).
+extern fn mr_fd_clear_nonblock: int -> int;
 extern fn getpid: unit -> int;
 // The process-identity questions <unistd.h> answers with an int, which is
 // the whole of what an extern can carry: the parent, a process group, a
@@ -440,6 +445,70 @@ let ivars_g = map_new ();
 // The collector drops a dead owner's entry. A prefix whose list would grow
 // past 4 KB, or a name holding chr 2, is marked chr 3 and listed by the walk.
 let iv_idx = map_new ();
+// AN OBJECT'S INSTANCE VARIABLES: SHAPES AND THE SLAB (note 559 step 2b).
+// An object's variables are kept in one slab of every object's values, in an
+// AREA of its own, and the names in a SHAPE: the names in the order they were
+// first set, a node of one tree that every object shares -- the shape of an
+// object with @a then @b is the child of @a's by "b" (ruby's shapes). An object
+// holds one int in obj_iv: its area's base and size class, and its shape
+// (iv_mk_rec). Its area is [base, base + cap), cap a power of 2 that holds the
+// shape's slots -- as many as its class's objects have come to need.
+// - A name's slot in a shape is asked of sh_slot ((shape, name) -> slot, or -1:
+//   asked once by walking the shape's parents, then remembered, "not there" too).
+// - An area too small for the next shape is moved into one twice its size; the
+//   old one goes back to its size's FREE LIST, as does a dead object's at the
+//   collector's sweep (the free area's first slot holds the next one, a VInt).
+//   The slab is never shorter than its high-water mark; the free lists reuse it.
+// - A removed variable leaves a mark in its slot (iv_absent, a Proc's handle
+//   of -1: no Ruby value) and the shape as it was. A listed name set again
+//   after its removal goes last, as in ruby: the object moves to the shape of
+//   its other names and that one (iv_readd). An internal name (iv_name_hidden)
+//   is written into its old slot: its place is never shown.
+// - TOO COMPLEX (ruby's word): an object that would need a new shape past the
+//   shape count's bound (MERE_RUBY_SHAPES_MAX, 2^18), or a class's eighth
+//   variation (a shape a class's object made beside another child of the same
+//   parent: ruby's SHAPE_MAX_VARIATIONS), or a shape of 4,096 names, moves to the
+//   table -- "<id>@<name>" keys and iv_idx -- for good: obj_iv holds -1 for it.
+//   The tree, the names' numbers and the remembered slots are never given back,
+//   and the bounds keep a program that makes names (`instance_variable_set
+//   ("@v#{i}")`) from growing them without end. MERE_RUBY_SHAPES=0 puts every
+//   object there (main before step 2b).
+let iv_nm = vec_new ();
+let iv_nm_id = map_new ();
+// shape s at 4s: its parent, its last name's number, its slots, its children
+let sh_tree = (let t = vec_new () in
+               let _ = vec_push t (0 - 1) in let _ = vec_push t (0 - 1) in
+               let _ = vec_push t 0 in let _ = vec_push t 0 in t);
+let sh_next = map_new ();
+let sh_slot = (let t = map_new () in let _ = map_compact t in t);
+let sh_cls_var = map_new ();
+// (their own arenas: map_bytes and vec_bytes read them, and the collector
+//  compacts them where it compacts the table)
+let obj_iv = (let t = map_new () in let _ = map_compact t in t);
+// ...and which of its keys are a String's, an Array's or a Hash's (kinds 1-3):
+// the collector asks this small set, not obj_iv, of every String, Array and
+// Hash it marks -- and nothing at all while no such one has a variable.
+// Written with obj_iv by iv_rec_put, emptied of the dead at the sweep.
+let iv_hng = (let t = map_new () in let _ = map_compact t in t);
+let iv_rec_put = fn (ok: int) -> fn (r: int) ->
+  let _ = (if ok % 8 != 0 && (if map_has iv_hng ok then false else true) then map_set iv_hng ok 1 else ()) in
+  map_set obj_iv ok r;
+let iv_slab = (let v = vec_new () in let _ = vec_push v VNil in let _ = vec_compact v in v);
+// each area size's free list (2^k at k), -1 for none
+let iv_free = (let v = vec_new () in
+               let rec fill = fn (i: int) -> if i >= 48 then () else (let _ = vec_push v (0 - 1) in fill (i + 1)) in
+               let _ = fill 0 in v);
+// 0: shapes on (MERE_RUBY_SHAPES), 1: the shape count's bound, 2: MERE_RUBY_SHAPES_CHECK,
+// 3: slots held
+let iv_env = fn (k: str) -> match env_var k with Some s -> s | None -> "";
+let iv_knobs = (let v = vec_new () in
+                let _ = vec_push v (if str_eq (iv_env "MERE_RUBY_SHAPES") "0" then 0 else 1) in
+                let _ = vec_push v (let s = iv_env "MERE_RUBY_SHAPES_MAX" in if str_eq s "" then 262144 else int_of_str s) in
+                let _ = vec_push v (if str_eq (iv_env "MERE_RUBY_SHAPES_CHECK") "" then 0 else 1) in
+                // 3: the slots the shaped objects hold (iv_entries)
+                let _ = vec_push v 0 in
+                v);
+let iv_key = fn (oid: int) -> fn (name: str) -> str_of_int oid ++ "@" ++ name;
 // How many instance variables of a String, an Array or a Hash -- keys
 // "str:<id>@name", "arr:..", "hsh:.." -- were ever written (iv_put counts).
 // Their owners have no index like an object's, so finding one's variables
@@ -447,6 +516,10 @@ let iv_idx = map_new ();
 // `instance_variables` of every String, Array and Hash made that walk to
 // find nothing: 100,000 instructions a `"abc".dup` in a program with 7,000
 // instance variables alive. Until the count leaves zero nobody walks.
+// (Since note 559 step 2b' a String's, an Array's and a Hash's variables are
+//  in their shape and the slab, and are found through the door; only an
+//  owner in the table -- MERE_RUBY_SHAPES=0, or too complex -- is written
+//  here, and only for those is the walk made.)
 let hiv_made = (let v = vec_new () in let _ = vec_push v 0 in v);
 // (one `let rec`, not two: each top-level let is a level of bracket depth)
 let rec iv_idx_add = fn (k: str) ->
@@ -474,6 +547,18 @@ let rec iv_idx_add = fn (k: str) ->
 //   test_module's complemented_method_entry loop)
 and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
   let c0 = (if str_len k > 0 then ord (char_at k 0) else 0) in
+  // (MERE_RUBY_SHAPES_CHECK=1: an object's key written here while the object
+  //  is not in the table is a writer that went around the door)
+  let _ = (if vec_get iv_knobs 2 > 0 && str_index_of k "@" > 0 then
+             (let at = str_index_of k "@" in
+              let ok = (if c0 >= 48 && c0 <= 57 then int_of_str (substring k 0 at) * 8
+                        else if at > 4 && str_starts_with k "str:" then int_of_str (substring k 4 at) * 8 + 1
+                        else if at > 4 && str_starts_with k "arr:" then int_of_str (substring k 4 at) * 8 + 2
+                        else if at > 4 && str_starts_with k "hsh:" then int_of_str (substring k 4 at) * 8 + 3
+                        else 0 - 1) in
+              if ok < 0 || (map_has obj_iv ok && map_get obj_iv ok == 0 - 1) then ()
+              else print_err ("shapes: a table write around the door: " ++ k ++ "\n"))
+           else ()) in
   let _ = (if c0 >= 48 && c0 <= 57 && (if map_has tbl k then false else true) then iv_idx_add k
            // (an instance variable of a String, an Array or a Hash: hiv_made)
            else if (c0 == 115 || c0 == 97 || c0 == 104) && str_len k > 4
@@ -489,14 +574,400 @@ and iv_put = fn tbl -> fn (k: str) -> fn (v: Val) ->
 // loader, m_prism_load.mere: a dozen variables a node, a million nodes in
 // ruby's test files, and growing the entry by one name per write was a third
 // of the loader). MERE_RUBY_IVAR_INDEX_CHECK=1 holds this to the table too.
+// AN OBJECT'S INSTANCE VARIABLE, by the object's id and the name without its
+// "@" (note 559). Every reader and writer of one object's variable goes
+// through these, so that where the variables are kept can change in one
+// place: an object's are in its shape and the slab (above), or the table's
+// "<id>@<name>" keys when it is too complex. A class's ("cls:..@"), a String's,
+// an Array's or a Hash's ("str:..@" and the like) and the table's other keys
+// ("$exc") are not an object's and keep their own spelling.
+let iv_absent = VProc (0 - 1);
+let sh_parent = fn (s: int) -> vec_get sh_tree (4 * s);
+let sh_name = fn (s: int) -> vec_get sh_tree (4 * s + 1);
+let sh_len = fn (s: int) -> vec_get sh_tree (4 * s + 2);
+let sh_count = fn (u: unit) -> vec_len sh_tree / 4;
+// (a record: ((base * 64) + its area's size class) * 2^24 + shape)
+let iv_rec_shape = fn (r: int) -> r % 16777216;
+let iv_rec_base = fn (r: int) -> r / 1073741824;
+let iv_rec_cap = fn (r: int) -> bit_shl 1 ((r / 16777216) % 64);
+let iv_cap_of = fn (n: int) -> (let rec go = fn (c: int) -> if c >= n then c else go (c * 2) in go 1);
+let iv_cap_class = fn (cap: int) -> (let rec go = fn (c: int) -> fn (k: int) -> if c >= cap then k else go (c * 2) (k + 1) in go 1 0);
+let iv_mk_rec = fn (b: int) -> fn (cap: int) -> fn (s: int) -> (b * 64 + iv_cap_class cap) * 16777216 + s;
+// how many slots a class's objects have come to need, at most: an object's
+// first area is that size (ruby's max_iv_count), so one whose initialize sets
+// five is not moved from an area of one to two, four and eight on the way --
+// each move a copy of its values in the slab's arena
+let sh_cls_cap = map_new ();
+// (a name's number, made if new; and only asked)
+let iv_nid = fn (name: str) ->
+  if map_has iv_nm_id name then map_get iv_nm_id name
+  else (let n = vec_len iv_nm in let _ = vec_push iv_nm name in let _ = map_set iv_nm_id name n in n);
+let iv_nid_find = fn (name: str) -> if map_has iv_nm_id name then map_get iv_nm_id name else 0 - 1;
+let iv_name_hidden = fn (name: str) ->
+  str_len name > 0
+  && (let c = ord (char_at name 0) in
+      c == 126 || (c >= 48 && c <= 57) || str_contains name (chr 1)
+      || (str_starts_with name "__" && (if str_starts_with name "__m_" || str_starts_with name "__um_" then false else true)));
+let iv_is_absent = fn (v: Val) -> match v with VProc h -> h < 0 | _ -> false;
+// THE read of a slot: the removed mark reads as `d` (the door and, in 2c, the
+// VM's cache both read through here -- nothing reads the slab itself)
+let iv_slot_read = fn (b: int) -> fn (i: int) -> fn (d: Val) ->
+  let v = vec_get iv_slab (b + i) in
+  match v with VProc h -> (if h < 0 then d else v) | _ -> v;
+let rec sh_walk = fn (s: int) -> fn (nid: int) ->
+  if s <= 0 then 0 - 1
+  else if sh_name s == nid then sh_len s - 1
+  else sh_walk (sh_parent s) nid;
+let sh_find = fn (s: int) -> fn (nid: int) ->
+  if s <= 0 || nid < 0 then 0 - 1
+  else (let k = s * 16777216 + nid in
+        if map_has sh_slot k then map_get sh_slot k
+        else (let i = sh_walk s nid in let _ = map_set sh_slot k i in i));
+// WHOSE variables: an OWNER KEY, the id times 8 and the kind, as the
+// collector's live set spells it -- 0 an object, 1 a String, 2 an Array, 3 a
+// Hash (note 559 step 2b'). obj_iv is keyed by it. The door below takes an
+// object's id (iv_*) or a String's, an Array's or a Hash's value (hiv_*).
+let iv_okind = fn (ok: int) -> ok % 8;
+// (the owner's keys in the table: "<id>@" for an object, "str:<id>@" and the
+// like for the others -- the table is where a too complex owner's are)
+let iv_tkey = fn (ok: int) -> fn (name: str) ->
+  let k = iv_okind ok in
+  (if k == 0 then str_of_int (ok / 8) ++ "@"
+   else (if k == 1 then "str:" else if k == 2 then "arr:" else "hsh:") ++ str_of_int (ok / 8) ++ "@")
+  ++ name;
+let iv_owner_cls = fn (ok: int) ->
+  let k = iv_okind ok in
+  if k == 0 then (if map_has obj_cls (ok / 8) then map_get obj_cls (ok / 8) else "Object")
+  else if k == 1 then "String" else if k == 2 then "Array" else "Hash";
+// the child of shape s by name nid for owner ok, made if new -- or -1 when
+// the object is to go to the table (TOO COMPLEX above)
+let sh_child = fn (s: int) -> fn (nid: int) -> fn (ok: int) ->
+  let k = s * 16777216 + nid in
+  if map_has sh_next k then map_get sh_next k
+  else if nid >= 16777216 || sh_count () >= vec_get iv_knobs 1 || sh_len s >= 4096 then 0 - 1
+  else
+    (let var = vec_get sh_tree (4 * s + 3) > 0 in
+     let cls = iv_owner_cls ok in
+     let nv = (if var then (if map_has sh_cls_var cls then map_get sh_cls_var cls else 0) else 0) in
+     if var && nv >= 8 then 0 - 1
+     else
+       (let _ = (if var then map_set sh_cls_var cls (nv + 1) else ()) in
+        let c = sh_count () in
+        let _ = vec_push sh_tree s in
+        let _ = vec_push sh_tree nid in
+        let _ = vec_push sh_tree (sh_len s + 1) in
+        let _ = vec_push sh_tree 0 in
+        let _ = vec_set sh_tree (4 * s + 3) (vec_get sh_tree (4 * s + 3) + 1) in
+        let _ = map_set sh_next k c in
+        c));
+// AN AREA of `cap` slots in a slab, its size class's free list first. The
+// slab and its free lists (2^k at k, -1 for none) are the caller's: the
+// objects' variables are iv_slab and iv_free; the frames' heads keep a slab
+// of their own (note 560 B: sharing one would let each call's copy grow the
+// objects' slab).
+let area_new = fn slab -> fn free -> fn (cap: int) ->
+  let k = iv_cap_class cap in
+  let h = vec_get free k in
+  if h >= 0 then
+    (let nx = (match vec_get slab h with VInt n -> n | _ -> 0 - 1) in
+     let _ = vec_set free k nx in
+     let _ = vec_set slab h VNil in
+     h)
+  else
+    (let b = vec_len slab in
+     let rec push = fn (i: int) -> if i >= cap then () else (let _ = vec_push slab VNil in push (i + 1)) in
+     let _ = push 0 in
+     b);
+// (an area given back: emptied, so nothing it held is kept, and its first slot
+//  the next free one -- an area given back is not to be marked)
+let area_free = fn slab -> fn free -> fn (b: int) -> fn (cap: int) ->
+  let k = iv_cap_class cap in
+  let rec clr = fn (i: int) -> if i >= cap then () else (let _ = vec_set slab (b + i) VNil in clr (i + 1)) in
+  let _ = clr 1 in
+  let _ = vec_set slab b (VInt (vec_get free k)) in
+  vec_set free k b;
+// HOW MANY instance variables there are, for the collector's pressure: the
+// table's entries and the shaped objects' slots. A slot is what a key of the
+// table was, and asking map_len of the table alone collected a fifth as often
+// once the objects left it (and a loop of objects made and dropped peaked a
+// tenth higher).
+let iv_slots_add = fn (n: int) -> vec_set iv_knobs 3 (vec_get iv_knobs 3 + n);
+let iv_entries = fn tbl -> map_len tbl + vec_get iv_knobs 3;
+let iv_rec_k = fn (ok: int) -> if map_has obj_iv ok then map_get obj_iv ok else 0 - 2;
+let iv_rec = fn (oid: int) -> iv_rec_k (oid * 8);
+// (a shaped record's area, given back -- the collector's sweep, the move to the table)
+let iv_rec_free = fn (r: int) ->
+  let s = iv_rec_shape r in
+  if s > 0 then (let _ = iv_slots_add (0 - sh_len s) in area_free iv_slab iv_free (iv_rec_base r) (iv_rec_cap r)) else ();
+// the slots of shape s in order, as (slot, name number)
+let iv_shape_slots = fn (s: int) ->
+  (let rec go = fn (t: int) -> fn (acc: (int * int) list) ->
+     if t <= 0 then acc else go (sh_parent t) (Cons ((sh_len t - 1, sh_name t), acc)) in
+   go s Nil);
+// an object's shaped variables moved to the table, in their order, for good
+// (TOO COMPLEX above), and its area given back
+let iv_to_table = fn tbl -> fn (ok: int) ->
+  let r = iv_rec_k ok in
+  // (in the table first: what is written there now is through the door)
+  let _ = iv_rec_put ok (0 - 1) in
+  if r > 0 then
+    (let b = iv_rec_base r in
+     let _ = list_iter (iv_shape_slots (iv_rec_shape r)) (fn (p: int * int) ->
+               let (i, nid) = p in
+               let v = vec_get iv_slab (b + i) in
+               if iv_is_absent v then () else iv_put tbl (iv_tkey ok (vec_get iv_nm nid)) v) in
+     iv_rec_free r)
+  else ();
+// the object (record r, 0 for none yet) moves to its shape's child c, and v
+// goes in c's last slot: into a bigger area when c's slots outgrow its own --
+// as big as its class's objects have come to need (sh_cls_cap)
+let iv_grow = fn (ok: int) -> fn (r: int) -> fn (c: int) -> fn (v: Val) ->
+  let s = iv_rec_shape r in
+  let b = iv_rec_base r in
+  let n0 = sh_len s in
+  let n1 = sh_len c in
+  let cap0 = (if s == 0 then 0 else iv_rec_cap r) in
+  let _ = iv_slots_add 1 in
+  if n1 <= cap0 then
+    (let _ = vec_set iv_slab (b + n1 - 1) v in
+     iv_rec_put ok (r - s + c))
+  else
+    (let cls = iv_owner_cls ok in
+     let h = (if map_has sh_cls_cap cls then map_get sh_cls_cap cls else 0) in
+     let _ = (if n1 > h then map_set sh_cls_cap cls n1 else ()) in
+     let cap1 = iv_cap_of (if n1 > h then n1 else h) in
+     let nb = area_new iv_slab iv_free cap1 in
+     let rec cp = fn (i: int) -> if i >= n0 then () else (let _ = vec_set iv_slab (nb + i) (vec_get iv_slab (b + i)) in cp (i + 1)) in
+     let _ = cp 0 in
+     let _ = (if cap0 > 0 then area_free iv_slab iv_free b cap0 else ()) in
+     let _ = vec_set iv_slab (nb + n1 - 1) v in
+     iv_rec_put ok (iv_mk_rec nb cap1 c));
+// a LISTED name set again after its removal goes last, as in ruby: the object
+// moves to the shape of its other names in their order and then that one
+let iv_readd = fn tbl -> fn (ok: int) -> fn (r: int) -> fn (nid: int) -> fn (v: Val) ->
+  let s = iv_rec_shape r in
+  let b = iv_rec_base r in
+  let rec kept = fn (xs: (int * int) list) ->
+    (match xs with
+     | Nil -> (Nil : (int * int) list)
+     | Cons ((i, n), rest) ->
+       (if n != nid && (if iv_is_absent (vec_get iv_slab (b + i)) then false else true)
+        then Cons ((i, n), kept rest) else kept rest)) in
+  let keep = kept (iv_shape_slots s) in
+  let rec path = fn (t: int) -> fn (xs: (int * int) list) ->
+    (match xs with
+     | Nil -> sh_child t nid ok
+     | Cons ((_, n), rest) -> (let c = sh_child t n ok in if c < 0 then c else path c rest)) in
+  let c = path 0 keep in
+  if c < 0 then
+    (let _ = iv_to_table tbl ok in iv_put tbl (iv_tkey ok (vec_get iv_nm nid)) v)
+  else
+    (let cap = iv_cap_of (sh_len c) in
+     let nb = area_new iv_slab iv_free cap in
+     let rec put = fn (j: int) -> fn (xs: (int * int) list) ->
+       (match xs with
+        | Nil -> vec_set iv_slab (nb + j) v
+        | Cons ((i, _), rest) -> (let _ = vec_set iv_slab (nb + j) (vec_get iv_slab (b + i)) in put (j + 1) rest)) in
+     let _ = put 0 keep in
+     let _ = iv_rec_free r in
+     let _ = iv_slots_add (sh_len c) in
+     iv_rec_put ok (iv_mk_rec nb cap c));
+// ...the door itself, by the owner key (iv_k_*) and the name without its "@"
+let iv_k_get_or = fn tbl -> fn (ok: int) -> fn (name: str) -> fn (d: Val) ->
+  let r = iv_rec_k ok in
+  if r >= 0 then
+    (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
+     if i < 0 then d else iv_slot_read (iv_rec_base r) i d)
+  else if r == 0 - 2 then d
+  else (let k = iv_tkey ok name in if map_has tbl k then map_get tbl k else d);
+let iv_k_has = fn tbl -> fn (ok: int) -> fn (name: str) ->
+  let r = iv_rec_k ok in
+  if r >= 0 then
+    (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
+     i >= 0 && (if iv_is_absent (vec_get iv_slab (iv_rec_base r + i)) then false else true))
+  else if r == 0 - 2 then false
+  else map_has tbl (iv_tkey ok name);
+let iv_k_set = fn tbl -> fn (ok: int) -> fn (name: str) -> fn (v: Val) ->
+  let r = iv_rec_k ok in
+  if r == 0 - 1 then iv_put tbl (iv_tkey ok name) v
+  else if r == 0 - 2 && vec_get iv_knobs 0 == 0 then
+    (let _ = iv_rec_put ok (0 - 1) in iv_put tbl (iv_tkey ok name) v)
+  else
+    (let r0 = (if r < 0 then 0 else r) in
+     let s = iv_rec_shape r0 in
+     let b = iv_rec_base r0 in
+     let nid = iv_nid name in
+     let i = sh_find s nid in
+     if i >= 0 then
+       (if iv_is_absent (vec_get iv_slab (b + i)) && (if iv_name_hidden name then false else true)
+        then iv_readd tbl ok r0 nid v
+        else vec_set iv_slab (b + i) v)
+     else
+       (let c = sh_child s nid ok in
+        if c < 0 then (let _ = iv_to_table tbl ok in iv_put tbl (iv_tkey ok name) v)
+        else iv_grow ok r0 c v));
+let iv_k_del = fn tbl -> fn (ok: int) -> fn (name: str) ->
+  let r = iv_rec_k ok in
+  if r >= 0 then
+    (let i = sh_find (iv_rec_shape r) (iv_nid_find name) in
+     if i < 0 then () else vec_set iv_slab (iv_rec_base r + i) iv_absent)
+  else if r == 0 - 1 then map_delete tbl (iv_tkey ok name)
+  else ();
+// an OBJECT's variable, by its id
+let iv_get_or = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (d: Val) -> iv_k_get_or tbl (oid * 8) name d;
+let iv_get = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_get_or tbl (oid * 8) name VNil;
+let iv_has = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_has tbl (oid * 8) name;
+let iv_set = fn tbl -> fn (oid: int) -> fn (name: str) -> fn (v: Val) -> iv_k_set tbl (oid * 8) name v;
+let iv_del = fn tbl -> fn (oid: int) -> fn (name: str) -> iv_k_del tbl (oid * 8) name;
+// a STRING's, an ARRAY's or a HASH's: its owner key, or -1 for any other value
+let hiv_ok = fn (v: Val) ->
+  match v with
+  | VStr h -> h * 8 + 1
+  | VArr h -> h * 8 + 2
+  | VHsh h -> h * 8 + 3
+  | _ -> 0 - 1;
+// ...and the same by the name WITH its "@" (`k`, as the evaluator spells it)
+let iv_at = fn (k: str) -> if str_len k > 0 && str_eq (char_at k 0) "@" then substring k 1 (str_len k) else k;
+let iv_get_at = fn tbl -> fn (oid: int) -> fn (k: str) -> iv_get_or tbl oid (iv_at k) VNil;
+let iv_has_at = fn tbl -> fn (oid: int) -> fn (k: str) -> iv_has tbl oid (iv_at k);
+let iv_set_at = fn tbl -> fn (oid: int) -> fn (k: str) -> fn (v: Val) -> iv_set tbl oid (iv_at k) v;
+let iv_del_at_name = fn tbl -> fn (oid: int) -> fn (k: str) -> iv_del tbl oid (iv_at k);
+// A NEW object's variables, all at once, in the order of `names` (chr 2
+// between): the Prism node loader's (m_prism_load.mere), a dozen a node and a
+// million nodes in ruby's test files. Answers where the slots start -- the
+// loader writes the j-th name's value at base + j -- or -1: the object is in
+// the table (shapes off, or too complex), and the loader writes it there with
+// iv_file_new / iv_put_new. A node type's shape is made once (iv_new_sh).
+let iv_new_sh = map_new ();
+let iv_new_obj = fn (oid: int) -> fn (names: str) ->
+  if vec_get iv_knobs 0 == 0 then (let _ = iv_rec_put (oid * 8) (0 - 1) in 0 - 1)
+  else
+    (let c = (if map_has iv_new_sh names then map_get iv_new_sh names
+              else (let rec go = fn (t: int) -> fn (xs: str list) ->
+                      (match xs with
+                       | Nil -> t
+                       | Cons (n, rest) -> (let c = sh_child t (iv_nid n) (oid * 8) in if c < 0 then c else go c rest)) in
+                    let c = go 0 (str_split names (chr 2)) in
+                    let _ = (if c > 0 then map_set iv_new_sh names c else ()) in
+                    c)) in
+     if c <= 0 then (let _ = iv_rec_put (oid * 8) (0 - 1) in 0 - 1)
+     else (let cap = iv_cap_of (sh_len c) in
+           let nb = area_new iv_slab iv_free cap in
+           let _ = iv_rec_put (oid * 8) (iv_mk_rec nb cap c) in
+           let _ = iv_slots_add (sh_len c) in
+           nb));
 let iv_file_new = fn (pfx: str) -> fn (names: str) -> map_set iv_idx pfx names;
 let iv_put_new = fn tbl -> fn (k: str) -> fn (v: Val) -> map_set tbl k v;
+// one object's variables copied to another (dup, clone): the same shape, an
+// area of the same size, the removed marks too. Answers false when the copy
+// is not this simple -- the source in the table, or the copy already holding
+// variables -- and the caller copies name by name.
+let iv_k_copy = fn (src: int) -> fn (dst: int) ->
+  let r = iv_rec_k src in
+  if r == 0 - 2 then true
+  else if r < 0 || iv_rec_k dst != 0 - 2 then false
+  else
+    (let s = iv_rec_shape r in
+     if s == 0 then true
+     else
+       (let n = sh_len s in
+        let b = iv_rec_base r in
+        let nb = area_new iv_slab iv_free (iv_rec_cap r) in
+        let rec cp = fn (i: int) -> if i >= n then () else (let _ = vec_set iv_slab (nb + i) (vec_get iv_slab (b + i)) in cp (i + 1)) in
+        let _ = cp 0 in
+        let _ = iv_rec_put dst (iv_mk_rec nb (iv_rec_cap r) s) in
+        let _ = iv_slots_add n in
+        true));
+let iv_copy_shaped = fn (src: int) -> fn (dst: int) -> iv_k_copy (src * 8) (dst * 8);
+// one object's variable names in their order, Struct slots left out (they are
+// not instance variables) -- a shaped object's, from its shape, else Nil
+let iv_shape_names = fn (r: int) ->
+  let b = iv_rec_base r in
+  let rec go = fn (t: int) -> fn (acc: str list) ->
+    if t <= 0 then acc
+    else (let nm = vec_get iv_nm (sh_name t) in
+          if iv_is_absent (vec_get iv_slab (b + sh_len t - 1)) || str_contains nm (chr 1) then go (sh_parent t) acc
+          else go (sh_parent t) (Cons (nm, acc))) in
+  go (iv_rec_shape r) Nil;
+// ...an owner's, by its owner key: a shaped one's names, else Nil (one in the
+// table is listed by a walk of it, where hiv_made says there may be some)
+let iv_k_names = fn (ok: int) -> (let r = iv_rec_k ok in if r >= 0 then iv_shape_names r else (Nil : str list));
+// whether a shaped owner has any variable at all
+let iv_k_any = fn (ok: int) ->
+  (let r = iv_rec_k ok in r >= 0 && (match iv_shape_names r with Nil -> false | _ -> true));
+// whether an owner has any variable (a String's for `-str` and `$/ =`): a
+// shaped one's from its shape; one in the table by a walk of it, made only
+// when hiv_made says a String, an Array or a Hash ever had one there (and
+// with no Map made per question: hiv_seen is the one answer slot)
+let hiv_seen = (let v = vec_new () in let _ = vec_push v 0 in v);
+let iv_k_has_any = fn tbl -> fn (ok: int) ->
+  let r = iv_rec_k ok in
+  if r != 0 - 1 then iv_k_any ok
+  else if iv_okind ok != 0 && vec_get hiv_made 0 == 0 then false
+  else
+    (let pfx = iv_tkey ok "" in
+     let _ = vec_set hiv_seen 0 0 in
+     let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+               if str_len k > str_len pfx && str_starts_with k pfx then vec_set hiv_seen 0 1 else ()) in
+     vec_get hiv_seen 0 == 1);
+// every variable of owner src to owner dst (a String's, an Array's, a Hash's
+// dup and clone): the area whole when it can (iv_k_copy), else name by name
+// -- from src's shape, or from the table (gathered first: writing while
+// walking it moves it)
+let iv_k_copy_all = fn tbl -> fn (src: int) -> fn (dst: int) ->
+  if iv_k_copy src dst then ()
+  else
+    (let r = iv_rec_k src in
+     if r >= 0 then
+       (let b = iv_rec_base r in
+        list_iter (iv_shape_slots (iv_rec_shape r)) (fn (p: int * int) ->
+          let (i, nid) = p in
+          let v = vec_get iv_slab (b + i) in
+          if iv_is_absent v then () else iv_k_set tbl dst (vec_get iv_nm nid) v))
+     else if iv_okind src != 0 && vec_get hiv_made 0 == 0 then ()
+     else
+       (let pfx = iv_tkey src "" in
+        let ns = vec_new () in
+        let vs = vec_new () in
+        let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+                  if str_len k > str_len pfx && str_starts_with k pfx
+                  then (let _ = vec_push ns (substring k (str_len pfx) (str_len k)) in vec_push vs v) else ()) in
+        let rec put = fn (i: int) -> if i >= vec_len ns then () else (let _ = iv_k_set tbl dst (vec_get ns i) (vec_get vs i) in put (i + 1)) in
+        put 0));
+// A KEY OF THE WHOLE TABLE, for those that walk it -- the collector, the
+// copy of every variable, the listing's fallback, the files flushed at exit
+// (note 559 step 2a): whose it is, and where its name starts, is asked here,
+// not read off the key by each of them. (They walk with map_iter themselves:
+// a curried callback of the door's, called per variable, made a collection
+// two fifths dearer.)
+// (the id a key "<id>@<name>" belongs to, else -1)
+let rec iv_key_owner_go = fn (k: str) -> fn (i: int) -> fn (acc: int) ->
+  if i >= str_len k then 0 - 1
+  else
+    (let c = char_at k i in
+     if str_eq c "@" then (if i > 0 then acc else 0 - 1)
+     else if is_digit c then iv_key_owner_go k (i + 1) (acc * 10 + (ord c - 48))
+     else 0 - 1);
+let iv_key_owner = fn (k: str) ->
+  if str_len k == 0 then 0 - 1
+  else if is_digit (char_at k 0) then iv_key_owner_go k 0 0
+  else 0 - 1;
+// (the name is asked about in place -- iv_name_eq -- and cut
+//  out only when it is kept, iv_name: a String per variable at each
+//  collection was dear too. iv_del_at deletes the variable.)
+// (where a key's name starts)
+let iv_key_name_at = fn (k: str) -> str_index_of k "@" + 1;
+let iv_name_eq = fn (s: str) -> fn (at: int) -> fn (lit: str) -> str_len s - at == str_len lit && str_ends_with s lit;
+let iv_name = fn (s: str) -> fn (at: int) -> substring s at (str_len s);
+let iv_del_at = fn tbl -> fn (o: int) -> fn (s: str) -> fn (at: int) -> map_delete tbl s;
 // the class an object's REFUSAL MESSAGE names: its own, never the singleton
 // that `def o.x` hung on it. (is_sng_cls lives in the eval chain, far below
 // the two other askers, so the prefix test is written out here once.)
 let obj_cls_name = fn (oid: int) ->
   let c = (if map_has obj_cls oid then map_get obj_cls oid else "Object") in
-  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
+  // (a WHOLE singleton name only: a class defined inside one, "(sng:159)::M",
+  //  is the object's class itself -- `.class` answered Object for it)
+  if str_len c >= 5 && str_eq (substring c 0 5) "(sng:" && str_eq (char_at c (str_len c - 1)) ")"
   then (if map_has cls_sup c then map_get cls_sup c else "Object") else c;
 // (the current line, and the current file's and method's numbers -- see
 //  pos_names below; here so that an allocation can note them)
@@ -1761,8 +2232,7 @@ let cls_frozen = map_new ();
 //  and undef_method that lands there is refused, whichever path reaches it)
 let ofrozen_set = fn (id: int) ->
   let _ = map_set obj_frozen id "1" in
-  let k = str_of_int id ++ "@__modbk" in
-  if map_has ivars_g k then (match map_get ivars_g k with VClass b -> map_set cls_frozen b "1" | _ -> ()) else ();
+  if iv_has ivars_g id "__modbk" then (match iv_get ivars_g id "__modbk" with VClass b -> map_set cls_frozen b "1" | _ -> ()) else ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen id;
 // the caller has the id as TEXT (a singleton class name carries it), so this
 // is the one door that still parses; a non-numeric name is simply not an id.
@@ -2060,6 +2530,9 @@ let lambda_ids = (let t = map_new () in let _ = map_compact t in t);  // (its ow
 // a loaded file's name -> its realpath, when the two differ (file_rp_note)
 let file_rp = map_new ();
 let thr_body_v = (let v = vec_new () in let _ = vec_push v 0 in v);
+// Native Method-backed Proc ids only, weak metadata with integer values.
+// Swept with proc_store; ordinary and Ruby Method procs leave this empty.
+let native_method_procs = (let t = map_new () in let _ = map_compact t in t);
 let proc_arity = (let t = map_new () in let _ = map_compact t in t);  // (its own arena from birth, compacted by the sweep: note 300)
 // a sentinel prepended to a block's params when a lambda is installed as a
 // block (via &lambda): run_block detects it, strips it, and enforces strict
@@ -2128,9 +2601,26 @@ let meth_broke = map_new ();
 let yscan_defined = map_new ();
 // class name -> the frozen String Module#name answers for it (one per class)
 let cls_name_str = map_new ();
-// hash ids that reached the current call as the LAST element of a splat (see
-// r2k_unflag_tail); cleared as each method binds its parameters
-let r2k_splat = map_new ();
+// Transient argument notes for the call being prepared: empty keywords,
+// the single final splatted ruby2_keywords Hash, and whether a marked Proc
+// keeps that Hash (slot 2 is valid only while slot 1 names a Hash).
+// Native integer slots replace two string/integer maps.
+// Reset at the argument-list boundary; splats publish after their tail has
+// evaluated, so nested calls cannot overwrite an outer call's note.
+let arg_notes = (let v = vec_new () in let _ = vec_push v 0 in
+                 let _ = vec_push v 0 in let _ = vec_push v 0 in v);
+let arg_notes_reset = fn (u: unit) ->
+  let _ = vec_set arg_notes 0 0 in vec_set arg_notes 1 0;
+let arg_empty_set = fn (u: unit) -> vec_set arg_notes 0 1;
+let arg_empty_take = fn (u: unit) ->
+  let set9 = vec_get arg_notes 0 == 1 in let _ = (if set9 then vec_set arg_notes 0 0 else ()) in set9;
+let arg_splat_has = fn (id: int) -> vec_get arg_notes 1 == id;
+let arg_splat_any = fn (u: unit) -> vec_get arg_notes 1 > 0;
+let arg_splat_note = fn (id: int) ->
+  let _ = vec_set arg_notes 1 id in vec_set arg_notes 2 0;
+let arg_splat_forget = fn (u: unit) -> vec_set arg_notes 1 0;
+let arg_splat_keep = fn (u: unit) -> vec_get arg_notes 2 == 1;
+let arg_splat_mark_keep = fn (u: unit) -> vec_set arg_notes 2 1;
 // The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
 // the top level is a MODE, not a call on names -- language/fixtures/def.rb
 // switches it with a bare `public` and the spec then asks Object for the
@@ -2410,6 +2900,17 @@ let mro_next_epoch = fn () ->
   let n = vec_get mro_gen 2 + 1 in
   let _ = vec_set mro_gen 2 n in n;
 let mro_bump = fn () -> vec_set mro_gen 0 (mro_next_epoch ());
+// The tables a method's record reads (mrec_get, note 560 A) are written
+// through these: each write moves the epoch, so no record read before it is
+// taken for one read after. (Most writes come with a method table's change,
+// which moves it anyway; a Method that holds its definition puts its rows
+// back without one.)
+let mrec_set_ss = fn t -> fn (k: str) -> fn (v: str) -> let _ = mro_next_epoch () in map_set t k v;
+let mrec_del_ss = fn t -> fn (k: str) -> let _ = mro_next_epoch () in map_delete t k;
+let mrec_set_si = fn t -> fn (k: str) -> fn (v: int) -> let _ = mro_next_epoch () in map_set t k v;
+let mrec_del_si = fn t -> fn (k: str) -> let _ = mro_next_epoch () in map_delete t k;
+let mrec_set_sv = fn t -> fn (k: str) -> fn (v: Val) -> let _ = mro_next_epoch () in map_set t k v;
+let mrec_del_sv = fn t -> fn (k: str) -> let _ = mro_next_epoch () in map_delete t k;
 let mro_now = fn () -> vec_get mro_gen 0;
 // (only a name mro_local_name accepts ever gets a local epoch -- see
 //  mro_lookup_enter and mro_bump_class -- so any other name is the global
@@ -2446,6 +2947,12 @@ let mro_bump_class = fn (c: str) ->
 // the generation at which Integer's operators were last found to be the
 // builtins (slot 0), the answer (slot 1), and whether there is one (slot 2):
 // see int_ops_plain
+// Numeric comparison overrides, invalidated with method-table generation.
+// Only integer counters are cached; no Ruby receiver or closure is retained.
+let numeric_cmp_st =
+  (let v = vec_new () in
+   let _ = vec_push v (0 - 1) in
+   let _ = vec_push v 0 in v);
 let int_fast_st =
   (let v = vec_new () in
    let _ = vec_push v 0 in
@@ -2773,13 +3280,16 @@ let pos_name_id = fn (s: str) ->
         let _ = vec_push pos_names s in
         let _ = map_set pos_name_ids s i in
         i);
-let cur_meth_set = fn (s: str) ->
-  let i = (if map_has meth_name_ids s then map_get meth_name_ids s
-           else (let n = vec_get meth_name_next 0 in
-                 let _ = vec_set meth_name_next 0 (n + 1) in
-                 let _ = map_set meth_names n s in
-                 let _ = map_set meth_name_ids s n in n)) in
-  vec_set cur_fm 1 i;
+// (a method label's number in meth_names, given one the first time it is
+//  asked: cur_meth_set, and a method's record, which keeps its label's --
+//  mrec_build -- so that a call sets it with no hashing)
+let meth_name_id = fn (s: str) ->
+  if map_has meth_name_ids s then map_get meth_name_ids s
+  else (let n = vec_get meth_name_next 0 in
+        let _ = vec_set meth_name_next 0 (n + 1) in
+        let _ = map_set meth_names n s in
+        let _ = map_set meth_name_ids s n in n);
+let cur_meth_set = fn (s: str) -> vec_set cur_fm 1 (meth_name_id s);
 // ⚠ A NAME-MEMBERSHIP TEST IS A SET LOOKUP, NOT A CHAIN OF COMPARISONS. These
 // three predicates ran 23-24 `str_eq` against literals, once per dispatch, and
 // the answer for almost every name is "no" -- so almost every call paid all 24.
@@ -3077,8 +3587,9 @@ let ns_modmeth = name_set "modmeth";
 let map_set_s = fn tbl -> fn (k: str) -> fn (v: str) ->
   if map_has tbl k && str_eq (map_get tbl k) v then () else map_set tbl k v;
 // the same, for a table keyed by an INT. The call-stack tables (call_names_s,
-// call_files_s, call_meths_s, call_lines, live_frames) are keyed by the call
-// DEPTH or a frame id, and they were keyed by its decimal spelling: nine
+// call_lines, live_frames; and call_file_ids, call_meth_ids, which keep
+// numbers) are keyed by the call DEPTH or a frame id, and they were keyed by
+// its decimal spelling: nine
 // `str_of_int` per method call, each one an asprintf. That was the single
 // largest cost in a dispatch-heavy program -- 1,207 of 4,600 samples in
 // method_body_flow alone.
@@ -3215,6 +3726,7 @@ let meth_source_get = fn (key: str) -> fn (field: int) ->
 let meth_source_has = fn (key: str) -> fn (field: int) ->
   match meth_source_get key field with VNil -> false | _ -> true;
 let meth_source_set = fn (key: str) -> fn (field: int) -> fn (value: Val) ->
+  let _ = mro_next_epoch () in
   let (line, file, last, flags) = (if map_has meth_src key then map_get meth_src key else (VNil, VNil, VNil, VNil)) in
   map_set meth_src key (if field == 0 then (value, file, last, flags)
                        else if field == 1 then (line, value, last, flags)
@@ -3228,6 +3740,26 @@ let meth_source_delete = fn (key: str) -> fn (field: int) ->
 // "cls#name" -> 1 for a method the prelude wrote: ruby's C method, which has
 // no `$~` of its own -- it matches into its caller's (see rx_cfunc_frame)
 let meth_cfn = map_new ();
+// A METHOD'S RECORD (note 560, A): what a call of the method "Class#name"
+// reads of the tables above -- its alias's source and origin, its cref, its
+// class-variable class, its nesting, its parameters' Array, whether C runs
+// it, whether define_method made it, its first and last line -- read once
+// and kept, with the texts the frame is given (frame_text) and its label.
+// It holds while no method table has moved since (mro_gen's epoch, slot 2:
+// every method defined, removed or aliased moves it), kept by "Class#name"
+// in mrec_gen; the record itself is written again only when it differs.
+// MERE_RUBY_MREC_CHECK=1 reads the tables at every call too and stops on a
+// difference (mrec_check_on: -1 not asked yet, 0 off, 1 on).
+let mrec_tab = map_new ();
+let mrec_gen = map_new ();
+// (...and a top-level method's, by its name: call_method)
+let mrec_ttab = map_new ();
+let mrec_tgen = map_new ();
+let mrec_check_on = (let v = vec_new () in let _ = vec_push v (0 - 1) in v);
+// (records written again with different contents since the collector last
+//  compacted the two tables: what each leaves behind in their arenas until
+//  then -- gc_sweep_classes)
+let mrec_dirty = (let v = vec_new () in let _ = vec_push v 0 in v);
 // a method's name without its owner: "K#m", "self.m", "o.m" are all "m"
 let def_bare_name = fn (k: str) ->
   let rec from = fn (i: int) -> fn (st: int) ->
@@ -3241,17 +3773,17 @@ let stamp_named_meth_src = fn (key: str) -> fn (name: str) ->
   let last = (if map_has def_end_lines site then map_get def_end_lines site else meth_source_get key 2) in
   let endless = (if map_has def_end_lines ("~" ++ site) then VInt 1 else VNil) in
   let f = cur_file () in
-  let _ = (if str_len f > 10 && str_eq (substring f 0 10) "<internal:" then map_set meth_cfn key 1
-           else if map_has meth_cfn key then map_delete meth_cfn key else ()) in
+  let _ = (if str_len f > 10 && str_eq (substring f 0 10) "<internal:" then mrec_set_si meth_cfn key 1
+           else if map_has meth_cfn key then mrec_del_si meth_cfn key else ()) in
   // ⚠ a NEW definition is no alias: what an alias recorded under this key --
   //   the name it was made from, the class its super resumes above -- is the
   //   old entry's, and a def over it kept them, so `alias saved example;
   //   alias example saved; def example = super` searched for `saved` (issue
   //   #124). A Method that captured the old entry keeps its own snapshot
   //   (msnap_save), so only this key's rows go.
-  let _ = (if map_has alias_srcname key then map_delete alias_srcname key else ()) in
-  let _ = (if map_has alias_origin key then map_delete alias_origin key else ()) in
-  map_set meth_src key (VInt line, frame_text f, last, endless);
+  let _ = (if map_has alias_srcname key then mrec_del_ss alias_srcname key else ()) in
+  let _ = (if map_has alias_origin key then mrec_del_ss alias_origin key else ()) in
+  (let _ = mro_next_epoch () in map_set meth_src key (VInt line, frame_text f, last, endless));
 let stamp_meth_src = fn (key: str) -> stamp_named_meth_src key (def_bare_name key);
 // the definition site of one method is the definition site of another when
 // the second was made FROM the first (an alias, or a define_method given a
@@ -3270,7 +3802,7 @@ let copy_dm_tbl = fn t -> fn (dst: str) -> fn (src: str) ->
 // installs it is not where it was defined.
 let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
   let _ = meth_source_delete key 4 in
-  let _ = (if map_has meth_cfn key then map_delete meth_cfn key else ()) in
+  let _ = (if map_has meth_cfn key then mrec_del_si meth_cfn key else ()) in
   if proc_source_has pk && proc_source_has ("f" ++ pk)
   then (let _ = meth_source_set key 0 (proc_source_get pk) in
         meth_source_set (key) 1 (proc_source_get ("f" ++ pk)))
@@ -3482,6 +4014,61 @@ let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
 // module's refinements, including the ones refined after it; see do_refine).
 // Detached immutable entries preserve the exact active table without
 // allocating an unpooled Map for every class body. Most bodies save Nil.
+// A FRAME'S HEAD (note 560, B): the entries a call writes into its frame for
+// the frame itself -- its self, the method it runs and the class it was
+// defined in, its cref and nesting, its arguments and parameters, its id --
+// are read and written through these, so that where they
+// are kept can change in one place (step 3: an area of the frame's own,
+// note 560 section 7). Today they are the frame's Map entries, as before.
+// One function a key and a use (fh_<key>_<use>), each naming its key as a
+// literal: a name fetched from a table at run time cost a call about 190
+// instructions (its hash, which a literal has ready).
+let fh_args_lv_get = fn env -> lv_get env "__args";
+let fh_args_set = fn env -> fn (v: Val) -> map_set env "__args" v;
+let fh_callee_get = fn env -> map_get env "__callee";
+let fh_callee_has = fn env -> map_has env "__callee";
+let fh_callee_lv_get = fn env -> lv_get env "__callee";
+let fh_callee_lv_has = fn env -> lv_has env "__callee";
+let fh_callee_set = fn env -> fn (v: Val) -> map_set env "__callee" v;
+let fh_cref_lv_get = fn env -> lv_get env "__cref";
+let fh_cref_lv_has = fn env -> lv_has env "__cref";
+let fh_cref_set = fn env -> fn (v: Val) -> map_set env "__cref" v;
+let fh_cvcls_lv_get = fn env -> lv_get env "__cvcls";
+let fh_cvcls_lv_has = fn env -> lv_has env "__cvcls";
+let fh_cvcls_set = fn env -> fn (v: Val) -> map_set env "__cvcls" v;
+let fh_defcls_get = fn env -> map_get env "__defcls";
+let fh_defcls_has = fn env -> map_has env "__defcls";
+let fh_defcls_lv_get = fn env -> lv_get env "__defcls";
+let fh_defcls_lv_has = fn env -> lv_has env "__defcls";
+let fh_defcls_set = fn env -> fn (v: Val) -> map_set env "__defcls" v;
+let fh_defidx_lv_get = fn env -> lv_get env "__defidx";
+let fh_defidx_lv_has = fn env -> lv_has env "__defidx";
+let fh_defidx_set = fn env -> fn (v: Val) -> map_set env "__defidx" v;
+let fh_fid_get = fn env -> map_get env "__fid";
+let fh_fid_has = fn env -> map_has env "__fid";
+let fh_fid_lv_get = fn env -> lv_get env "__fid";
+let fh_fid_lv_has = fn env -> lv_has env "__fid";
+let fh_fid_set = fn env -> fn (v: Val) -> map_set env "__fid" v;
+let fh_has_blk_lv_get = fn env -> lv_get env "__has_blk";
+let fh_has_blk_lv_has = fn env -> lv_has env "__has_blk";
+let fh_has_blk_set = fn env -> fn (v: Val) -> map_set env "__has_blk" v;
+let fh_meth_get = fn env -> map_get env "__meth";
+let fh_meth_has = fn env -> map_has env "__meth";
+let fh_meth_lv_get = fn env -> lv_get env "__meth";
+let fh_meth_lv_has = fn env -> lv_has env "__meth";
+let fh_meth_set = fn env -> fn (v: Val) -> map_set env "__meth" v;
+let fh_nest_lv_get = fn env -> lv_get env "__nest";
+let fh_nest_lv_has = fn env -> lv_has env "__nest";
+let fh_nest_set = fn env -> fn (v: Val) -> map_set env "__nest" v;
+let fh_params_lv_get = fn env -> lv_get env "__params";
+let fh_params_lv_has = fn env -> lv_has env "__params";
+let fh_params_set = fn env -> fn (v: Val) -> map_set env "__params" v;
+let fh_self_get = fn env -> map_get env "self";
+let fh_self_has = fn env -> map_has env "self";
+let fh_self_lv_get = fn env -> lv_get env "self";
+let fh_self_lv_has = fn env -> lv_has env "self";
+let fh_self_lv_set = fn env -> fn (v: Val) -> lv_set env "self" v;
+let fh_self_set = fn env -> fn (v: Val) -> map_set env "self" v;
 let ref_save_active = fn (u: unit) ->
   if map_len ref_active == 0 then (Nil : (str * Val) list)
   else region RFSAVE {
@@ -3682,10 +4269,8 @@ let next_fid = fn () ->
   n + 1;
 let proc_home = (let t = map_new () in let _ = map_compact t in t);  // str(proc id) -> VInt home-frame-id // (its own arena from birth, compacted by the sweep: note 300)
 let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
-// "e": the argument list just evaluated passed keywords that came to nothing
-// (`**{}`, an empty ruby2_keywords hash), which ruby still counts as keywords
-// given; run_block takes it for the block it starts (bind_block_params)
-let blk_kwp = map_new ();
+// arg_notes slot 0 records keywords that came to nothing (`**{}` or an
+// empty ruby2_keywords Hash). run_block consumes it for auto-splat binding.
 let live_frames = map_new ();   // fid -> 1 while that method frame is on the stack
 // callcc's re-entry (note 541 round 14). Off until `require "continuation"`
 // (cont_on is a slot, read on every call: cont_invoke). While on, each call of
@@ -3914,16 +4499,18 @@ let mode_writable = fn (m: str) ->
 //   shape. ruby prints "..." on re-entry, which is what the spec's regexp
 //   matches. The flag is cleared by raise_exc / raise_exc_iv, because a raise
 //   is the one thing that unwinds out of an inspect without returning.
-// The encoding of the format String that sprintf / String#% is running
-// (slot "v"); %c needs it to turn a codepoint into bytes. Saved and restored
-// around each format, since a #to_s run by one format may format another.
-let fmt_enc_cur = map_new ();
-// "k": the name a `%<name>` directive being read has already taken (a second
-// one in the same directive is "named<k2> after <k>")
-let fmt_named_cur = map_new ();
+// Formatting scratch storage is reused after every normal or exceptional
+// return. Busy slots remain separate across nested and interleaved calls.
+// Each slot holds result encoding, prefix, format encoding, named key and
+// its presence flag. Free slots retain no output or format text.
+let fmt_state_pool = vec_new ();
+let fmt_state_busy = vec_new ();
 // an object whose #inspect is being asked by `super` from the program's own:
 // inspect_w answers the builtin text for it (keyed by the object's id)
 let insp_super = map_new ();
+// has a constant ever named an instance of a Module subclass? ("y" when so:
+// until then no object's #inspect / #to_s has to ask -- mod_inst_name_s)
+let modinst_named = map_new ();
 let frz_busy = map_new ();
 let hng_store = map_new ();
 // (every write goes through here, and an Array's -- an "arr:" key -- notes
@@ -4074,7 +4661,7 @@ let rx_gbodies = (let t = map_new () in let _ = map_compact t in t);  // (its ow
 let rx_prog_names = map_new ();
 // the cache key of the pattern currently being matched, so the MatchData it
 // publishes can name its groups.
-let rx_cur = map_new ();
+let rx_cur = (let t = map_new () in let _ = map_compact t in t);  // (its own arena, compacted by the collector)
 // The line of the literal the last check of queued regexp literals refused
 // (rx_check_go), 0 when it refused none: the line a required file's, or an
 // eval's, SyntaxError says for a literal only the regexp engine refuses. A
@@ -4540,6 +5127,9 @@ let vm_tail_name = map_new ();
 //  :call is the VM's to fire there, not run_meth's on the way in:
 //  vm_late_call, vm_body_late)
 let vm_late_ids = map_new ();
+// Whether a program can throw the VM's jump signal (vm_jump): by id, its
+// generation * 4 plus 1 (it cannot) or 2 (it can) -- vm_may_jump
+let vm_jump_memo = map_new ();
 // A program's id: one given back (vm_free) or a new one. Its instructions are
 // its tree's (vm_tree_put); until they are there it has none.
 let vm_slot = fn (u: unit) ->
@@ -4728,8 +5318,13 @@ let load_ctx = (let t = map_new () in let _ = map_compact t in t);  // (its own 
 // where execution is: the line of the statement being run (0 = not known, e.g.
 // inside a body that was synthesised rather than parsed).
 let call_names_s = map_new ();
-let call_files_s = map_new ();
-let call_meths_s = map_new ();
+// the file and the method a call was made from, per call depth: their numbers
+// in pos_names and meth_names (cur_fm's two slots), kept as they were when
+// the call was made and put back when it returns (cur_file_back,
+// cur_meth_back) -- the names themselves were compared and hashed again at
+// every call (note 560, C). call_file_at reads one back as a name.
+let call_file_ids = map_new ();
+let call_meth_ids = map_new ();
 // the method the innermost frame is running ("" at the top level)
 let cur_meth = fn () -> map_get meth_names (vec_get cur_fm 1);
 // The label ruby writes in a frame. Through 3.3 it was the method alone, so
@@ -5579,7 +6174,7 @@ and bx_note_meth = fn (k: str) ->
 and bx_note_inc = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note includes bx_str "i" k else ()
 and bx_note_pre = fn (k: str) -> if bx_writing () && bx_master_cls k then bx_note prepends bx_str "p" k else ()
 // (a method key changing hands drops its parameter-name memo, as a write does)
-and bx_meth_memo = fn (b: int) -> bx_walk "m" b (fn (k: str) -> map_delete meth_params k)
+and bx_meth_memo = fn (b: int) -> bx_walk "m" b (fn (k: str) -> mrec_del_sv meth_params k)
 and bx_switch = fn (b: int) ->
   let l = vec_get box_st 2 in
   if l == b then () else
@@ -5608,7 +6203,7 @@ and box_set = fn (b: int) ->
   let _ = vec_set box_st 1 b in
   if vec_get box_st 0 == 1 then bx_switch b else ()
 // ...and a call's box comes back with its file when the call returns: the
-// depth's box is kept beside call_files_s (box_put / box_take), and the
+// depth's box is kept beside call_file_ids (box_put / box_take), and the
 // frames that save a file in a local save the box with it (box_back)
 and box_put = fn (d: int) -> if vec_get box_st 0 == 1 then map_set call_box d (vec_get box_st 1) else ()
 and box_take = fn (d: int) -> if vec_get box_st 0 == 1 && map_has call_box d then box_set (map_get call_box d) else ()
@@ -5623,6 +6218,21 @@ and cur_file_set = fn (s: str) ->
      let _ = box_set (int_of_str (substring s 1 j)) in
      vec_set cur_fm 0 (pos_name_id (substring s (j + 1) (str_len s))))
   else vec_set cur_fm 0 (pos_name_id s);
+// the file a call at depth d was made from, as a name ("" when none)
+let call_file_at = fn (d: int) ->
+  if map_has call_file_ids d then vec_get pos_names (map_get call_file_ids d) else "";
+// ...and the two put back when the call at depth d returns. (A file name
+// kept with its box's mark would go through cur_file_set, which enters the
+// box -- a guard: cur_file_set takes the mark off before pos_name_id, so
+// pos_names holds none today, and the branch is not expected to run.)
+let cur_file_back = fn (d: int) ->
+  if map_has call_file_ids d then
+    (let i = map_get call_file_ids d in
+     let s = vec_get pos_names i in
+     if str_len s > 2 && str_starts_with s chr1_s then cur_file_set s else vec_set cur_fm 0 i)
+  else cur_file_set "";
+let cur_meth_back = fn (d: int) ->
+  if map_has call_meth_ids d then vec_set cur_fm 1 (map_get call_meth_ids d) else cur_meth_set "";
 let set_inc = fn (k: str) -> fn (v: str) ->
   let _ = bx_note_inc k in
   let _ = mro_note_mixins v in let _ = class_sng_note k in let _ = mro_bump_class k in map_set includes k v;
@@ -5865,7 +6475,7 @@ let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
            if str_len b == 0 then ()
            else if map_has sym_all b then (match map_get sym_all b with VBool _ -> map_set sym_all b VNil | _ -> ())
            else map_set sym_all b VNil) in
-  let _ = map_delete meth_params k in store_meth tbl k v;
+  let _ = mrec_del_sv meth_params k in store_meth tbl k v;
 // native_definition_body proves an unobserved anonymous owner, an absent
 // method row and no alias/undef/generated-method or notification-hook state.
 // Retain cache invalidation, owner presence and parameter-cache invalidation.
@@ -5878,14 +6488,14 @@ let set_fresh_meth = fn tbl -> fn (owner: str) -> fn (key: str) -> fn (value: Me
            if str_len b == 0 then ()
            else if map_has sym_all b then (match map_get sym_all b with VBool _ -> map_set sym_all b VNil | _ -> ())
            else map_set sym_all b VNil) in
-  let _ = map_delete meth_params key in store_meth tbl key value;
+  let _ = mrec_del_sv meth_params key in store_meth tbl key value;
 let del_meth = fn tbl -> fn (k: str) ->
   let _ = ast_reader_forget k in
   let _ = capi_note_redef tbl k in
   let _ = bx_note_meth k in
   let _ = vec_set method_store_dirty 0 1 in
   let _ = msnap_save tbl k in
-  let _ = mro_bump () in let _ = map_delete meth_params k in map_delete tbl k;
+  let _ = mro_bump () in let _ = mrec_del_sv meth_params k in map_delete tbl k;
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
@@ -6393,8 +7003,8 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
   let _ = copy_dm_tbl dm_methods dst src in
   let _ = copy_dm_tbl dm_captured dst src in
   let _ = copy_dm_tbl dm_had_blk dst src in
-  let _ = (if map_has meth_cfn src then map_set meth_cfn dst 1
-           else if map_has meth_cfn dst then map_delete meth_cfn dst else ()) in
+  let _ = (if map_has meth_cfn src then mrec_set_si meth_cfn dst 1
+           else if map_has meth_cfn dst then mrec_del_si meth_cfn dst else ()) in
   let _ = (if meth_source_has src 0 && meth_source_has src 1
            // Publish the copied location and sharing flag once. Preserve the
            // destination's end position/endless bit, as the separate writes did.
@@ -6402,8 +7012,8 @@ let copy_meth_src = fn (dst: str) -> fn (src: str) ->
            //  where its :return is fired -- tp_meth_flow)
            then (let last = (if meth_source_has dst 2 then meth_source_get dst 2 else meth_source_get src 2) in
                  let flags = (if meth_source_has dst 3 then 1 else 0) + (if sharing then 2 else 0) in
-                 map_set meth_src dst (meth_source_get src 0, meth_source_get src 1, last,
-                                       if flags == 0 then VNil else VInt flags))
+                 (let _ = mro_next_epoch () in map_set meth_src dst (meth_source_get src 0, meth_source_get src 1, last,
+                                       if flags == 0 then VNil else VInt flags)))
            else (let _ = (if meth_source_has dst 4 then meth_source_delete dst 4 else ()) in
                  if sharing && meth_source_has dst 0 then meth_source_set dst 4 (VInt 1) else ())) in
   // A shared source needs marking only once; repeated Method copies must not
@@ -6436,6 +7046,47 @@ let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
   let _ = map_set bi_reg_r 1 p in
   let _ = (if ni >= 0 then map_set bi_reg_r 2 ni else (if map_has bi_reg_r 2 then map_delete bi_reg_r 2 else ())) in
   vec_set bi_reg_d 0 d;
+// A BUILTIN'S OWN CALLS SEE NO REFINEMENT, as a C body's rb_funcall sees
+// none: `[1, 2].sum` adds with Integer's +, `sort` compares with the class's
+// own <=>, whatever the file that called sum or sort has refined. A builtin
+// runs at the depth of the call that entered it (a Ruby method or block it
+// calls runs deeper), so a call asked about while one is registered at the
+// depth now is either that call itself or one the builtin makes.
+let bi_running_here = fn (u: unit) ->
+  let d = vec_get bi_reg_d 0 in
+  d >= 0 && d == cd_get ();
+// is (n, r) the call the running builtin was entered for?
+let bi_reg_is = fn (n: str) -> fn (r: Val) ->
+  map_has bi_reg_n 0 && map_has bi_name_ix n && map_get bi_name_ix n == map_get bi_reg_n 0
+  && map_has bi_reg_r 0
+  && (let k = map_get bi_reg_r 0 in
+      let p = (if map_has bi_reg_r 1 then map_get bi_reg_r 1 else 0) in
+      match r with
+      | VInt x -> k == 1 && p == x | VStr h -> k == 2 && p == h | VArr h -> k == 3 && p == h
+      | VHsh h -> k == 4 && p == h | VObj h -> k == 5 && p == h | VNil -> k == 6
+      | VBool b -> k == 7 && p == (if b then 1 else 0)
+      | VSym _ -> k == 8
+      | VClass c -> k == 9 && map_has bi_class_name 0 && str_eq (map_get bi_class_name 0) c
+      | VExc (_, _) -> k == 10 | VBig _ -> k == 11 | VRat (_, _) -> k == 12 | VFlt _ -> k == 13
+      | VCpx (_, _) -> k == 14 | VRange (_, _, _) -> k == 15 | VProc h -> k == 16 && p == h
+      | VBind h -> k == 17 && p == h | VRegex (_, _, _) -> k == 18 | VMain -> k == 19
+      | _ -> false);
+// send, __send__ and public_send call what they are given as the caller's
+// own call would, and method, instance_method and respond_to? find it as that
+// call would: the refinements of the caller's file apply to them
+let bi_reg_sends = fn (u: unit) ->
+  map_has bi_reg_n 0
+  && (let i = map_get bi_reg_n 0 in
+      let is = fn (n: str) -> map_has bi_name_ix n && map_get bi_name_ix n == i in
+      is "send" || is "__send__" || is "public_send" || is "method" || is "public_method"
+      || is "instance_method" || is "public_instance_method" || is "respond_to?"
+      // ...and a Method (an object) called runs the method it was taken
+      // with, refined when the refinement was what it found
+      || (map_has bi_reg_r 0 && map_get bi_reg_r 0 == 5
+          && (is "call" || is "bind_call" || is "===" || is "[]" || is "yield" || is "to_proc")));
+// a call made from inside a builtin: no refinement answers it
+let bi_own_call = fn (n: str) -> fn (r: Val) ->
+  bi_running_here () && (if bi_reg_is n r || bi_reg_sends () then false else true);
 // a rescue ends whatever builtin raised at or above its own depth; a later
 // raise at this depth is the program's, not that builtin's
 let bi_raiser_drop = fn (u: unit) ->
@@ -7016,7 +7667,7 @@ let enc_valid = fn (s: str) -> fn (e: str) ->
           || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank" then
     enc_valid_sjis s
   else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
-          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 129 254 64 126 161 254 false
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 161 254 64 126 161 254 false
   else if str_eq e "CP949" then enc_valid_db s 129 254 65 90 97 254 true
   else if str_eq e "GBK" || str_eq e "CP936" then enc_valid_db s 129 254 64 126 128 254 true
   else if str_eq e "GB18030" then enc_valid_gb18030 s 0
@@ -7057,14 +7708,14 @@ let enc_sjis_family = fn (e: str) ->
   || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank";
 // the double-byte families the validator above models, as (lead, trail, trail2)
 // ranges -- the same numbers enc_valid_db is called with, read back here.
-// ⚠ ONLY the ranges that were checked against ruby for EVERY number in the
-// one- and two-byte space. The validator above also models Big5, CP949 and
-// GBK with (129, 254, ...), and ruby disagrees with all three -- it refuses
-// 0x8140 in Big5 and ACCEPTS a bare 0x80 in CP949 and GBK -- so chr leaves
-// them to the refusal below instead of answering from ranges that are wrong
-// in the permissive direction.
+// Checked against Ruby 4.0.10 over all one- and two-byte codepoints.
+// GBK also accepts the single byte 0x80 (handled by enc_clen1 below).
+// CP949 is still outside this model.
 let enc_db_ranges = fn (e: str) ->
   if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "GB12345" then (161, 254, 161, 254, 0 - 1, 0 - 1)
+  else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then (161, 254, 64, 126, 161, 254)
+  else if str_eq e "GBK" || str_eq e "CP936" then (129, 254, 64, 126, 128, 254)
   else (0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
 let enc_max_clen = fn (e: str) ->
   if str_eq e "US-ASCII" then 1
@@ -7072,15 +7723,13 @@ let enc_max_clen = fn (e: str) ->
   else if enc_eucjp_family e then 3
   else if enc_sjis_family e then 2
   else if (match enc_db_ranges e with (l, _, _, _, _, _) -> l) > 0 then 2
-  // ⚠ modelled by the validator above but NOT verified for chr: Big5 and its
-  // variants, CP949, GBK/CP936, and the stateless ISO-2022-JP pair, which
+  // ⚠ modelled by the validator above but NOT verified for chr:
+  // CP949 and the stateless ISO-2022-JP pair, which
   // accepts ASCII and the EUC-JP katakana shift but not the trail pairs.
   else if str_eq e "EUC-TW" || str_eq e "GB18030"
           || str_eq e "Emacs-Mule" || str_eq e "UTF-16BE" || str_eq e "UTF-16LE"
           || str_eq e "UTF-32BE" || str_eq e "UTF-32LE"
-          || str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
-          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" || str_eq e "CP949"
-          || str_eq e "GBK" || str_eq e "CP936"
+          || str_eq e "CP949"
           || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then 0 - 1
   // ⚠ NOT a dummy check. A dummy encoding is never DECODED, but Integer#chr
   // does not decode: ruby hands back the single byte for 0..255 in every one
@@ -7116,7 +7765,7 @@ let enc_clen1 = fn (e: str) -> fn (s: str) ->
     (match enc_db_ranges e with
      | (l_lo, l_hi, t1_lo, t1_hi, t2_lo, t2_hi) ->
        if l_lo > 0 then
-         (if b0 < 128 then 1
+         (if b0 < 128 || (b0 == 128 && (str_eq e "GBK" || str_eq e "CP936")) then 1
           else if b0 >= l_lo && b0 <= l_hi then
             (let v = bv 1 in
              if (v >= t1_lo && v <= t1_hi) || (t2_lo > 0 && v >= t2_lo && v <= t2_hi) then 2 else 0)
@@ -7315,3 +7964,6 @@ let rxv_imf = (let v = vec_new () in let _ = vec_push v 0 in v);
 // per program key: 1 when the cache may be used for it, 0 when not
 let rx_mc_ok = map_new ();
 
+
+// Only a method-generation stamp and a boolean; no Ruby handles are retained.
+let pattern_hash_cache = (let v = vec_new () in let _ = vec_push v (0 - 1) in let _ = vec_push v 0 in v);

@@ -1729,6 +1729,13 @@ let ic_redo_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
 let ic_return_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
   let args = pn_return_arguments cx n in
   let ty = ic_u_type cx u in
+  // (a file's own return answers nothing, and ruby warns of its value as it
+  //  compiles the file -- a rescue or an ensure clause's return is the
+  //  scope's around it: counted, meta 11, for who asked for the compile to
+  //  say, as the Ruby compiler says it)
+  let rec scope_type = fn (x: int) ->
+    (let t = ic_u_type cx x in if (t == 4 || t == 5) && ic_u_parent cx x >= 0 then scope_type (ic_u_parent cx x) else t) in
+  let _ = (if args >= 0 && scope_type u == 0 then (let m = ic_meta cx in vec_set m 11 (vec_get m 11 + 1)) else ()) in
   if ty != 2 && ty != 0 then
     (if ic_through ty then
        (let _ = ic_return_value cx u n args in
@@ -1736,9 +1743,6 @@ let ic_return_node = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
         let _ = ic_in cx u "throw" 1 in
         ic_pop_if cx u popped)
      else ic_refuse "return from here is not compiled yet")
-  // (a file's own return answers nothing, and ruby warns as it compiles:
-  //  the Ruby compiler says that)
-  else if ty == 0 && args >= 0 then ic_refuse "a top-level return with a value is not compiled yet"
   else
     (let sp_l = ic_new_label cx u in
      let _ = ic_emit_label cx u sp_l in
@@ -2022,6 +2026,11 @@ let ic_ensure_part = fn cx -> fn (u: int) -> fn (n: int) -> fn (popped: bool) ->
 //  to a target's receiver, fixed once every target is known). st: a Vec of
 //  [stack_size, position]; ents: a Vec of one list of (topns, index, size,
 //  position).
+// NO STATE, as pm_compile_target_node's NULL: a target written straight
+// to, its receiver and arguments left where they were pushed (a for loop's
+// splat target). A state is [size, position]; none is [-1].
+let ic_mstate_no = fn (u: unit) -> (let v = vec_new () in let _ = vec_push v (0 - 1) in v);
+let ic_mstate_none = fn st -> vec_get st 0 < 0;
 let ic_mstate_push = fn cx -> fn st -> fn ents -> fn (topns: int list) -> fn (size: int) ->
   let _ = vec_set ents 0 (Cons ((topns, vec_get st 0 + 1, size, vec_get st 1), vec_get ents 0)) in
   vec_set st 0 (vec_get st 0 + size);
@@ -2089,10 +2098,13 @@ let ic_target = fn cx -> fn (u: int) -> fn (t: int) -> fn (writes: int) -> fn (c
   else if ty == px_constant_path_target () then
     (let p = pn_constant_path_target_parent cx t in
      let _ = (if p >= 0 then ic_node cx u p false else (let _ = ic_here cx u t in ic_i1 cx u "putobject" (OVal (IvCls "Object")))) in
-     let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
-     let _ = ic_mstate_push cx st ents (Cons (tn, Nil)) 1 in
+     // (with no state -- a for loop's splat target -- the parent is swapped
+     //  under the value and written to, as ruby's is)
+     let _ = (if ic_mstate_none st then (let _ = ic_winsn cx writes t "swap" Nil in ())
+              else (let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
+                    ic_mstate_push cx st ents (Cons (tn, Nil)) 1)) in
      let _ = ic_winsn cx writes t "setconstant" (Cons (ic_osym cx (ic_cname cx (pn_constant_path_target_name cx t)), Nil)) in
-     let _ = ic_winsn cx cleanup t "pop" Nil in ())
+     if ic_mstate_none st then () else (let _ = ic_winsn cx cleanup t "pop" Nil in ()))
   else if ty == px_call_target () then
     (let _ = ic_node cx u (pn_call_target_receiver cx t) false in
      let safe = (if pq_call_target_safe_navigation cx t then
@@ -2102,20 +2114,26 @@ let ic_target = fn cx -> fn (u: int) -> fn (t: int) -> fn (writes: int) -> fn (c
                     let _ = ic_il cx u "branchnil" l in
                     l)
                  else 0 - 1) in
-     let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
-     let _ = ic_mstate_push cx st ents (Cons (tn, Nil)) 1 in
-     let _ = ic_winsn cx writes t "swap" Nil in
+     let none = ic_mstate_none st in
+     let _ = (if none then ()
+              else (let tn = ic_winsn cx writes t "topn" (Cons (ONum 1, Nil)) in
+                    let _ = ic_mstate_push cx st ents (Cons (tn, Nil)) 1 in
+                    let _ = ic_winsn cx writes t "swap" Nil in ())) in
      let flag = (if pq_call_target_ignore_visibility cx t then 16 + 4 else 16) in
      let _ = ic_winsn cx writes t "send" (Cons (ic_cd (ic_cname cx (pn_call_target_name cx t)) flag 1, Cons (OSeq (0 - 1), Nil))) in
+     let _ = (if safe >= 0 && none then ic_push cx writes safe else ()) in
      let _ = ic_winsn cx writes t "pop" Nil in
-     let _ = (if safe >= 0 then ic_push cx writes safe else ()) in
-     let _ = ic_winsn cx cleanup t "pop" Nil in ())
+     let _ = (if safe >= 0 && (if none then false else true) then ic_push cx writes safe else ()) in
+     if none then () else (let _ = ic_winsn cx cleanup t "pop" Nil in ()))
   else if ty == px_index_target () then
     (let _ = ic_node cx u (pn_index_target_receiver cx t) false in
      let (argc, flag0, _, has_kws) = ic_setup_args cx u (pn_index_target_arguments cx t) (pn_index_target_block cx t) (ic_start_line cx t) (ic_nid cx t) 0 in
      if has_kws then ic_refuse "an index target with keywords is not compiled yet"
      else
-       (let first = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in
+       (let none = ic_mstate_none st in
+        let _ = (if none then ()
+                 else
+        (let first = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in
         let rec more = fn (k: int) -> if k <= 0 then (Nil : int list) else (let e = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in Cons (e, more (k - 1))) in
         let topns =
           (if argc == 0 then (let _ = ic_winsn cx writes t "swap" Nil in Cons (first, Nil))
@@ -2124,16 +2142,18 @@ let ic_target = fn cx -> fn (u: int) -> fn (t: int) -> fn (writes: int) -> fn (c
              (let ms = more argc in
               let _ = ic_winsn cx writes t "topn" (Cons (ONum (argc + 1), Nil)) in
               Cons (first, ms))) in
-        let _ = ic_mstate_push cx st ents topns (argc + 1) in
+        ic_mstate_push cx st ents topns (argc + 1))) in
         let splat = bit_and flag0 1 != 0 in
         let ci_argc = (if splat then argc else argc + 1) in
         let _ = (if splat then (let _ = ic_winsn cx writes t "newarray" (Cons (ONum 1, Nil)) in let _ = ic_winsn cx writes t "concatarray" Nil in ()) else ()) in
         let flag = (if bit_and flag0 (1 + 2 + 64) == 0 then bit_or flag0 16 else flag0) in
         let _ = ic_winsn cx writes t "send" (Cons (ic_cd "[]=" flag ci_argc, Cons (OSeq (0 - 1), Nil))) in
         let _ = ic_winsn cx writes t "pop" Nil in
-        let _ = (if argc != 0 then (let _ = ic_winsn cx writes t "pop" Nil in ()) else ()) in
-        let rec pops = fn (k: int) -> if k <= 0 then () else (let _ = ic_winsn cx cleanup t "pop" Nil in pops (k - 1)) in
-        pops (argc + 1)))
+        if none then ()
+        else
+        (let _ = (if argc != 0 then (let _ = ic_winsn cx writes t "pop" Nil in ()) else ()) in
+         let rec pops = fn (k: int) -> if k <= 0 then () else (let _ = ic_winsn cx cleanup t "pop" Nil in pops (k - 1)) in
+         pops (argc + 1))))
   else if ty == px_multi_target () then
     (let before = vec_get st 1 in
      let _ = vec_set st 1 (before - 1) in
@@ -3009,8 +3029,12 @@ let ic_for_index = fn cx -> fn (child: int) -> fn (t: int) -> fn (hidden: str) -
      // (no state is handed down here, so a call or an index target's topn
      //  stays as it was written -- reaching a value, not its receiver: ruby
      //  4.0's `for o.x, y in [[1, 2]]` calls x= on the 2)
+     // (...and a splat's own target is compiled with no state at all, as
+     //  pm_compile_for_node_index hands it NULL: `for *h[:k] in o` writes
+     //  h[:k] with the receiver and the key where they were pushed, no topn
+     //  and nothing left to pop)
      let _ = (if ty == px_multi_target () then ic_multi_target cx child t writes cleanup st ents
-              else ic_target cx child t writes cleanup st ents) in
+              else ic_target cx child t writes cleanup (ic_mstate_no ()) ents) in
      // (the four calls are on the value, with FCALL as ruby writes them:
      //  marked for the VM, to which FCALL is a call without a receiver)
      let recv = Cons (OVal (IvSym ("recv", "US-ASCII")), Nil) in
