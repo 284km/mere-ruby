@@ -1,7 +1,10 @@
 # CRuby tool tests
 
-CI measures the pinned Ruby source's 12 `tool/test` candidate files in four
-partitions. Each side runs the original `tool/test/runner.rb` on its own
+CI measures the pinned Ruby source's 12 `tool/test` candidate files in one
+partition (`tool-shard-0`, one job; four partitions until 2026-11-08, when the
+short macOS jobs were combined without changing any row: see
+`bench/ci_short_shards.md`). On main `0f0413c5` (2026-11-28, ruby 4.0.10) the
+12 files hold 205 tests: 194 MATCH, 0 RED, 11 BOTH. Each side runs the original `tool/test/runner.rb` on its own
 interpreter and passes that interpreter to the upstream runner's `--ruby`.
 CLI children, parallel fixtures and PATH-based `ruby` commands use the same
 side. A private launcher handles interpreter paths containing spaces without

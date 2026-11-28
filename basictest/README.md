@@ -31,6 +31,9 @@ same plan, compiler, source and exact binary provenance as the unittest and
 bootstrap jobs, plus the upstream body/runner and harness hashes. These totals
 are separate from `unittest-report` and `bootstrap-report`.
 
+On main `0f0413c5` (2026-11-28, ruby 4.0.10) both sides are COMPLETE with
+894 cases, all 894 MATCH.
+
 ```sh
 python3 basictest/measure.py --ruby-src .ruby-tests \
   --plan measurement-plan/manifest.json --suites measurement-plan/suites.json \

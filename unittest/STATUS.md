@@ -1,10 +1,19 @@
 # mere-ruby — CRuby's own tests
 
+⚠ **This is a local `unittest/run.sh` record of 186 files (json, psych,
+ruby, zlib), against ruby 4.0.9, last regenerated in November 2026 before the
+reference moved to 4.0.10.** It is not the full measurement. CI measures all
+758 files of `test/` on every push to main: on main `0f0413c5` (2026-11-28,
+[run 46101446305](https://github.com/284km/mere-ruby/actions/runs/46101446305),
+ruby 4.0.10) that was 34,634 named tests, 33,068 MATCH, 1,427 RED, 117 BOTH,
+22 EXTRA, with 60 tests excluded on both sides. See
+[README.md](README.md#the-latest-full-run) and the run's `unittest-report`.
+
 GC exclusion ledger (stage 9, 2026-11-16): **57 tests excluded on both
 interpreters**, measured separately from MATCH/RED/BOTH/EXTRA in the four
-target files. This historical full-suite table below predates that ledger;
+target files. The table below predates that ledger;
 fresh CI reports its actual exclusions separately in `exclusions.tsv` and
-`summary.json`. Allocation comparisons remain enabled.
+`summary.json` (60 in the run above). Allocation comparisons remain enabled.
 The GC-only subset in #112 has 41 exclusions; this integrated stack also
 includes 16 ObjectSpace exclusions, for the 57 counted here.
 

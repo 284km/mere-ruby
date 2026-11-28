@@ -1,15 +1,19 @@
 # mere-ruby
 
 A Ruby implementation written in [Mere](https://merelang.org/), in pure
-Mere, targeting ruby 4.0.10. The saved measurements below were taken
-against ruby 4.0.9; they remain historical until replaced by a 4.0.10 run.
-The [reference upgrade notes](loop/2026-11-24-ruby-4.0.10.md) record the new
-inputs, validation and newly exposed gaps.
+Mere, targeting ruby 4.0.10. The
+[reference upgrade notes](loop/2026-11-24-ruby-4.0.10.md) record the move
+from 4.0.9, its inputs, validation and newly exposed gaps. Each number below
+says which reference it was measured against.
+It runs Ruby two ways -- a tree-walking evaluator, and an ISeq compiler with
+a bytecode VM behind `MERE_RUBY_VM=1` (see [The two executions](#the-two-executions)) --
+and loads C extensions compiled against its own C API
+([capi/README.md](capi/README.md)), so native gems install with `gem install`.
 It is measured by CRuby's own test suites
-and by [ruby/spec](https://github.com/ruby/spec): of the 34,559 tests in
-CRuby's `test/`, **32,462 pass here as they pass under ruby**; all of
+and by [ruby/spec](https://github.com/ruby/spec): of the 34,634 tests in
+CRuby's `test/`, **33,068 pass here as they pass under ruby 4.0.10**; all of
 `basictest` passes; and **2,673 of 2,994 ruby/spec files** are byte-identical
-to ruby — see [Where it stands](#where-it-stands) for every suite and what the
+to ruby 4.0.9 — see [Where it stands](#where-it-stands) for every suite and what the
 rest is. `set`, `pathname` and `digest` are compiled in; the real `csv` gem is
 not, and pointed at it with `-I` this parses CSV byte-identically to ruby
 (`bench/csv.sh`).
@@ -18,48 +22,73 @@ The milestones further down (M0-M6) are how it was first built.
 
 ## Where it stands
 
-Measured by CI on main `baa6422d` (2026-11-14), against ruby 4.0.9. MATCH:
-passes under both. RED: passes under ruby and not here -- the number to work
-on. BOTH: fails under ruby as well, and is not counted.
+Measured by CI on main `0f0413c5` (2026-11-28,
+[run 46101446305](https://github.com/284km/mere-ruby/actions/runs/46101446305)),
+against ruby 4.0.10, except the ruby/spec row, whose record was last swept
+against ruby 4.0.9 (2026-11-11). MATCH: passes under both. RED: passes under
+ruby and not here -- the number to work on. BOTH: fails under ruby as well,
+and is not counted.
 
 | suite | measured | MATCH | RED | BOTH |
 |---|---:|---:|---:|---:|
-| CRuby `test/` (758 files, [unittest/](unittest/README.md)) | 34,559 tests | 32,462 | 1,952 | 134 |
-| `bootstraptest` ([bootstraptest/](bootstraptest/README.md)) | 2,044 | 2,018 | 20 | 5 |
-| `basictest` | 894 | 894 | 0 | 0 |
-| `tool/test` | 205 | 194 | 0 | 11 |
-| ruby/spec ([SPEC_STATUS.md](SPEC_STATUS.md)) | 2,994 files | 2,673 | DIFF 16 | SKIP 305 |
-| the corpus (`corpus/`, byte-for-byte) | 687 programs | 687 | 0 | |
+| CRuby `test/` (758 files as 761 units, [unittest/](unittest/README.md)) | 34,634 tests | 33,068 | 1,427 | 117 |
+| `bootstraptest` ([bootstraptest/](bootstraptest/README.md)) | 2,046 | 2,020 | 20 | 5 |
+| `basictest` ([basictest/](basictest/README.md)) | 894 | 894 | 0 | 0 |
+| `tool/test` ([tooltest/](tooltest/README.md)) | 205 | 194 | 0 | 11 |
+| ruby/spec ([SPEC_STATUS.md](SPEC_STATUS.md), ruby 4.0.9) | 2,994 files | 2,673 | DIFF 16 | SKIP 305 |
+| the corpus (`corpus/`, byte-for-byte, hash index ON and OFF) | 1,033 programs | 1,033 | 0 | |
+| the corpus on the ISeq VM (`tools/iseq/vm_corpus.sh`) | 1,033 programs | 1,033 | 0 | |
 
-What the 1,952 RED of `test/` are, by what they wait on:
+`test/` also has 22 EXTRA (passes here and not under ruby) and 60 tests
+excluded on both sides (`unittest/excludes-gc/`); bootstraptest has one EXTRA.
+On the VM every corpus program ran on the VM itself: none fell back to the
+evaluator.
+
+What the 1,427 RED of `test/` are, by file, from the same run's `files.tsv`:
 
 | | RED | |
 |---|---:|---|
-| C extensions and mkmf | 1,118 | CRuby's C API, its `-ext-` test extensions, building native gems ([KNOWN_GAPS.md](KNOWN_GAPS.md) lists what mkmf reads) |
-| JIT | 444 | test_zjit, test_yjit: a method JIT on top of the VM |
-| GC and ObjectSpace internals | 159 | CRuby's heap layout, compaction and internal constants, which are not answered with made-up values |
-| AST and Ripper | 120 | parse.y-shaped trees (`RubyVM::AbstractSyntaxTree`) |
-| VM, ISeq, coverage | 55 | `RubyVM::InstructionSequence` compiles to ruby's own instructions, to_a and disasm byte for byte (`tools/iseq/`), and a first VM runs a part of them |
-| error_highlight | 12 | |
-| the rest | 44 | each sorted in [LOOP.md](LOOP.md) (52) and (53): a test at a timing bound, callcc re-entry, a test that leans on another's load order |
+| files stopped at a bound or before their summary | 694 | `ruby/test_array.rb` reaches the 2 GiB bound (491), `ruby/test_time.rb` and `ruby/test_sprintf.rb` the 600-second one (123); `json/json_parser_test.rb`, `json_addition_test.rb`, `json_generic_object_test.rb` and `-ext-/string/test_set_len.rb` end without a summary (78); `-ext-/thread/test_lock_native_thread.rb` runs none (2). Every test such a file holds is RED, including the ones that pass when the file is run alone |
+| JIT | 451 | test_zjit, test_yjit, test_yjit_exit_locations: a method JIT on top of the VM |
+| C API test extensions and mkmf | 78 | the rest of `-ext-/` and `mkmf/`: TracePoint and the debug inspector from C, postponed jobs, profile frames, ISeq loading ([capi/README.md](capi/README.md#what-is-missing)) |
+| GC, ObjectSpace and allocation | 68 | `ruby/test_allocation.rb` (58), `objspace/` (9), `ruby/test_gc.rb` (1) |
+| RubyGems | 26 | `test_gem_uninstaller.rb` (20) and three more files |
+| AST, Ripper and Prism | 8 | |
+| VM and ISeq | 6 | `test_iseq.rb`, `test_vm_dump.rb` |
+| the rest | 96 | across 41 files; `ruby/test_string.rb` (18) is the largest |
+
+The three files at a bound completed against ruby 4.0.9 (main `79f287ae`,
+2026-11-24: `test_array` 473 of 477 MATCH, `test_sprintf` and `test_time`
+every test ruby passes) and have stopped at their bounds in every CI run on
+main since the reference moved to 4.0.10. The JSON files completed on main
+`85da98fb` (2026-11-26) and end without a summary from `491cc5ca`
+(2026-11-28) on.
 
 Divergences understood and deliberately left are in
 [KNOWN_GAPS.md](KNOWN_GAPS.md); results that move between runs of the same
 code are listed in [unittest/README.md](unittest/README.md#known-noise-results-that-move-without-the-change).
 
-Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/2e3cc433d470842a07c79cc50bd217441c889dc0)
-for native builds. Anonymous Class/Module metadata collection requires its
+Use the [pinned Mere compiler source](https://github.com/merelang/mere/tree/9dec2ff687a08433247dbdb7729bc19c8522e538)
+for native builds: it is the `MERE_REF` CI builds with, and `mere.toml`
+asks for Mere 0.1.731 or later. Anonymous Class/Module metadata collection requires its
 candidate string-root scanning and bounded-word string Map hashing.
 `tools/build.sh` requires native cache trimming and verifies the compiler’s
-default 64-region cache with zeroed reuse.
+default 64-region cache with zeroed reuse. Native `openssl` needs OpenSSL 3
+(below) before the first build.
 
 ```sh
-./tools/build.sh            # or, by hand, the line below
+./tools/build.sh            # -O2: the build that sweeps and the build that ships
 ./tools/build.sh --fast     # -O1: faster to build than -O2, slower to run (-O0 cannot run the prelude).
                             # For shaping a change, NOT for the record -- the
-                            # sweep refuses an -O0 binary, because every verdict
+                            # spec sweep refuses a --fast binary, because every verdict
                             # in it is bounded in CPU seconds.
+./tools/build.sh --cc-only  # skip the emit and compile the mr.c that is there
+./tools/build.sh --relink   # the same, recompiling mr.c only when it changed
+                            # (for work on the C beside it: capi/, tools/*_glue.c)
 
+# The core of what build.sh does, by hand. build.sh also compiles libprism
+# (vendor/prism), tools/*_glue.c and the C API (capi/*.c) into the same link,
+# with OpenSSL; this line alone does not make a complete mere-ruby.
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 # That line is macOS's. On Linux all three pieces differ, and none of them was
 # written down until CI ran it somewhere else:
@@ -68,10 +97,11 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 #   -fbracket-depth  mainline clang caps nesting at 256, Apple's allows more.
 #                    The Ruby prelude is one `"..." ++ "..."` chain and each ++
 #                    is a bracket there, so it is split into four `let`s as well.
-#                    MEASURED 2026-09-19: the emitted C needs 270, so the flag is
-#                    LOAD-BEARING -- a build without it does not compile. It was
-#                    240 on 2026-09-10 and that note said the default of 256
-#                    would do by sixteen; the sixteen are gone. What grows is the
+#                    MEASURED 2026-09-19: the emitted C needed 270, and the flag
+#                    was LOAD-BEARING -- a build without it did not compile. It
+#                    was 240 on 2026-09-10 and 155 in CI on main 0f0413c5
+#                    (2026-11-28): the number moves both ways, so the flag
+#                    stays. What grows is the
 #                    count of top-level VALUES a function reads, plus each run of
 #                    `let _`s between two of them -- not every top-level `let`
 #                    (functions cost nothing; measured 2026-11-13, see the head
@@ -79,14 +109,13 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 #                    answer and prints both distances on every CI run).
 #   -lm              libm is separate there and part of libSystem here
 #
-# The CORPUS is a macOS gate on purpose. run_corpus.sh diffs this interpreter
-# against the ruby on the machine, and this one reports
-# RUBY_PLATFORM = "arm64-darwin22" wherever it runs -- its socket constants are
-# the BSD ones to match (SOL_SOCKET 65535, AF_INET6 30, SO_REUSEADDR 4). Run it
-# beside a Linux ruby and corpus/108_sockets.rb reports a difference that is
-# real and is not a defect: two platforms' constants, correctly reported by
-# each. Comparing like with like means running where the identity it claims is
-# true -- and, for the same reason, beside the ruby VERSION it claims to be.
+# run_corpus.sh diffs this interpreter against the ruby on the machine, so it
+# has to claim the identity of the platform it runs on: RUBY_PLATFORM is
+# "arm64-darwin25" on macOS and "x86_64-linux" / "aarch64-linux" on Linux, and
+# the socket constants are that platform's (corpus/108_sockets.rb prints
+# them). CI runs the whole corpus on both. Comparing like with like means
+# running where the identity it claims is true -- and, for the same reason,
+# beside the ruby VERSION it claims to be.
 # mere-ruby reports `ruby 4.0.10` (tools/ref_ruby.sh names the same version,
 # and every gate sources it). The oracle has to be that release: 3.4 changed
 # Hash#inspect to put spaces around `=>`, 4.0 prints a Set as `Set[1, 2]`, and
@@ -95,6 +124,7 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 # has to match, so CI pins the oracle to exactly 4.0.10 on darwin. None of those
 # differences was a defect on either side.
 ./mere-ruby script.rb
+MERE_RUBY_VM=1 ./mere-ruby script.rb   # the same program on the ISeq VM
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby
 ```
@@ -142,8 +172,10 @@ RubyGems and the published Bundler (see the RubyGems and Bundler paragraph
 below). It installs C-extension gems with `gem install` through its own mkmf and
 C API — nokogiri among them, compared with ruby by `tools/capi_gem_check.py`
 ([capi/README.md](capi/README.md)) — and takes a real Rails application through
-Bundler, its dependencies, migration, boot, tests and Puma
-([railstest/README.md](railstest/README.md)).
+Bundler, its dependencies, migration, boot, tests and Puma, on the evaluator
+and on the VM ([railstest/README.md](railstest/README.md)). Rails' own
+component test suites are compared with ruby test by test in
+[railstest/framework/](railstest/framework/README.md).
 
 `-stack_size` is not optional. Parsing and evaluating recurse over the
 statement list, so native stack use grows with program size; on the
@@ -162,15 +194,74 @@ Divergences that are understood and deliberately unfixed are tracked in
 [KNOWN_GAPS.md](KNOWN_GAPS.md), with what each costs and what fixing it
 would take — separately from what nobody has looked at yet.
 
+## The two executions
+
+By default a program runs on the evaluator, which walks the parsed tree.
+`RubyVM::InstructionSequence` compiles Ruby to ruby's own instructions --
+`to_a` and `disasm` are compared with ruby's byte for byte (`tools/iseq/`) --
+with a compiler written in Ruby (`lib/iseq_compiler_ext.rb`) and one written
+in Mere (`ic/`); CI compares the two compilers with ruby and with each other.
+`MERE_RUBY_VM` runs whole files on a VM over those instructions:
+
+| value | what happens |
+|---|---|
+| unset or `0` | the evaluator |
+| `1` | each file (the main script and every file it requires) runs on the VM when the compiler and the VM take all of it, and on the evaluator otherwise |
+| `report` | as `1`, and says on stderr which files fell back to the evaluator and why |
+| `strict` | as `1`, and a file the VM does not take raises instead of falling back |
+| `why` | says whether the main script would run on the VM, and runs nothing |
+
+The VM is held to the same answers as the evaluator: CI runs every corpus
+program on it (`tools/iseq/vm_corpus.sh`; a fallback not listed in
+`tools/iseq/vm_fallbacks.txt` fails, and the list is empty at present),
+compares `ISeq#eval` snippets with ruby on the VM alone
+(`tools/iseq/vm_check.sh`), and runs the C API contracts on it
+(`tools/capi_check.py --vm`). `unittest/vm_compare.sh` runs CRuby's tests on
+both executions and compares them test by test; CI runs it on the weekly
+schedule and by hand. Its last run over all of `test/ruby` (main `d5869476`,
+2026-11-25, `loop/2026-11-25-stage10-test-ruby-whole.md`) found two tests
+that fail on the VM alone.
+
+## Settings in the environment
+
+These are mere-ruby's own. Some harnesses give mere-ruby a cleaned
+environment and drop any `MERE_RUBY_*` the caller has set: CI's CRuby,
+bootstrap, basic and tool measurements (`unittest/ci.py` and the
+`measure.py` scripts built on it), `mspec/run_spec.sh` (an `env -i`
+allowlist), the C API checks (`tools/capi_check.py`, `capi_gem_check.py`,
+`capi_spec_check.py`, `capi_mkmf_check.py`; `--vm` asks for the VM), and
+`railstest/measure.py` and `railstest/framework/run.py` (`--mere-env` passes
+one on explicitly). Others inherit the caller's settings: `run_corpus.sh`
+runs the candidate with whatever the caller exported (`--both` only clears
+`MERE_RUBY_NO_HASH_INDEX` for its first pass), so an exported
+`MERE_RUBY_VM`, `MERE_RUBY_GC_TIGHT` or `MERE_RUBY_GC_STRESS` changes what the
+corpus comparison measures. `tools/iseq/vm_corpus.sh`, `unittest/run.sh` and
+`unittest/try.sh` inherit them the same way (`vm_corpus.sh` sets
+`MERE_RUBY_VM` itself, and `unittest/vm_compare.sh` sets or unsets it per
+pass).
+
+| variable | |
+|---|---|
+| `MERE_RUBY_VM` | the ISeq VM, above |
+| `MERE_RUBY_NO_GEMS=1` | do not require RubyGems before the program, as `--disable=gems` |
+| `MERE_RUBY_NO_HASH_INDEX=1` | Hash lookups walk instead of using the index (`run_corpus.sh --both` runs every program both ways) |
+| `MERE_RUBY_STACKTRACE=1` | the recursion guard prints the innermost call names before it raises SystemStackError |
+| `MERE_RUBY_GC_TIGHT=1` | the collector's byte trigger fires at baseline + 8 MB instead of 2x + 32 MB, so the peak follows what is live rather than when a collection happened to run. The memory comparisons between builds recorded in `loop/` use it, with a fixed test seed (`--seed=1`) |
+| `MERE_RUBY_GC_STRESS=N` | collect at every Nth safepoint, pressure or not (a missing root shows up as a wrong answer) |
+| `MERE_RUBY_GC_LOG=1` | log each collection |
+| `MERE_RUBY_STORE_STATS=1` | print the interpreter's table sizes at the end (`=exit`: after the `at_exit` handlers) |
+
 ## Gates
 
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 687 programs, byte-for-byte
+./run_corpus.sh                                  # every corpus program, byte-for-byte
 ./run_corpus.sh --both                           # ...with the hash index ON and OFF,
                                                  # running the reference once, not twice
-                                                 # (and eight SOURCE gates, see tools/)
+                                                 # (and the SOURCE gates below first)
+sh tools/iseq/vm_corpus.sh -j 3                  # every corpus program on the ISeq VM
+sh tools/iseq/vm_check.sh                        # ISeq#eval snippets on the VM against ruby
 ./bootstraptest/all.sh <ruby-checkout>           # legacy assert_equal pairs (a subset)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./mspec/record_hygiene.sh                        # the records name no machine and no operator
@@ -191,9 +282,10 @@ native runner, including exit, pattern, syntax and finish assertions. See
 [bootstrap measurement](bootstraptest/README.md) for the complete manifest,
 bounded execution, explicit skips and saved per-assertion results.
 
-`run_corpus.sh` also runs eight SOURCE gates before it runs a program, because
-each of them catches a defect that is invisible at runtime -- a rule written
-twice, a table nobody reads, a guard that silently disables the arm behind it:
+`run_corpus.sh` also runs SOURCE gates and two interpreter self-checks before
+it runs a program, because each of them catches a defect that is invisible at
+runtime -- a rule written twice, a table nobody reads, a guard that silently
+disables the arm behind it. The gates are in `tools/`:
 
 | gate | what it refuses |
 |---|---|
@@ -201,16 +293,29 @@ twice, a table nobody reads, a guard that silently disables the arm behind it:
 | `dup_defs_check.sh` | one name defined twice in a chain (the second silently wins) |
 | `dead_defs_check.sh` | a top-level function nothing calls |
 | `meth_writes_check.sh` | a method-table write that skips the generation bump |
+| `iv_door_check.sh` | an instance variable read or written by its table key instead of through the shape (the read finds nothing, quietly) |
+| `strbuf_region_check.py` | a StrBuf made outside a region block (its buffer would stay for the rest of the run) |
 | `name_spec_check.sh` | a `name_set` tag with no arm (an empty table answers false about every name), and an arm nobody asks for |
+| `rx_caps_check.sh` | a regex capture slot written around `rx_cap_set` (the next match answers with the last one's group) |
 | `ns_names_check.sh` | a namespace arm and its name list disagreeing -- either a name the call refuses though the arm implements it, or one respond_to? claims and the arm does not |
 | `name_len_check.sh` | a length guard that is not its literal's length, which makes the arm UNREACHABLE with no build error |
-| `rx_caps_check.sh` | a regex capture slot written around `rx_cap_set` (the next match answers with the last one's group) |
 | `bracket_depth_check.sh` | the emitted C outgrowing the nesting the build passes (CI-only: it needs the C) |
 
-`mspec/record_hygiene.sh` is the tenth: it refuses a record that names a
+The self-checks ask the built interpreter: every Errno class has its
+strerror text (`MERE_RUBY_ERRNO_CHECK=1`), and the per-class shape tables
+hold a few hundred keys at most after 3,000 classes are made and dropped
+(`tools/shape_class_tables_check.rb`).
+
+`mspec/record_hygiene.sh` runs there too: it refuses a record that names a
 machine or an operator, a tag file whose row count disagrees with its table
 row (which is what a killed sweep leaves behind), and a tag file with no table
 row at all.
+
+`run_corpus.sh` takes `MR_BIN` (the binary to test, default `./mere-ruby`),
+`CORPUS_KEEP_GOING=1` (report every difference instead of stopping at the
+first) and `CORPUS_STDERR=warnings|all` (compare stderr too). Two runs may go
+at once, even in one tree: a corpus program that writes a file names it with
+its process id, and one that listens asks for port 0.
 
 ⚠ **The sweep clones the spec tree ONCE, not once per file.** Measured
 2026-09-22: a spec file cost 2.71s of which 1.89s was SYS and 0.15s user --
@@ -289,19 +394,19 @@ one-shot decoding; the Ruby streaming inflater keeps its existing bounded
 reader and dictionary handling.
 
 `prism` is CRuby's parser, and `require "prism"` works here because
-[libprism](vendor/prism/) -- Prism 1.8.2, the copy Ruby 4.0.9 ships, as C
--- is compiled into the binary by `tools/build.sh` and reached through five
-`extern fn` (`tools/prism_glue.c`). Each returns the parser's SERIALIZED
+[libprism](vendor/prism/) -- Prism 1.8.2, the copy Ruby 4.0.9 and 4.0.10
+ship, as C -- is compiled into the binary by `tools/build.sh` and reached
+through eight `extern fn` (`prism_*` in `m_state.mere`, written in
+`tools/prism_glue.c`). The parse returns the parser's SERIALIZED
 answer, and Prism's own Ruby library (shipped, as json's is; generated by
 `tools/gen_prism_lib.rb`) deserializes it into the node tree -- the shape of
 Prism's FFI backend on other Ruby implementations, with Mere's `bytes` in
 place of FFI::MemoryPointer. The C extension (`prism/extension.c`) is not
 used; `lib/prism_ext.rb` answers `require "prism/prism"` in its place. This
 is the first of two steps: the parser itself is to be written in Mere behind
-the same five externs. What `test/prism` still fails is Ripper (lex_test,
-magic_comment_test, ripper_test compare against it), `RubyVM::InstructionSequence`
-(newline_test, locals_test) and mere-ruby's own parser refusing or accepting
-what CRuby's does not.
+the same externs. Of `test/prism` and `test/ripper` together (75 files,
+14,005 tests at main `0f0413c5` against 4.0.10), 8 tests are RED: one in
+magic_comment_test and seven in test/ripper.
 
 `ripper` is parse.y with event callbacks, a C extension. Here `::Ripper` is
 `Prism::Translation::Ripper` -- Ripper's API over Prism's tree, as on
@@ -312,10 +417,8 @@ event handlers that answer their first argument) in `lib/ripper_ext.rb`,
 which answers `require "ripper"` and every name ripper's own files are
 required by. Prism documents the known differences: some scanner events are
 not dispatched during `#parse`, and a syntax error's message is Prism's, not
-parse.y's. test/prism's lex_test and ripper_test (which compare Prism with
-Ripper) pass; test/ripper's `test_files_*` do not, because the translation
-reads what a parser's callbacks RETURN (`arguments&.any?`) where the C core
-does not -- an upstream difference, not this interpreter's.
+parse.y's. Every file of test/ripper runs to its summary here, as under ruby
+(two are ZERO on both sides); the seven RED above are what remains.
 
 `python3 unittest/zlib_compression_check.py` checks both formats in both
 directions against Python's native zlib/gzip, including binary data, input
@@ -345,13 +448,13 @@ stdlib directory of its own to seed it with. `-I` and `RUBYLIB` fill it,
 in that order, exactly as in ruby:
 
 ```sh
-./mere-ruby -I/path/to/ruby/lib/ruby/3.2.0 script.rb
-RUBYLIB=/path/to/ruby/lib/ruby/3.2.0 ./mere-ruby script.rb
+./mere-ruby -I/path/to/ruby/lib/ruby/4.0.0 script.rb
+RUBYLIB=/path/to/ruby/lib/ruby/4.0.0 ./mere-ruby script.rb
 ```
 
 Pointed at a CRuby installation's stdlib, mere-ruby runs a good deal of
 it directly. `fileutils` and `uri` also ship embedded; `URI.parse`,
-`URI.join` and `URI.encode_www_form` follow the pinned Ruby 4.0.9 source.
+`URI.join` and `URI.encode_www_form` follow the pinned Ruby source.
 ⚠ MEASURED 2026-09-20, and two of the three names this sentence used to carry
 were wrong in opposite directions. `uri` did NOT load: a constant defined in a
 `class << self` body could not be read from that same body (`uri/common.rb`
@@ -392,8 +495,8 @@ portable Digest/HMAC/AES remain available and native key/certificate/TLS
 operations raise `NotImplementedError`.
 
 The OpenSSL selection covers all 32 nonempty upstream files and 593 tests
-from Ruby 4.0.9: 591 match and two FIPS tests skip on both sides on macOS and
-Linux. This includes PKCS12, PKCS7/S/MIME, OCSP, Timestamp and Netscape SPKI.
+from Ruby 4.0.10: 591 match and two FIPS tests skip on both sides (CI, main
+`0f0413c5`, macOS). This includes PKCS12, PKCS7/S/MIME, OCSP, Timestamp and Netscape SPKI.
 Engine discovers zero reference tests and is excluded from the pass count.
 Independent wire, cryptographic-vector, cross-format, TLS-peer and
 resource-lifetime gates live in `unittest/openssl_*_check.py`; the complete
@@ -604,9 +707,11 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **687 programs,
-687 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
-index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
+and under `./mere-ruby` and diffs the output byte-for-byte: **1,033 programs,
+1,033 identical** in CI on main `0f0413c5` (2026-11-28) — and again with
+`MERE_RUBY_NO_HASH_INDEX=1`, so the hash index cannot hide behind the walk it
+replaced, and once more on the ISeq VM. CI runs the corpus on macOS and on
+Linux. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
 ## Conformance (ruby/spec)
@@ -634,48 +739,53 @@ it is not a complete inventory. CI's `measurement-plan/suites.json` separately
 lists the broader target suites and inputs still awaiting measurement.
 
 The record covers **2994 spec files**: **2673 MATCH, 16 DIFF, 0 CRASH**,
-305 SKIP, 0 SLOW, against ruby 4.0.9. Run with no
+305 SKIP, 0 SLOW, against ruby 4.0.9 (last swept 2026-11-11; it has not yet
+been swept against 4.0.10). Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
-one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
-the end).
+one table is measured by ONE build (`MR_BIN`, default `./mere-ruby`; the
+sweep refuses a `tools/build.sh --fast` binary unless `SPEC_BUILD_OK=1`).
 
 ⚠ **The record is measured against ONE ruby/spec tree, and it is not ruby's
-master.** `SPEC_STATUS.md` names it on its last line (`ruby@84a27934cf53`, the
-ruby/ruby commit whose `spec/ruby` it is). A checkout of anything newer has a
+master.** `SPEC_STATUS.md` names it on its last line (`ruby@3e93b23afcec`, the
+ruby/ruby commit tagged v4.0.9, whose `spec/ruby` it is; until 2026-11-09 the
+record was master's `84a27934cf53`). A checkout of anything else has a
 different number of files in some groups (core/string has 124 on 2026-10-03's
 master and 114 in the record), and `scoreboard.sh` refuses to sweep it rather
 than let the new files read as regressions. Make the tree once, beside your
 ruby checkout, and sweep that:
 
 ```sh
-git -C <ruby-checkout> worktree add --detach ../ruby-spec-84a2793 84a27934cf53
-./mspec/scoreboard.sh ../ruby-spec-84a2793/spec/ruby          # core, language, ...
-SPEC_WITH_STDLIB=1 ./mspec/scoreboard.sh ../ruby-spec-84a2793/spec/ruby   # library/
+git -C <ruby-checkout> worktree add --detach ../ruby-spec-3e93b23 3e93b23afcec
+./mspec/scoreboard.sh ../ruby-spec-3e93b23/spec/ruby          # core, language, ...
+SPEC_WITH_STDLIB=1 ./mspec/scoreboard.sh ../ruby-spec-3e93b23/spec/ruby   # library/
 ```
 
 Moving the record to a newer tree is a deliberate upgrade of the suite
 (`SPEC_TOTALS_OK=1`, the whole table re-measured together), not a pull.
 
-**`core` and `language` are now measured in full**: 2133 of 2133 core files and
-80 of 80 language files, every directory the suite has, nested ones included.
-`library` is measured for the libraries this ships: **735 of 1516**, across 66
-groups.
+**`core` and `language` are measured nearly in full**: of that tree's 2,095
+core files every directory but `core/enumerator/generator` and
+`core/enumerator/yielder` (6 files) has a row, and all 79 language files do.
+`library` is measured for the libraries this ships: **793 of 1517**, across 68
+groups. One row, `core/ruby/source_range` (1 file, SKIP), is left over from
+master's tree and has no file in v4.0.9's.
 
-⚠ **2948 is not all of ruby/spec** -- the suite has 3821 files, and the number
-worth writing down is the one that says what is NOT being asked. Here are the
-other 873, counted so that they add up:
+⚠ **2994 is not all of ruby/spec** -- the v4.0.9 tree has 3783 files, and the
+number worth writing down is the one that says what is NOT being asked. Here
+are the other 790, counted so that they add up:
 
 | files | not measured | why |
 |---|---|---|
-| 781 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
+| 724 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is MEASURED rather than remembered: on 2026-09-22 every `require` the then-unrecorded groups made was asked of this interpreter, and the groups whose libraries all loaded were swept |
 | 46 | `optional/capi` | measured by `tools/capi_spec_check.py`, not by this sweep: each spec file needs its C extension built for both rubies. Its record is `capi/check/spec_expect.tsv` -- 2,420 of the reference's 2,602 examples pass (2026-11-24, Ruby 4.0.10) |
-| 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
-| 13 | `security` | CVE regressions; four of them need rubygems or optparse |
-| 1 | `optional/thread_safety` | one file; it needs the scheduling `core/thread` is still thin on |
+| 14 | `security` | CVE regressions |
+| 6 | `core/enumerator/generator`, `core/enumerator/yielder` | no row yet |
 
-A percentage over a surface you chose is worth less than the list of what you
-left out, so the list is here and it adds to 3821.
+`command_line` (32 files) is in the record, and `clitest/` also measures the
+executable's flag handling directly. A percentage over a surface you chose is
+worth less than the list of what you left out, so the list is here and it adds
+to 3783 (2993 real files in the record, plus these 790).
 
 ⚠ **The 448 files added on 2026-09-22 cost no interpreter change at all**, and
 picking them was the whole of the work. `library/` has 118 directories with no
@@ -726,9 +836,10 @@ asks "did it run at all", and mere-ruby printed no tally where ruby ran eleven
 examples. When two instruments disagree, find out which question each is
 answering before believing the friendlier one.
 
-**Nothing aborts on its own** — CRASH is 0, and the eight SLOW files were
-stopped by one of this harness's bounds (six by the CPU budget, one by the
-memory cap), not by the interpreter giving up. ⚠ That distinction is now the
+**Nothing aborts on its own** — CRASH is 0, and so is SLOW now. When the
+record had eight SLOW files they were stopped by one of this harness's bounds
+(six by the CPU budget, one by the memory cap), not by the interpreter giving
+up. ⚠ That distinction is now the
 definition rather than a convention: a SIGKILL from `mspec/rss_guard.sh` used
 to be filed as CRASH, which is a claim about the interpreter, and its row names
 the bound instead. So the gap is not "cannot", and a group score reads low for
@@ -740,18 +851,18 @@ reports as a crash because the process dies before it can report.
 A whole group can carry a crash for a handful of integers.
 
 Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
-down to a bounded number of **kinds**, and the largest single one is
-`NoMethodError` (227 files): a name that is not there, which is missing surface
-rather than wrong behaviour -- and it grew with the measured surface, because
-the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
-the ones whose names are thinnest. The next-largest kinds are VALUE mismatches
-(`expected "S", got "S"`, `expected N, got N`) and REFUSALS ruby makes and this
-does not (`expected ArgumentError to be raised`). Because ruby/spec is laid out
+down to a bounded number of **kinds**. When it was last generated
+(2026-10-01, from 185 DIFF files; the record now has 16) the kinds were led
+by missing surface (`NameError`, `NoMethodError`: a name that is not there),
+VALUE mismatches (`expected "S", got "S"`, `expected N, got N`) and REFUSALS
+ruby makes and this does not (`expected ArgumentError to be raised`).
+`./mspec/causes.sh` rewrites it from `mspec/tags/` without a sweep. Because
+ruby/spec is laid out
 as `core/<class>/<method>_spec.rb`, those files name the absent methods
 themselves -- `CAUSES.md` ends with that list, per class, and
 [`MISSING_NAMES.md`](MISSING_NAMES.md) asks the same question from the other
-side (ruby's own method lists, probed under this interpreter: **185 absent of
-1413**).
+side (ruby's own method lists, probed under this interpreter: **58 absent of
+1410** on 2026-09-30, against ruby 4.0.6).
 
 ⚠ A record refreshed only when someone remembers is a claim about the past. One
 re-sweep found the table had drifted 3 files from the committed interpreter, so
@@ -769,5 +880,7 @@ mutual recursion carry it naturally. What doesn't carry — float
 formatting fidelity, for one — gets found, recorded in `PAIN.md`, and
 fixed upstream.
 
-Native only in practice (built via the C backend); the interpreter core
-is backend-agnostic.
+Native builds go through Mere's C backend and the browser build through its
+Wasm backend ([In the browser](#in-the-browser)); the interpreter core is
+backend-agnostic. The ISeq VM came later, beside the tree-walking evaluator
+([The two executions](#the-two-executions)).

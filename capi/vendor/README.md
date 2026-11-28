@@ -40,3 +40,15 @@ its `Init_escape` (renamed there to `mr_static_Init_erb_escape`, so that
 another extension's `Init_escape` cannot meet it), and its methods are C
 functions, so `Method#source_location` is nil as on ruby. `HAVE_RB_EXT_RACTOR_SAFE`
 is defined there, as its extconf.rb's `have_func` would.
+
+`cgi_escape.c` is CRuby's `ext/cgi/escape/escape.c` (`CGI::EscapeExt`:
+`escapeHTML`, `unescapeHTML`, `escape`, `unescape`, `escapeURIComponent`,
+`unescapeURIComponent`), also unchanged, compiled by `capi/static_cgi_escape.c`
+and linked into the executable the same way: `require "cgi/escape"` runs its
+`Init_escape` (renamed to `mr_static_Init_cgi_escape`, in its own file because
+erb's `escape.c` has static functions of the same names) from the table in
+`capi/static_ext.c`.
+
+`capi/tools/headers_check.py` maps the two renamed files back to their paths
+in the ruby tree (`erb_escape.c` to `ext/erb/escape/escape.c`, `cgi_escape.c`
+to `ext/cgi/escape/escape.c`) when it compares them.
