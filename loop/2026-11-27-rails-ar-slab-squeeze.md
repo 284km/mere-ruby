@@ -165,14 +165,44 @@ loaded; the cause is not found.
   and the compressor held 13-15 GiB through these runs, so the size of the
   gain is not settled here.
 
+## The scratch Vecs' arena (PR review, 2026-11-28)
+
+The two scratch Vecs were made with `vec_new` and so filled the default
+region, which `vec_recycle` cannot give back: the first big squeeze's copies
+stayed there. They are now compacted when they are made (a527ed56). One
+squeeze of 500,000 live areas: default region 130 MB cap / 81 MB allocated
+before, 63 MB / 40 MB after.
+
+## eager_test under run.py on Linux (2026-11-28)
+
+Docker, Debian arm64 with ruby 4.0.10 and clang 19, the gems installed by
+run.py in the container. The squeeze build is the PR head a527ed56, the
+other main 491cc5ca, alternating, `--jobs 1 --side mere`, family RSS limit
+2 GiB.
+
+| build | state | time to the limit | peak family RSS | cases done |
+| --- | --- | --- | --- | --- |
+| squeeze | MEMORY_LIMIT | 430 s | 2.00 GiB | 197 (196 pass, 1 F) |
+| main | MEMORY_LIMIT | 371 s | 2.00 GiB | 197 (196 pass, 1 F) |
+| squeeze | MEMORY_LIMIT | 477 s | 2.00 GiB | 197 (196 pass, 1 F) |
+| main | MEMORY_LIMIT | 314 s | 2.00 GiB | 197 (196 pass, 1 F) |
+
+- Both builds are stopped at the same place, in the last two cases (the
+  65,536-row fixture). The squeeze reaches the limit later but does not get
+  eager_test under it on Linux. On macOS both builds finished, so macOS RSS
+  is not a stand-in for the Linux limit.
+- (The tree the runs started from was a copy without `.git`, given an empty
+  local commit so run.py could record `source_ref`; that field is not a real
+  commit.)
+
+## sq-stress-vm with `CORPUS_KEEP_GOING=1`
+
+Stopped by hand at 523 (587 files ok, 0 FAIL) on the head before a527ed56,
+to free the machine. The rest (524 on) is not run.
+
 ## Next
 
-1. The same comparison on Linux (docker), where CI's limit applies and
-   nothing is compressed: the two builds alternating, two runs each, with
-   run.py's limits. The PR is merged only after this is in it.
-2. sq-stress-vm with `CORPUS_KEEP_GOING=1` on the merged tree (the run
-   without it stopped at 526, which differs under `GC_STRESS=50` on main
-   too).
-3. If the retired-arena suspicion holds, propose a fix before writing it
-   (for example: when the slab's arena is pinned, skip the squeeze and try
-   at the next collection).
+1. Decide with 44 what to do with the PR: on Linux the squeeze does not
+   bring eager_test under 2 GiB. The rest of the peak is the fixture
+   (Psych.unsafe_load) and the preload, not the slab.
+2. If the PR goes on: sq-stress-vm from 524 on the PR head.
