@@ -159,7 +159,8 @@ require six broken variants to produce their specific failure witnesses.
 
 ### Per-scan range and own-block caches
 
-CI now pins Mere `01f5ad738748cc570cc04e3000f50b8c6965543f`. The word walker
+For this measurement CI pinned Mere `01f5ad738748cc570cc04e3000f50b8c6965543f`
+(CI's pin has moved since; `MERE_REF` in `.github/workflows/ci.yml` names it). The word walker
 keeps its previous last-span fast path and adds eight exact allocation/gap
 range hints. Both paths reuse the span's classification against the walk's
 fixed own-block set. Hints are local to one zero-initialized scan state;
@@ -781,3 +782,27 @@ With the pinned O2 compiler `991f299b`, Ruby 4.0.9's
 `TestHashOnly#test_broken_hash_value` previously exceeded the 2 GiB family RSS
 limit (2,103,536 KiB observed). After this change it passed both assertions in
 31.9 seconds with 269,344 KiB peak family RSS. The inputs and limits are unchanged.
+
+## Other harnesses and notes
+
+Each of these has its own write-up or says in its header how it is run.
+
+| file | what |
+|---|---|
+| [argument_markers.md](argument_markers.md) | argument-error marker retention (`argument_markers.rb`, `unittest/argument_marker_check.py`) |
+| [block_recursion.md](block_recursion.md) | catching recursive block calls before the native stack runs out |
+| [copy_stream_path.md](copy_stream_path.md) | `IO.copy_stream` from a path without copying the rest of the source per chunk (`copy_stream_path.rb`) |
+| [decimal_parsing.md](decimal_parsing.md) | converting 100,000 decimal digits (`long_decimal.rb`) |
+| [hash_default_lookup.md](hash_default_lookup.md) | Hash reads with a default Proc (`hash_default_lookup.rb`) |
+| [objectspace_internal_class.md](objectspace_internal_class.md) | `ObjectSpace.internal_class_of` without growing a metaclass chain |
+| [quoted_source.md](quoted_source.md) | parsing a long quoted Ruby source string (`quoted_source.rb`) |
+| [ci_integrated.md](ci_integrated.md), [ci_short_shards.md](ci_short_shards.md) | CI validation of combined changes, and fewer short macOS measurement jobs |
+| `region_split.sh`, `def_sites.sh`, `def_maps.sh` | where the default region's bytes come from: the split against block regions, the emitting call sites, and which map took the writes |
+| `region_reuse.sh`, `reclaim.sh` | whether a grown region's memory comes back usable, and what can be given back at all (written in August 2026; their headers describe the interpreter as it was then) |
+
+The remaining single-workload scripts (`*_r<N>.json` records beside them,
+or none) were added with the change they measure; the commit that added a
+script, and the record in `loop/` it names, say how it was run and what it
+showed. Some name the settings they are compared under in their header
+(`define_method_lexical_super.rb` and `string_format_retention.rb`:
+`MERE_RUBY_GC_TIGHT=1` and a fixed `--seed=1`).
