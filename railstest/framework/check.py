@@ -473,5 +473,89 @@ class FrameworkCheck(unittest.TestCase):
                 run.component_lib_parity(root / 'source', root / 'home')
 
 
+class ArgumentDescriptionCheck(unittest.TestCase):
+    policy = 'rails-argument-descriptions'
+
+    @staticmethod
+    def names(second='20', offset='+0900'):
+        prefix = 'ArgumentSerializationTest#test_serializes_Range_-_'
+        return [prefix + f'2026-11-18_01:13:{second}.123456_{offset}..'
+                '#<Date:_2026-11-28_((2461373j,0s,0n),+0s,2299161j)>_verbatim',
+                prefix + f'2026-11-27_15:13:{second}.123456_{offset}..'
+                f'2026-11-28_01:13:{second}.123457_{offset}_verbatim',
+                prefix + f'Sat,_31_Oct_2026_01:13:{second}_{offset}..'
+                f'Sat,_28_Nov_2026_01:13:{second}_{offset}_verbatim']
+
+    def sides(self, verdict='.'):
+        return (parsed(transcript(dict.fromkeys(self.names('20'), '.'))),
+                parsed(transcript(dict.fromkeys(self.names('23'), verdict))))
+
+    def test_clock_pairing_is_explicit_and_source_pinned(self):
+        reference, mere = self.sides()
+        for policy, digest in (('literal', run.ARGUMENT_SOURCE_SHA256),
+                               ('opaque-class-addresses', run.ARGUMENT_SOURCE_SHA256),
+                               (self.policy, None), (self.policy, 'changed-source')):
+            self.assertEqual({}, run.case_identity_aliases(reference, mere, policy, digest))
+        verdicts = run.classify(reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256)
+        self.assertEqual(dict.fromkeys(self.names('20'), 'MATCH'), verdicts)
+        self.assertEqual(self.names('23'), list(mere['cases']))
+
+    def test_pairing_does_not_hide_failed_assertions(self):
+        reference, mere = self.sides('F')
+        self.assertEqual(dict.fromkeys(self.names('20'), 'RED'),
+                         run.classify(reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256))
+
+    def test_offsets_remain_part_of_the_identity(self):
+        reference, _ = self.sides()
+        mere = parsed(transcript(dict.fromkeys(self.names('23', '+0800'), '.')))
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, self.policy,
+                                                       run.ARGUMENT_SOURCE_SHA256))
+
+    def test_ambiguous_and_incomplete_cases_stay_unpaired(self):
+        reference, mere = self.sides()
+        for side, extra in ((reference, '21'), (mere, '24')):
+            side['cases'].update(dict.fromkeys(self.names(extra), '.'))
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, self.policy,
+                                                       run.ARGUMENT_SOURCE_SHA256))
+        reference, mere = self.sides()
+        mere['state'] = 'INCOMPLETE'
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, self.policy,
+                                                       run.ARGUMENT_SOURCE_SHA256))
+
+    def test_other_tests_are_not_clock_descriptions(self):
+        reference = parsed(transcript({self.names('20')[0].replace('ArgumentSerializationTest', 'OtherTest'): '.'}))
+        mere = parsed(transcript({self.names('23')[0].replace('ArgumentSerializationTest', 'OtherTest'): '.'}))
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, self.policy,
+                                                       run.ARGUMENT_SOURCE_SHA256))
+        rname, mname = 'T#test_#<Class:0x0011>', 'T#test_#<Class:0xabcd>'
+        reference, mere = parsed(transcript({rname: '.'})), parsed(transcript({mname: '.'}))
+        self.assertEqual({mname: rname}, run.case_identity_aliases(reference, mere, self.policy))
+
+    def test_summarize_all_pass_and_compare_keep_the_same_policy(self):
+        name = 'activejob/test/cases/argument_serialization_test.rb'
+        def record(second):
+            sides = {s: parsed(transcript(dict.fromkeys(self.names(second if s == 'reference' else '24'), '.')))
+                     for s in ('reference', 'mere')}
+            r = dict(case_identity_policy=self.policy, files={name: dict(
+                sides=sides, source_sha256=run.ARGUMENT_SOURCE_SHA256)})
+            run.summarize(r)
+            self.assertEqual(3, r['components']['activejob']['MATCH'])
+            self.assertTrue(run.all_pass(r, [name]))
+            return r
+        before, after = record('20'), record('23')
+        with tempfile.TemporaryDirectory() as directory:
+            base, new = Path(directory) / 'base.json', Path(directory) / 'new.json'
+            base.write_text(json.dumps(before))
+            new.write_text(json.dumps(after))
+            args = type('Args', (), dict(base=base, new=new))
+            with open(os.devnull, 'w') as sink, patch('sys.stdout', sink):
+                self.assertEqual(0, run.compare(args))
+                after['files'][name]['sides']['mere']['cases'][self.names('24')[0]] = 'F'
+                run.summarize(after)
+                self.assertFalse(run.all_pass(after, [name]))
+                new.write_text(json.dumps(after))
+                self.assertEqual(1, run.compare(args))
+
+
 if __name__ == '__main__':
     unittest.main()
