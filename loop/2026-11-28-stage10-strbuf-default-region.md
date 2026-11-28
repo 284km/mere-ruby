@@ -144,6 +144,11 @@ A check that read nothing, or read a file wrong, would pass everything.
 - **The collector's survivor list.** `gc_str_surv` is a top-level Vec. Each time it grows, the copy it outgrew stays in the default region. That is what `split`, `lines` and `scan` added. It is a high-water mark, not a growth with the turns: `split` 5, 10, 20 and 40 times added 49, 53, 20 and 29 MB.
 - **`JSON.generate`'s own region** handed out 131 KB per call for a 32 KB String. Its region gives that back at the call's end, but it is more work than the result needs.
 
+Found in review, the same on main, and not this change's:
+
+- `break` inside a `gsub` block answers the wrong value: ruby's is 9 and mere's is "a9c".
+- `encode(..., undef: :replace)` grows by about 2.5 MB a call.
+
 ## Checked
 
 On cb532798, which is main 491cc5ca and this branch:
@@ -156,3 +161,4 @@ On cb532798, which is main 491cc5ca and this branch:
 - `tools/class_watermark_check.sh`.
 - `tools/strbuf_region_check.py` reports a StrBuf made outside a region block in a file of its own, and nothing in one made inside.
 - After the review fix: `python3 unittest/harness_check.py -v` (21 tests, `test_corpus_uses_selected_reference_and_both_index_modes` included) and `python3 tools/runtime_load_path_check.py -v` (8 tests, the corpus ones included), both OK.
+- After the second review's fixes, on 02179425: `run_corpus.sh` 1031/1031 (`strbuf_region_check.py` reading `mr.c` too), `vm_corpus.sh` all 1031 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, `tools/loop_rss_check.sh` 26/26 from the tree, and `tools/class_watermark_check.sh`. The JIS family's encoders (8 encodings, 15 characters) answer as main does. The check fails, as it should, on a file whose braces do not close, on reading no file, on an allowance no longer taken, and on a function missing from the allowed list in `mr.c`.
