@@ -102,3 +102,43 @@ rescue ArgumentError => error
   p [:native_argument_error, error.message]
 end
 p [:native_parameters, Struct.new(:a).instance_method(:initialize).parameters]
+
+# A marked rest tail remains keywords when the next method forwards ... .
+class KeywordForwardBase958
+  def process(...) = target(...)
+  def target(argument:) = argument
+end
+module MarkedSuper958
+  def process(*args) = super
+  ruby2_keywords(:process)
+end
+class MarkedForward958 < KeywordForwardBase958
+  prepend MarkedSuper958
+end
+p [:marked_super_forward, MarkedForward958.new.process(argument: 42)]
+module MarkedBlockSuper958
+  def process(*args)
+    1.times { return super }
+  end
+  ruby2_keywords(:process)
+end
+class MarkedBlockForward958 < KeywordForwardBase958
+  prepend MarkedBlockSuper958
+end
+p [:marked_block_super_forward, MarkedBlockForward958.new.process(argument: 43)]
+class MarkedExplicit958 < KeywordForwardBase958
+  def process(*args) = super(*args)
+  ruby2_keywords(:process)
+end
+p [:marked_explicit_forward, MarkedExplicit958.new.process(argument: 44)]
+
+class ForwardPacket958
+  def relay(...) = finish(...)
+  def finish(*args, **keywords) = [args, keywords]
+end
+marked958 = Hash.ruby2_keywords_hash(argument: 45)
+packet958 = ForwardPacket958.new
+p [:marked_positional, packet958.relay(marked958)]
+p [:marked_splat, packet958.relay(*[marked958])]
+p [:ordinary_splat, packet958.relay(*[{argument: 46}])]
+p [:still_marked, Hash.ruby2_keywords_hash?(marked958)]
