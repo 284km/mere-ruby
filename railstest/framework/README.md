@@ -24,8 +24,10 @@ the Rails plan. The application in `railstest/app` is measured separately by
   Selenium WebDriver 4.44.0. These direct versions, and the RubyZip 2.4.1
   constraint, come from Rails' lock. Their transitive dependencies were
   resolved conservatively, preserving every previously locked package.
-  `archives.lock.json` pins all 85 archives with their SHA-256.
-  When updating from the earlier 73-archive lock, run `restore` again before
+  Active Support's file-watcher tests add Listen 3.10.0, at Rails' locked
+  version, with rb-fsevent, rb-inotify and ffi.
+  `archives.lock.json` pins all 89 archives with their SHA-256.
+  When updating from an earlier lock (73 or 85 archives), run `restore` again before
   `install`. Existing archive bytes are reused; the new locked inventory must
   be complete and contain no extra archives.
   Rails' own Gemfile is not used: it pulls in external-service gems
@@ -248,3 +250,30 @@ local paths. Raw logs stay outside the repository.
   `deep_mergeable` (2). 40 of the MISSING are `xml_mini/nokogiri_engine_test.rb`
   and `nokogirisax_engine_test.rb`: requiring nokogiri stops on the VM with
   `Nokogiri::HTML is not a module`. The evaluator runs both files.
+- `actionpack-full-8624fb60.json`: all 173 Action Pack files on frozen build
+  `8624fb60` with `--require-all-pass` (see "Use" above): **4,152 MATCH**, no
+  RED, MISSING or BOTH, two EMPTY files. `actionpack-full-8624fb60-validation.json`
+  holds that build's provenance, its fresh native installation and the corpus
+  run after it.
+- `actionpack-reference-4.0.10.json`: the reference Ruby 4.0.10 installation
+  the Action Pack records ran against, and the gem specifications inside it.
+- `actionview-*`, `activemodel-*`, `activesupport-*` and `actionmailer-*`
+  records named after a change (`actionview-struct-keyword.json`,
+  `activesupport-zlib-fast-insertion.json`, ...) are the evidence of one fix
+  each, all against Ruby 4.0.10: the runtime commit and the one it is
+  compared with, the corpus in both hash modes and on the VM, the source
+  gates, the related CRuby test files, and the Rails files the change was
+  for, run before and after. They are not whole-component measurements,
+  except where a record says so:
+  - `actionview-struct-keyword.json` (`actionview_baseline_context`): all
+    64 Action View files on runtime `63213030` (2026-11-26, not a main
+    commit). Evaluator **3,155 MATCH / 48 RED / 0 MISSING / 2 BOTH**; VM
+    3,157 / 46 / 0 / 2.
+  - `actionmailer-singleton-class-super.json` (`full_actionmailer`): all 17
+    Action Mailer files, on the evaluator and on the VM alike. On runtime
+    `85d7500b` every file stopped before its tests (268 MISSING); with the
+    change, on integration runtime `d1ce15ee` (main `491cc5ca` and the
+    changes the record names, 2026-11-28), **248 MATCH / 20 RED**.
+  - `activemodel-*` records carry the 58-file Active Model baseline they
+    started from (`component_baseline_context`), with the causes of its RED
+    grouped.

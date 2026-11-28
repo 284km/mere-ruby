@@ -119,7 +119,12 @@ logs and built gems are external artifacts. This initial snapshot retains the
 runner hash used for that run; later harness fixes do not rewrite history. Its main source is recorded in
 `source_ref`; it does not describe unmerged gem or C API branches.
 
-## First blocker and next measurements
+## First blocker and next measurements (history)
+
+This section and the candidate sections after it record the way to G1 as it
+was measured (2026-11-19 to 2026-11-21); G1 and the runs on both executions
+at the top of this file supersede them. Rails' own component tests are
+measured in [`framework/`](framework/README.md).
 
 On main `12ca1df2`, installing bigdecimal 4.1.3 executes mere-ruby but fails
 loading mkmf with `undefined method '+' for nil`. The smaller
