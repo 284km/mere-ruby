@@ -9,6 +9,7 @@ compare   per-file differences between two results.json files
 """
 import argparse
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import os
@@ -59,6 +60,56 @@ ARGUMENT_CLOCK_CASES = [
                        ('hours-ago-to-time', _TIME + r'\.\.' + _TIME),
                        ('weeks-ago-to-datetime', _DATETIME + r'\.\.' + _DATETIME))
 ]
+
+
+def argument_clock_values_valid(kind, name):
+    """Validate the arithmetic and rendered calendars before dropping clocks."""
+    prefix = 'ArgumentSerializationTest#test_serializes_Range_-_'
+    first, last = name[len(prefix):-len('_verbatim')].split('..', 1)
+
+    def time_value(value):
+        date, clock, offset = value.split('_')
+        if int(offset[1:3]) > 23 or int(offset[3:]) > 59:
+            raise ValueError('invalid UTC offset')
+        whole, point, fraction = clock.partition('.')
+        if point:
+            clock = whole + '.' + fraction[:6].ljust(6, '0')
+        # Older supported Python versions require a colon in the UTC offset
+        # and microsecond precision. Sub-microsecond digits do not affect the
+        # two-second tolerance and are never made part of an identity.
+        return datetime.datetime.fromisoformat(date + 'T' + clock + offset[:3] + ':' + offset[3:])
+
+    def datetime_value(value):
+        weekday, day, month, year, clock, offset = value.split('_')
+        months = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+        stamp = time_value(f'{year}-{months.index(month)+1:02}-{day}_{clock}_{offset}')
+        if weekday != ('Mon,', 'Tue,', 'Wed,', 'Thu,', 'Fri,', 'Sat,', 'Sun,')[stamp.weekday()]:
+            raise ValueError('weekday disagrees with date')
+        return stamp
+
+    try:
+        if kind == 'days-ago-to-date':
+            start = time_value(first)
+            match = re.fullmatch(r'#<Date:_(\d{4}-\d{2}-\d{2})_\(\((-?\d+)j,0s,0n\),\+0s,2299161j\)>', last)
+            if not match:
+                return False
+            end = datetime.date.fromisoformat(match[1])
+            if int(match[2]) != end.toordinal() + 1721425:
+                return False
+            days = (end - start.date()).days
+            seconds = start.hour * 3600 + start.minute * 60 + start.second + start.microsecond / 1e6
+            # The two clock reads can straddle midnight (including a small
+            # clock correction). Otherwise their calendar dates differ by10.
+            return days == 10 or (days == 11 and seconds >= 86400 - 2) or (days == 9 and seconds <= 2)
+        parser = time_value if kind == 'hours-ago-to-time' else datetime_value
+        start, end = parser(first), parser(last)
+        expected = 10 * 3600 if kind == 'hours-ago-to-time' else 28 * 86400
+        return abs((end - start).total_seconds() - expected) <= 2
+    except (ValueError, OverflowError, IndexError):
+        return False
+
+
 SUMMARY = re.compile(r'^(\d+) runs, (\d+) assertions, (\d+) failures, (\d+) errors, (\d+) skips$', re.M)
 
 # Only these unchanged tagged files legitimately contain no runnable tests.
@@ -398,9 +449,11 @@ def case_identity_aliases(reference, mere, policy='literal', source_sha256=None)
         if policy == 'rails-argument-descriptions' and source_sha256 == ARGUMENT_SOURCE_SHA256:
             for kind, pattern in ARGUMENT_CLOCK_CASES:
                 match = pattern.fullmatch(name)
-                if match:
+                if match and argument_clock_values_valid(kind, name):
                     # Preserve each endpoint's UTC offset. Only the clock's
                     # date/time text is volatile, not the test's type or form.
+                    # Arithmetic, weekday and Julian-day checks above must
+                    # succeed independently on each side before any pairing.
                     return (('rails-clock', kind, *match.groups()),), [], True
         pieces, addresses, slots, start = [], [], {}, 0
         for match in ANONYMOUS_CLASS.finditer(name):

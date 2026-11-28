@@ -505,6 +505,67 @@ class ArgumentDescriptionCheck(unittest.TestCase):
         self.assertEqual(dict.fromkeys(self.names('20'), 'RED'),
                          run.classify(reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256))
 
+    def test_invalid_clock_values_do_not_become_matches(self):
+        mutations = [
+            (0, '2026-11-18', '2023-01-01'),
+            (0, '2026-11-18', '2026-11-19'),
+            (0, '2026-11-18', '2026-11-17'),
+            (0, '2026-11-18', '2026-02-30'),
+            (0, '2461373j', '2461374j'),
+            (1, '2026-11-27', '2026-11-20'),
+            (1, '2026-11-28_01:13:23', '2026-11-28_01:13:28'),
+            (1, '15:13:23', '25:13:23'),
+            (1, '+0900', '+0060'),
+            (2, 'Sat,_31_Oct_2026', 'Mon,_31_Oct_2026'),
+            (2, 'Sat,_31_Oct_2026', 'Sat,_07_Nov_2026'),
+            (2, 'Sat,_31_Oct_2026', 'Sat,_31_Nov_2026'),
+        ]
+        for index, old, new in mutations:
+            with self.subTest(index=index, old=old, new=new):
+                reference, _ = self.sides()
+                names = self.names('23')
+                names[index] = names[index].replace(old, new, 1)
+                mere = parsed(transcript(dict.fromkeys(names, '.')))
+                aliases = run.case_identity_aliases(reference, mere, self.policy,
+                                                     run.ARGUMENT_SOURCE_SHA256)
+                self.assertNotIn(names[index], aliases)
+                verdicts = run.classify(reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256)
+                self.assertEqual('MISSING', verdicts[self.names('20')[index]])
+                self.assertEqual('EXTRA', verdicts[names[index]])
+
+    def test_clock_values_are_validated_on_both_sides(self):
+        reference, mere = self.sides()
+        bad = self.names('20')[2].replace('Sat,_31_Oct', 'Mon,_31_Oct')
+        reference['cases'] = {bad: '.'}
+        mere['cases'] = {self.names('23')[2]: '.'}
+        self.assertEqual({}, run.case_identity_aliases(reference, mere, self.policy,
+                                                       run.ARGUMENT_SOURCE_SHA256))
+
+    def test_subsecond_precision_is_not_a_clock_identity(self):
+        reference, _ = self.sides()
+        names = [name.replace('.123456', '.12345') for name in self.names('23')]
+        mere = parsed(transcript(dict.fromkeys(names, '.')))
+        self.assertEqual(3, len(run.case_identity_aliases(reference, mere, self.policy,
+                                                        run.ARGUMENT_SOURCE_SHA256)))
+
+    def test_hours_use_utc_elapsed_time_across_offset_changes(self):
+        prefix = 'ArgumentSerializationTest#test_serializes_Range_-_'
+        def name(second):
+            return prefix + f'2026-11-01_00:13:{second}_-0400..2026-11-01_09:13:{second}_-0500_verbatim'
+        reference = parsed(transcript({name('20'): '.'}))
+        mere = parsed(transcript({name('23'): '.'}))
+        self.assertEqual({name('23'): name('20')}, run.case_identity_aliases(
+            reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256))
+
+    def test_date_clock_reads_can_cross_midnight(self):
+        prefix = 'ArgumentSerializationTest#test_serializes_Range_-_'
+        def name(second):
+            return prefix + f'2026-11-18_23:59:{second}_+0900..#<Date:_2026-11-29_((2461374j,0s,0n),+0s,2299161j)>_verbatim'
+        reference = parsed(transcript({name('58'): '.'}))
+        mere = parsed(transcript({name('59'): '.'}))
+        self.assertEqual({name('59'): name('58')}, run.case_identity_aliases(
+            reference, mere, self.policy, run.ARGUMENT_SOURCE_SHA256))
+
     def test_offsets_remain_part_of_the_identity(self):
         reference, _ = self.sides()
         mere = parsed(transcript(dict.fromkeys(self.names('23', '+0800'), '.')))

@@ -114,6 +114,13 @@ the identity. Assertions run unchanged; a paired failure remains RED. Both
 original names and accepted aliases remain available in the record. The
 existing policies retain their behavior.
 
+Before discarding clock text, each side must independently describe the
+expected interval: ten calendar days to Date.today (allowing a two-second
+midnight crossing), ten elapsed hours, or four elapsed weeks (two-second
+tolerance for separate clock reads). DateTime weekdays and Date's printed
+Julian day must agree with the calendar date. Invalid dates, offsets or
+intervals retain literal identities. Subsecond precision may vary.
+
 ActiveJob's `exceptions_test.rb` eagerly loads SneakersAdapter even when using
 a built-in adapter. Its real gem dependencies are locked here; no RabbitMQ
 worker is started. Run that file with `--env AJ_ADAPTER=test` to exercise its
