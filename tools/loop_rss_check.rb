@@ -97,6 +97,16 @@ CASES = {
   "Array#to_s" => ->(d) { a = ["ab" * 16_384]; (4_000 / d).times { a.to_s } },
   "Array#join" => ->(d) { a = ["ab" * 8_192, "cd" * 8_192]; (4_000 / d).times { a.join } },
   "Random#bytes" => ->(d) { r = Random.new(1); (4_000 / d).times { r.bytes(32_768) } },
+  # A String of 256 KB or more is kept in a Vec of its own. In the page in use,
+  # a dead one stayed until the page's arena had doubled: a compaction is
+  # refused while the program's stack points into that page. (The first case
+  # needs sub!'s StrBuf in a region of its own too, #393.)
+  "big Strings" => ->(d) { s = "a" * 300_000; (2_000 / d).times { t = s + "b"; t << "c"; t.sub!("a", "d") } },
+  "a big String replaced" => ->(d) { s = +"x"; (2_000 / d).times { |i| s.replace("a" * 300_000); s << i.to_s } },
+  # ...and by one that is already there, again and again: no new handle is
+  # made, so nothing else asks for a collection, and the replaced copies have
+  # to be counted until the sweep recycles them (#400's review)
+  "a big String replaced by another, both kept" => ->(d) { src = "a" * 1_048_576; s = +"x"; (512 / d).times { s.replace(src) } },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))

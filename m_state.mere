@@ -1373,18 +1373,89 @@ let str_pg_touch = fn (p: int) ->
         let k = vec_get str_pg_dq_n 0 in
         let _ = (if k < vec_len str_pg_dq then vec_set str_pg_dq k p else vec_push str_pg_dq p) in
         vec_set str_pg_dq_n 0 (k + 1));
+// ⚠ A BIG STRING IN AN ARENA OF ITS OWN. A page gives back the bytes of the
+// Strings that died in it only when it is compacted, and a compaction is
+// refused while a suspended stack points into the page's arena -- which the
+// program's stack, stopped below the collector, does for the page in use. So
+// the page kept every big String that died in it until its arena had doubled
+// (Mere's rule since v0.1.651): a loop of 1 MB Strings kept 44 to 54 MB in the
+// page, where 6.5 MB lived. A String of str_big_min bytes or more is kept in a
+// Vec of its own instead, with the page's slot "", and its Vec is recycled at
+// the next sweep after the String died or was replaced: nothing points into
+// it then, whatever points into the page.
+// (Recycled at the SWEEP and not at once: the old text may be in flight in
+//  the very call that replaces it -- `sput id (sraw id ++ tail)`. vec_recycle
+//  gives the growth back and keeps one 256-byte block, and the Vec goes to a
+//  pool for the next big String.)
+let str_big_min = 262144;
+let str_big = (let t = map_new () in let _ = map_compact t in t);
+let str_big_dead = vec_new ();
+let str_big_dead_n = (let v = vec_new () in let _ = vec_push v 0 in v);
+let str_big_pool = vec_new ();
+let str_big_pool_n = (let v = vec_new () in let _ = vec_push v 0 in v);
+let str_big_tot = (let v = vec_new () in let _ = vec_push v 0 in v);
+let str_big_take = fn (u: unit) ->
+  let n = vec_get str_big_pool_n 0 in
+  if n > 0 then (let v = vec_get str_big_pool (n - 1) in let _ = vec_set str_big_pool_n 0 (n - 1) in v)
+  else (let v = vec_new () in let _ = vec_compact v in v);
+// the handle's own Vec, if it has one, to be recycled at the next sweep
+// ⚠ ...and its bytes still counted until then (review, Major): they are
+//   still there. Taken off at once, a String replaced again and again by
+//   another big one counted one copy while every copy stayed, and the
+//   pressure never asked for the sweep that would have given them back --
+//   128 replaces of 1 MB went from 69 to 199 MB with no collection.
+let str_big_let_go = fn (id: int) ->
+  if map_len str_big > 0 && map_has str_big id then
+    (let v = map_get str_big id in
+     let k = vec_get str_big_dead_n 0 in
+     let _ = (if k < vec_len str_big_dead then vec_set str_big_dead k v else vec_push str_big_dead v) in
+     let _ = vec_set str_big_dead_n 0 (k + 1) in
+     map_delete str_big id)
+  else ();
+let str_big_put = fn (id: int) -> fn (s: str) ->
+  let _ = str_big_let_go id in
+  let v = str_big_take () in
+  let _ = vec_push v s in
+  let _ = vec_set str_big_tot 0 (vec_get str_big_tot 0 + str_len s) in
+  map_set str_big id v;
+// at a sweep that runs off the program's stack (not `nc`)
+let str_big_sweep = fn (u: unit) ->
+  let k = vec_get str_big_dead_n 0 in
+  let rec go = fn (j: int) ->
+    if j >= k then ()
+    else (let v = vec_get str_big_dead j in
+          let _ = vec_set str_big_tot 0 (vec_get str_big_tot 0 - str_len (vec_get v 0)) in
+          let _ = vec_recycle v in
+          let n = vec_get str_big_pool_n 0 in
+          let _ = (if n < vec_len str_big_pool then vec_set str_big_pool n v else vec_push str_big_pool v) in
+          let _ = vec_set str_big_pool_n 0 (n + 1) in
+          go (j + 1)) in
+  let _ = go 0 in
+  let _ = vec_set str_big_dead_n 0 0 in
+  map_compact str_big;
 let sraw = fn (id: int) ->
   let i = id - handle_base in
   let pg = (if map_has str_store (i / 4096) then map_get str_store (i / 4096) else str_pg_empty) in
   let o = i - (i / 4096) * 4096 in
-  if o < vec_len pg then vec_get pg o else "";
+  let v = (if o < vec_len pg then vec_get pg o else "") in
+  if str_len v == 0 && map_len str_big > 0 && map_has str_big id then vec_get (map_get str_big id) 0 else v;
 let sput = fn (id: int) -> fn (s: str) ->
   let i = id - handle_base in
   let pg = (if map_has str_store (i / 4096) then map_get str_store (i / 4096) else str_pg_empty) in
   let o = i - (i / 4096) * 4096 in
   if o < vec_len pg then
-    (let _ = map_set str_pg_changed (i / 4096) 1 in
-     let _ = str_pg_touch (i / 4096) in vec_set pg o s) else ();
+    (if str_len s >= str_big_min then
+       // (a big String written over another is bytes made, as mkstr counts
+       //  them: the safepoint asks for the pressure once 16 MB have been)
+       (let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + str_len s) in
+        let _ = str_big_put id s in
+        if str_len (vec_get pg o) == 0 then ()
+        else (let _ = map_set str_pg_changed (i / 4096) 1 in
+              let _ = str_pg_touch (i / 4096) in vec_set pg o ""))
+     else
+       (let _ = str_big_let_go id in
+        let _ = map_set str_pg_changed (i / 4096) 1 in
+        let _ = str_pg_touch (i / 4096) in vec_set pg o s)) else ();
 // vec_compact can defer a pinned page. Keep its mutation bit until its
 // capacity actually decreases, as in the dense-page implementation.
 let str_pg_try_compact = fn pg ->
@@ -1442,7 +1513,7 @@ let str_bytes = fn (u: unit) ->
           go (j + 1)) in
   let _ = go 0 in
   let _ = vec_set str_pg_dq_n 0 0 in
-  vec_get str_pg_tot 0 + vec_get str_pg_add 0;
+  vec_get str_pg_tot 0 + vec_get str_pg_add 0 + vec_get str_big_tot 0;
 // ⚠ ONE SNAPSHOT PER SUBJECT, NOT PER MATCH. A MatchData keeps the subject it
 // matched against (for #string / #pre_match / #post_match / $` / $'), and it
 // has to be the text AS IT WAS -- ruby's MatchData holds a frozen copy. Making
@@ -1481,7 +1552,9 @@ let mkstr = fn (s: str) ->
   let p = n / 4096 in
   let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + str_len s) in
   let _ = map_set str_pg_changed p 1 in
-  let _ = vec_push (map_get str_store p) s in
+  let _ = (if str_len s >= str_big_min
+           then (let _ = vec_push (map_get str_store p) "" in str_big_put (handle_base + n) s)
+           else vec_push (map_get str_store p) s) in
   let _ = vec_set str_n 0 (n + 1) in
   let _ = (if vec_get atr_on 0 > 0 then atr_note ("str:" ++ str_of_int (handle_base + n)) else ()) in
   VStr (handle_base + n);
@@ -1499,7 +1572,9 @@ let mkstr_join = fn (parts: str list) ->
     match xs with Nil -> total | Cons (x, rest) -> size rest (total + str_len x) in
   let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + size parts 0) in
   let _ = map_set str_pg_changed (n / 4096) 1 in
-  let _ = vec_push (map_get str_store (n / 4096)) (str_join "" parts) in
+  let _ = (if size parts 0 >= str_big_min
+           then (let _ = vec_push (map_get str_store (n / 4096)) "" in str_big_put (handle_base + n) (str_join "" parts))
+           else vec_push (map_get str_store (n / 4096)) (str_join "" parts)) in
   let _ = vec_set str_n 0 (n + 1) in
   let _ = (if vec_get atr_on 0 > 0 then atr_note ("str:" ++ str_of_int (handle_base + n)) else ()) in
   VStr (handle_base + n);
