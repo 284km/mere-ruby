@@ -47,3 +47,25 @@ loader failure: reference: 33 cases complete, Mere exceptions_test INCOMPLETE
 with33 MISSING. This result is retained and not marked passing. Follow-up
 interpreter work and candidate/VM broad diagnostics remain pending.
 Owner merges after the bot reviews the exact publication head.
+
+## Clock-value review follow-up
+
+The preceding evidence records the original7dd171fe tooling. Review found that
+shape-only matching could hide incorrect date arithmetic or weekday rendering.
+The follow-up validates both endpoints before discarding clock text.
+
+Measured policy source `a9b46e4b6131eeb0209e83a1880b4f3f4b35e880`. Runtime42e57da3 and its installed
+binary55f31f7f are unchanged; archive/lock inputs and installer function ASTs
+match the original installation. No reference default gems were installed.
+
+- Framework checks:48 passed on Python3.12.5 and on Python3.9.6.
+- Twelve invalid-value mutations remain MISSING/EXTRA rather than MATCH.
+- Checks include wrong years/days/hours, invalid dates/offsets, wrong weekdays
+  and Julian days; valid subsecond variation, DST offsets and midnight crossing
+  remain supported. Source/inventory/failure controls still pass.
+- Real argument_serialization_test:53MATCH/0RED/0other on each engine, all
+  reference/candidate sides COMPLETE and unbounded, normal GC, seed12345.
+- Reclassified36 existing raw focused/RSS records with the new validator;
+  every component count and verdict is unchanged. Original raw hashes retained.
+- Corpus1031both/VM, related core and RSS evidence above use the unchanged
+  runtime and are reused explicitly; they are not claimed as fresh runs.
