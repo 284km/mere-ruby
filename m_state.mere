@@ -1974,6 +1974,9 @@ let fn sfrozen_fwd: int -> bool;
 // retain their compact-list/index representation. The rows contain native
 // strings only (digest and stable id), and have their own recyclable arenas.
 let fn hentry_key_same_fwd: bool -> Val -> Val -> bool;
+// A singleton needs only its insertion-time digest. Its key and value are
+// already in the pair list/index; allocate collision rows only as it grows.
+let hentry_single = (let t = map_new () in let _ = map_compact t in t);
 let hentry_rows = (let t = map_new () in let _ = map_compact t in t);
 let hentry_pool = vec_new ();
 let hentry_quar = vec_new ();
@@ -1984,6 +1987,7 @@ let hentry_take = fn (u: unit) ->
   if n > 0 then (let _ = vec_set hentry_counts 0 (n - 1) in vec_get hentry_pool (n - 1))
   else (let v = vec_new () in let _ = vec_recycle v in v);
 let hentry_drop = fn (id: int) ->
+  let _ = (if map_len hentry_single > 0 && map_has hentry_single id then map_delete hentry_single id else ()) in
   if map_has hentry_rows id then
     (let v = map_get hentry_rows id in
      let _ = map_delete hentry_rows id in
@@ -2058,11 +2062,12 @@ let hentry_make = fn (id: int) -> fn (xs: Val list) ->
   let rec go = fn (ys: Val list) -> fn (i: int) ->
     match ys with
     | Cons (k, Cons (_, t)) ->
-      let _ = vec_push rows (hkey_dig id k) in
+      let _ = vec_push rows (if i == 0 && map_has hentry_single id then map_get hentry_single id else hkey_dig id k) in
       let _ = vec_push rows (str_of_int i) in go t (i + 1)
     | _ -> () in
   let _ = go xs 0 in
   let _ = hentry_populate id xs rows (map_get hash_index id) in
+  let _ = (if map_has hentry_single id then map_delete hentry_single id else ()) in
   map_set hentry_rows id rows;
 let hentry_insert = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   let ix = map_get hash_index id in
@@ -2185,6 +2190,11 @@ let hstale_fold = fn (id: int) ->
      let _ = map_delete hash_stale id in
      if map_has hash_index id then
        (let ys = (if map_has hentry_rows id then hstale_vals_at id (hst_get id) (map_get hentry_rows id) 0
+                  else if map_has hentry_single id then
+                    (match hst_get id with
+                     | Cons (key, Cons (_, Nil)) ->
+                       Cons (key, Cons (map_get (map_get hash_index id) (map_get hentry_single id), Nil))
+                     | pairs -> pairs)
                   else hstale_vals id (hst_get id)) in
         let _ = hst_publish id ys in ())
      else ())
@@ -2304,13 +2314,25 @@ let rec hidx_seed_go = fn (id: int) -> fn (ys: Val list) ->
      else (let _ = hidx_put id d v in hidx_seed_go id t))
   | _ -> false;
 let hidx_seed = fn (id: int) -> fn (xs: Val list) ->
-  if hidx_seed_go id xs then
-    (let _ = (if not (hcbi_fwd id) && hentry_needed xs then hentry_make id xs else ()) in true)
-  else false;
+  match xs with
+  | Cons (key, Cons (value, Nil)) when hentry_mutable key && not (hcbi_fwd id) ->
+    (let digest = hkey_dig id key in
+     if str_eq digest "" then false else
+       (let _ = hidx_put id digest value in
+        let _ = map_set hentry_single id digest in true))
+  | _ -> if hidx_seed_go id xs then
+           (let _ = (if not (hcbi_fwd id) && hentry_needed xs then hentry_make id xs else ()) in true)
+         else false;
 // Copy the stored-entry association, including a key changed before dup.
 // This does not read values back from the index being checked by the walk.
 let hentry_copy = fn (src: int) -> fn (dst: int) -> fn (xs: Val list) ->
-  if map_has hentry_rows src then
+  if map_len hentry_single > 0 && map_has hentry_single src then
+    (let digest = map_get hentry_single src in
+     let _ = hidx_drop dst in
+     let _ = hidx_start dst in
+     let _ = (match xs with Cons (_, Cons (value, Nil)) -> hidx_put dst digest value | _ -> ()) in
+     map_set hentry_single dst digest)
+  else if map_has hentry_rows src then
     (let from = map_get hentry_rows src in
      let source = map_get hash_index src in
      let _ = hidx_drop dst in
@@ -2410,7 +2432,11 @@ let hcopy_shared = fn (src: int) ->
   let snapshot9 = hshare_snapshot src in
   if snapshot9 < 0 then
     (let xs = hst_get src in
-     let copy = mkhash xs in
+     // The source's stored digests are authoritative, including after a
+     // key changes. Do not build and immediately discard a fresh index.
+     let tracked = map_has hentry_single src || map_has hentry_rows src in
+     let copy = mkhash (if tracked then Nil else xs) in
+     let _ = (if tracked then (match copy with VHsh dst -> hst_publish dst xs | _ -> ()) else ()) in
      let _ = (match copy with VHsh dst -> hentry_copy src dst xs | _ -> ()) in copy)
   else (let copy9 = mkhash Nil in
         let _ = (match copy9 with
@@ -2450,7 +2476,8 @@ let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
      let pairs = go (hst_get id) 0 false in
      let _ = hentry_drop id in
      let _ = map_set hentry_rows id next in pairs)
-    else (let _ = (if keep then map_delete (map_get hash_index id) (hkey_dig id k) else ()) in xs)) in
+    else (let _ = (if map_has hentry_single id then map_delete hentry_single id else ()) in
+          let _ = (if keep then map_delete (map_get hash_index id) (hkey_dig id k) else ()) in xs)) in
   // Stable entry ids let a delete keep every other deferred-value association.
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   let _ = hpend_drop id in
@@ -2483,9 +2510,11 @@ let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
                  let _ = hidx_start id in
                  if hidx_seed id (hsettled id) then () else hidx_drop id)
            else ()) in
-  let _ = (if hidx_on id && not (hcbi_fwd id) && (map_has hentry_rows id || hentry_mutable k) then
-             (let _ = (if map_has hentry_rows id then () else hentry_make id (hderef id)) in
-              hentry_insert id k v)
+  let _ = (if hidx_on id && not (hcbi_fwd id) && (map_has hentry_rows id || map_has hentry_single id || hentry_mutable k) then
+             (if map_has hentry_rows id then hentry_insert id k v
+              else (match hderef id with
+                    | Nil -> map_set hentry_single id (hkey_dig id k)
+                    | pairs -> (let _ = hentry_make id pairs in hentry_insert id k v)))
            else ()) in
   // keep the index in step, or give it up: a key it cannot digest means the
   // index no longer knows everything in this hash.

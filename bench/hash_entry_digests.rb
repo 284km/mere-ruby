@@ -3,7 +3,15 @@ count = Integer(ARGV.fetch(1, '10000'))
 seed = ARGV.find { |arg| arg.start_with?('--seed=') }
 srand(seed ? Integer(seed.split('=', 2).last) : 1)
 sum = 0
-if mode == 'churn'
+if mode == 'empty'
+  count.times { |i| sum += i }
+elsif mode == 'small_create'
+  count.times { |i| hash = {[i] => i}; sum += i }
+elsif mode == 'small_dup'
+  count.times { |i| hash = {[i] => i}; hash.dup; sum += i }
+elsif mode == 'small_symbol_dup'
+  count.times { |i| hash = {a: i}; hash.dup; sum += i }
+elsif mode == 'churn'
   count.times do |i|
     key = [i]
     hash = {key => i}

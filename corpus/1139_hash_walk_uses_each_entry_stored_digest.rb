@@ -207,6 +207,47 @@ changing = {a: 1, b: 2}
 outer = stored_hash1139(changing, :mode_kept)
 changing.compare_by_identity
 p outer[changing]
+
+# A singleton retains its insertion-time digest across copying and promotion.
+# Inspect values while a key is changed, and restore it before keyed reads:
+# CRuby's randomized small-table hash hints can otherwise collide by chance.
+[:literal, :assignment].each do |construction|
+  key = [1]
+  hash = construction == :literal ? {key => :first} : {}.tap { |h| h[key] = :first }
+  hash[key] = :updated
+  key << 2
+  copies = [hash.dup, hash.clone, {}.replace(hash)]
+  GC.start
+  p [construction, hash.values, copies.map(&:values)]
+  key.pop
+  p [hash[key], copies.map { |copy| copy[key] }]
+  hash[:second] = :new
+  copies.each { |copy| copy[:second] = :copy }
+  key << 3
+  p [hash.values, copies.map(&:values)]
+  key.pop
+  p [hash[key], copies.map { |copy| copy[key] }]
+end
+
+key = [1]
+hash = {key => :original}
+key << 2
+hash[[1]] = :later
+hash[[1]] = :later_updated
+key.pop
+p [hash.size, hash[key], hash.dup.values, hash.delete([1]), hash.values]
+p [hash[[1]], hash.delete([1]), hash.empty?]
+hash[[9]] = :reused
+p [hash.size, hash[[9]], hash.dup.values]
+
+key = {a: 1}
+hash = {key => :hash_key}
+key[:b] = 2
+copy = hash.dup
+key.delete(:b)
+hash[:second] = :extra
+copy[:second] = :extra
+p [hash[key], copy[key], hash.values, copy.values]
 changing_key = +'same'
 changing = {changing_key => 1}.compare_by_identity
 outer = stored_hash1139(changing, :contents_kept)
