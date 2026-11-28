@@ -109,3 +109,36 @@ retained as pre-corpus failure; no mtime gate or resource bound was bypassed.
 Original core/Rails/RSS evidence remains applicable to that unchanged runtime,
 and is explicitly reused. This does not clear the separate hostedLinux Module
 timeouts or396 Method-copy memory failure/global merge hold. Re-review exacthead.
+
+Review follow-up: Range probe allocation and measurement scope
+
+Runtime9e611af4 replaces hng_key with hng_key_q in prim_eq_override and avoids an endpoint-
+list allocation for Integer-ended Ranges in arr_has_obj_d. Corpus948 now includes String-
+subclass and singleton equality controls. The original record itself identifies the three
+clock-name rows whose pairing needs396.
+
+Corpora:1031/1031 both hash modes; VM1031/0fallback/0differences. Twelve source
+gates/default record hygiene pass; explicit changed-file hygiene is checked at publication.
+Range67 and Hash298 cases complete on both engines and both before/after binaries; no prior
+PASS lost.
+
+The three ActiveJob files remain121MATCH/0other, COMPLETE on both sides, both engines. Fresh
+native installations use each exact measured binary. The checked-in follow-up evidence
+retains all core case identities,24boundary comparisons, net instruction samples and
+repeated large-file RSS controls.
+
+evaluator RSS KiB: {'before': [1519776, 1537632, 1605440], 'after': [1541008, 1604576,
+1572432]}; median change 2.26percent. Three alternating normal-GC seed12345 pairs; report
+variance without a stable-improvement claim.
+
+vm RSS KiB: {'before': [1273376, 1242160, 1265872], 'after': [1287280, 1205168, 1274816]};
+median change 0.71percent. Three alternating normal-GC seed12345 pairs; report variance
+without a stable-improvement claim.
+
+Net per-call Range cost remains4–8percent above main491, while improving17–20percent for
+String/mixed Ranges versus runtime42. Hash join still incurs the required per-call method-
+dispatch increase, around26k→37k instructions; the earlier whole-process1percent number
+includes startup. The PR body presents both quantities together.
+
+Evidence:railstest/framework/records/activejob-equality-cost.json. Exact-head bot re-review
+and owner merge-hold clearance remain required.
