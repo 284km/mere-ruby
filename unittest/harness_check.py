@@ -307,6 +307,8 @@ exit "$(cat "$fixture_root/$side.code")"
             stub = self.root / "tools" / (name + "_check.sh")
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
+        # (the StrBuf check is Python, run as `python3 tools/...py`)
+        (self.root / "tools/strbuf_region_check.py").write_text("import sys\nsys.exit(0)\n")
         hygiene = self.root / "mspec/record_hygiene.sh"
         hygiene.write_text("#!/bin/sh\nexit 0\n")
         hygiene.chmod(0o755)

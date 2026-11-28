@@ -81,6 +81,22 @@ CASES = {
   # interval too, every class and module the loop made was kept until it
   # ended -- TestModule#test_iclass_memory_leak (Bug #19550), 10 s for 6
   "a module included in a new class" => ->(d) { (300_000 / d).times { mod = Module.new; Class.new { include mod } } },
+  # A StrBuf made outside every region block is the default region's, which
+  # nothing gives back: each of these kept a buffer of its result's size, 32 KB
+  # here, every turn, after the result was let go -- 128 MB over 4,000 turns
+  # (tools/strbuf_region_check.py). One match for the regex ones: the buffer
+  # is the result's, whatever the matches.
+  "gsub with a block" => ->(d) { s = "a" + "b" * 32_767; (4_000 / d).times { s.gsub(/a/) { "c" } } },
+  "gsub with a String" => ->(d) { s = "a" + "b" * 32_767; (4_000 / d).times { s.gsub("a", "c") } },
+  "sub" => ->(d) { s = "a" + "b" * 32_767; (4_000 / d).times { s.sub("a", "c") } },
+  "tr" => ->(d) { s = "ab" * 16_384; (4_000 / d).times { s.tr("a", "c") } },
+  "delete" => ->(d) { s = "ab" * 16_384; (4_000 / d).times { s.delete("a") } },
+  "squeeze" => ->(d) { s = "aab" * 10_923; (4_000 / d).times { s.squeeze } },
+  "reverse" => ->(d) { s = "ab" * 16_384; (4_000 / d).times { s.reverse } },
+  "inspect" => ->(d) { s = "ab" * 16_384; (4_000 / d).times { s.inspect } },
+  "Array#to_s" => ->(d) { a = ["ab" * 16_384]; (4_000 / d).times { a.to_s } },
+  "Array#join" => ->(d) { a = ["ab" * 8_192, "cd" * 8_192]; (4_000 / d).times { a.join } },
+  "Random#bytes" => ->(d) { r = Random.new(1); (4_000 / d).times { r.bytes(32_768) } },
   # A String of 256 KB or more is kept in a Vec of its own. In the page in use,
   # a dead one stayed until the page's arena had doubled: a compaction is
   # refused while the program's stack points into that page. (The first case

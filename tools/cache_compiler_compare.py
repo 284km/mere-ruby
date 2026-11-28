@@ -167,8 +167,10 @@ def collect(args):
     for index, side in enumerate(ORDER):
         folder = output / ('method-' + str(index) + '-' + side)
         with (output / ('method-' + str(index) + '.driver.log')).open('w') as log:
+            # (--legacy: the 20-batch program and the result this record reads)
             driver = subprocess.run([sys.executable, str(native.ROOT / 'tools/method_copy_memory_check.py'),
-                '--binary', str(roots[side] / 'mere-ruby'), '--reference', str(reference), '--output', str(folder)],
+                '--binary', str(roots[side] / 'mere-ruby'), '--reference', str(reference), '--output', str(folder),
+                '--legacy'],
                 stdout=log, stderr=subprocess.STDOUT)
         value = dict(label=side, driver_exit=driver.returncode,
                      result=json.loads((folder / 'result.json').read_text()),

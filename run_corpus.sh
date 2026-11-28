@@ -89,6 +89,11 @@ done
 # "<id>@<name>" outside the door (m_state's iv_*). Since note 559 step 2b the
 # variable is in a shape's slot, and such a read finds nothing, quietly.
 ./tools/iv_door_check.sh > /dev/null || { ./tools/iv_door_check.sh; exit 1; }
+# ...and every StrBuf is made inside a region block (or allowed, with the reason
+# it may stay): one made outside is the default region's, which nothing gives
+# back, and its buffer -- the size of what it built -- stays for the rest of the
+# run, every call.
+python3 ./tools/strbuf_region_check.py > /dev/null || { python3 ./tools/strbuf_region_check.py; exit 1; }
 # ...a seventh: every `name_set "tag"` has an arm in name_spec. A tag with no
 # arm builds an EMPTY table, which is a predicate answering false about every
 # name -- a wrong answer, not a crash.

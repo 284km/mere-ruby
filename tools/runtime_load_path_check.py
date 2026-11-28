@@ -32,6 +32,8 @@ class LoadPathCheck(unittest.TestCase):
                       "name_spec", "rx_caps", "ns_names", "name_len", "iv_door"):
             (self.root / "tools" / f"{guard}_check.sh").write_text("#!/bin/sh\nexit 0\n")
             (self.root / "tools" / f"{guard}_check.sh").chmod(0o755)
+        # (the StrBuf check is Python, run as `python3 tools/...py`)
+        (self.root / "tools/strbuf_region_check.py").write_text("import sys\nsys.exit(0)\n")
         (self.root / "mspec/record_hygiene.sh").write_text("#!/bin/sh\nexit 0\n")
         (self.root / "mspec/record_hygiene.sh").chmod(0o755)
         for name in ("01_arith.rb", "02_monitor.rb"):
