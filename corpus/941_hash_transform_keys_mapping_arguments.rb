@@ -119,3 +119,34 @@ def s.to_hash = {a: :A}
     p [e.class, e.message]
   end
 end
+
+# Array subclass overrides also receive keys before native index coercion.
+class KeyedArray941 < Array
+  attr_reader :writes
+  def []=(key, value)
+    @writes ||= []
+    @writes.replace([key, value])
+    :writer_return
+  end
+  def [](key) = [:read, key]
+  def fetch(key) = [:fetch, key]
+end
+keyed941 = KeyedArray941.new
+p [:assignment, (keyed941['file.txt'] = 'body'), keyed941.writes]
+p [:read, keyed941['file.txt'], keyed941.fetch('file.txt')]
+native_write941 = Array.instance_method(:[]=).bind(keyed941)
+index941 = Object.new
+def index941.to_int = 0
+p [:native_write, native_write941.call(index941, 7), Array.instance_method(:[]).bind_call(keyed941, 0)]
+keyed941.freeze
+p [:frozen_override, (keyed941['other'] = 8)]
+class ForwardIndexArray941 < Array
+  def []=(*args)
+    super
+  end
+  def [](*args)
+    super
+  end
+end
+forward941 = ForwardIndexArray941.new
+p [:native_super, (forward941[index941] = 9), forward941[index941]]
