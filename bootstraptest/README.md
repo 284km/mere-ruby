@@ -7,6 +7,12 @@ the O2 mere-ruby measurement binary. The upstream assertion methods evaluate
 equality, matching, syntax, exit and finish conditions. No assertion kind is
 replaced by a no-op.
 
+On main `0f0413c5` (2026-11-28, [run 46101446305](https://github.com/284km/mere-ruby/actions/runs/46101446305),
+ruby 4.0.10) the 35 inputs hold 2,046 assertions: 2,020 MATCH, 20 RED, 5 BOTH,
+1 EXTRA. Eighteen of the RED are the YJIT files (`test_yjit.rb` 17,
+`test_yjit_30k_ifelse.rb` 1); the others are one each in `test_gc.rb` and
+`test_insns.rb`. The five BOTH are in `test_ractor.rb`.
+
 `audit_runner.rb` adds discovery, start and finish records around the native
 runner. Its child wrapper records an explicit `BT_Skip` without changing the
 original result text or line count. An expected skip message remains SKIP.
