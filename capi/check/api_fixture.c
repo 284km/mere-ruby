@@ -136,7 +136,11 @@ static VALUE cat_kept(VALUE self, VALUE str, VALUE peek) {
     memset(p + len, 't', 4096);
     p[len + 4096] = '\0';
     r->len = len + 4096;
-    return str;
+    /* ...and then reads it through RSTRING_PTR, which sees Ruby's byte, and
+     * writes its first byte */
+    char seen = RSTRING_PTR(str)[5];
+    RSTRING_PTR(str)[0] = 'W';
+    return INT2FIX(seen);
 }
 /* ...and one a data object holds alone, marked by its dmark, appended to
  * in later calls */

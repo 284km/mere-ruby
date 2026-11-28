@@ -569,6 +569,7 @@ static int write_back(struct mr_mirror *m, VALUE obj) {
             mr_up1(MR_STR_SET, obj);
         }
         m->synced = len + 1;
+        if (sent) { mr_transit_restore(&saved); return 2; }
     }
     else {
         if (m->as.array.as.heap.len < 0 || m->as.array.as.heap.len > m->capa) mr_fatal("an Array's length was set past its capacity");
@@ -641,8 +642,13 @@ void *rb_mere_string(VALUE obj) {
     if (m->body == T_STRING && m->body_epoch == mr_epoch) return &m->as.string;
     if (m->body == T_STRING) str_adopt(m);
     /* What C wrote through a pointer it kept across a call is not lost to
-     * the fetch: it goes back first, and is then what the interpreter has. */
-    if (m->body == T_STRING && write_back(m, obj)) {
+     * the fetch: it goes back first, and is then what the interpreter has
+     * -- when it went whole. When only its tail went (write_back answers 2),
+     * the interpreter's String is its own first bytes and that tail, which
+     * differ from the struct's when Ruby wrote them while C kept the struct
+     * (mirror.c MR_STR_CAT): the String is fetched, as below. */
+    int wrote = m->body == T_STRING ? write_back(m, obj) : 0;
+    if (wrote == 1) {
         m->body_epoch = mr_epoch;
         touch(m, obj);
         return &m->as.string;
