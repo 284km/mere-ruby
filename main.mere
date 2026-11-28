@@ -14779,6 +14779,8 @@ and elem_has_user_eq = fn world -> fn (xs: Val list) ->
     (match h with
      | VObj _ -> if has_own_eq world h || exc_cmp_val world h then true else elem_has_user_eq world t
      | VExc (_, _) -> if exc_cmp_val world h then true else elem_has_user_eq world t
+     | VRange (lo9, hi9, _) ->
+       if arr_has_obj_d world (Cons (lo9, Cons (hi9, Nil))) 8 then true else elem_has_user_eq world t
      // one level in, for the pairs assoc/rassoc look at — and no deeper, or a
      // self-referential array (a = []; a << a) would never bottom out.
      | VArr aid -> if shallow_has_user_eq world (deref aid) then true else elem_has_user_eq world t
@@ -14790,6 +14792,8 @@ and shallow_has_user_eq = fn world -> fn (xs: Val list) ->
   | Cons (h, t) ->
     (match h with
      | VObj _ -> if has_own_eq world h then true else shallow_has_user_eq world t
+     | VRange (lo9, hi9, _) ->
+       if arr_has_obj_d world (Cons (lo9, Cons (hi9, Nil))) 8 then true else shallow_has_user_eq world t
      | _ -> shallow_has_user_eq world t)
 
 // `frozen_array.delete(x)` where x is NOT there changes nothing, and ruby's
@@ -19192,6 +19196,21 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                    (match invoke_val_c env world noblk h "to_s" Nil false with
                     | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
                     | _ -> app e0 (to_s h) "US-ASCII")
+                 // Hash#to_s inspects its members through the object world.
+                 // The leaf printer loses a nested object's class/ivars.
+                 | VHsh hid ->
+                   (match invoke_val_c env world noblk h "to_s" Nil false with
+                    | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
+                    | _ ->
+                      // rb_any_to_s uses the native identity, without asking
+                      // a user object_id. ASCII class names give a binary
+                      // String; a non-ASCII name keeps its own encoding.
+                      (let cls9 = display_cls world (dispatch_cls_of world h) in
+                       let (nm9, enc9) = (match mod_name_w world cls9 with
+                         | VStr sh9 -> (sget sh9, enc_canon_name (senc_get sh9))
+                         | _ -> (cls_display world cls9, "ASCII-8BIT")) in
+                       app e0 ("#<" ++ nm9 ++ ":0x" ++ hex_pad16 (hid - handle_base) ++ ">")
+                         (if enc_all7 nm9 then "ASCII-8BIT" else enc9)))
                  | _ -> app e0 (to_s h) "US-ASCII") in
               ljoin t e1 false)) in
         // ⚠ the TOP level is walked as ruby walks it, by index on the array as
@@ -40506,6 +40525,11 @@ and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
   | Cons (VExc (c9, m9), t) -> (if exc_cmp_val world (VExc (c9, m9)) then true else arr_has_obj_d world t d)
   | Cons (VArr a9, t) -> (if d > 0 && arr_has_obj_d world (deref a9) (d - 1) then true else arr_has_obj_d world t d)
   | Cons (VHsh h9, t) -> (if d > 0 && arr_has_obj_d world (hderef h9) (d - 1) then true else arr_has_obj_d world t d)
+  // Integer endpoints cannot have singleton equality overrides; avoid making
+  // a temporary endpoint list for this common native Range shape.
+  | Cons (VRange (VInt _, VInt _, _), t) -> arr_has_obj_d world t d
+  | Cons (VRange (lo9, hi9, _), t) ->
+    (if d > 0 && arr_has_obj_d world (Cons (lo9, Cons (hi9, Nil))) (d - 1) then true else arr_has_obj_d world t d)
   // (...or is a builtin value whose singleton or subclass answers #==:
   //  `x = +"k"; def x.==(o) = true` in `[x] == ["zzz"]` -- prim_eq_override)
   | Cons (v9, t) -> (if prim_eq_override world v9 then true else arr_has_obj_d world t d)
@@ -40521,7 +40545,7 @@ and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
 and prim_eq_override = fn world -> fn (v: Val) ->
   (match v with
    | VObj _ -> false | VInt _ -> false | VNil -> false | VBool _ -> false
-   | _ -> (let hk9 = hng_key v in
+   | _ -> (let hk9 = hng_key_q v in
            (if str_eq hk9 "" then false else true) && map_has hng_store hk9 && has_meth world (map_get hng_store hk9) "=="))
 and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
   // (an element whose own #== is a singleton's or a subclass's is asked, as
@@ -40554,6 +40578,10 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
      | (VFlt _, VObj _) -> cmp_num_obj_w env world x y
      | (VBig _, VObj _) -> cmp_num_obj_w env world x y
      | (VRat (_, _), VObj _) -> cmp_num_obj_w env world x y
+     // A Range stored in a container compares its endpoints through their
+     // own ==, just as the Range's direct comparison does (Time and Date
+     // endpoints are objects, not values the structural check can compare).
+     | (VRange (lo9, hi9, ex9), VRange _) -> rng_eq_w env world lo9 hi9 ex9 y false
      // (a Range against the Range an object holds: rng_sub_held)
      | (VRange (_, _, _), VObj _) -> rng_sub_held world y && rb_eq x (rng_sub_as_range world y)
      | (VObj _, VRange (_, _, _)) -> rng_sub_held world x && rb_eq (rng_sub_as_range world x) y
@@ -65506,11 +65534,11 @@ and native_definition_apply = fn world -> fn (cls: str) -> fn (body: Stmt list) 
   let saved_lex = cur_lex () in
   let _ = (if ref_on () then ref_install (ref_env_id denv) else ()) in
   let _ = set_lex cscope in
-  // (the nesting of a block written in a method is the method's: see
-  //  register_class_blk. `Class.new { def b; end }` comes straight here,
+  // (the nesting is the block's captured one: see register_class_blk.
+  //  `Class.new { def b; end }` comes straight here,
   //  from native_constructor_declaration.)
   let saved_nest = cur_nest () in
-  let _ = (if fh_meth_lv_has denv && fh_nest_lv_has denv
+  let _ = (if fh_nest_lv_has denv
            then set_nest (match fh_nest_lv_get denv with VStr h9 -> sget h9 | _ -> "") else ()) in
   let result = try_or_msg (fn (u: unit) -> native_definition_commit world cls body stmt)
     (fn (message: str) -> let _ = set_lex saved_lex in let _ = set_nest saved_nest in let _ = restore_ref_active saved in fail message) in
@@ -65599,8 +65627,10 @@ and native_refinement_declaration_body = fn world -> fn (cls: str) -> fn (body: 
 // empty nesting, so its constants were looked up through A::B as well:
 // activerecord's FixtureSet::RenderContext reads `File` there and got
 // ActiveRecord::FixtureSet::File ("undefined method 'binread'").
+// Class/module-body frames carry __nest too; their stored blocks must not
+// capture the nesting of the class_eval caller instead.
 and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (cscope: str) -> fn denv ->
-  if fh_meth_lv_has denv && fh_nest_lv_has denv then
+  if fh_nest_lv_has denv then
     (let saved_nest = cur_nest () in
      let _ = set_nest (match fh_nest_lv_get denv with VStr h9 -> sget h9 | _ -> "") in
      let r9 = try_or_msg (fn (u: unit) -> register_class_blk0 world cls body cscope denv)
