@@ -105,6 +105,21 @@ Mere 9dec2ff6, reference ruby 4.0.10. The base is main 491cc5ca; for the Linux n
   | ×100, default, 7 runs | median 649 MiB (632–750) | 616 (421–825) | — |
 
   With the default collector the peak depends on when the collections fall, and the runs spread over 400 MiB. The footprint medians of those seven are 639 (main) and 679 MiB.
+
+  Measured again with `MERE_RUBY_GC_TIGHT=1`, 7 runs alternating, median max RSS (range):
+
+  | | main | this change |
+  |---|---|---|
+  | ×10 | 368 MiB (309–404) | 316 MiB (266–333) |
+  | ×30 | 373 MiB (316–412) | 363 MiB (348–368) |
+
+- **A known exception: the GC_TIGHT peak on macOS.** The review measured the same loop with its own builds and found this change above main:
+  - ×10: 275 against 329–330 MiB, and 290 against 346 in another three runs;
+  - ×30: 333–359 against 399, and 367–377 against 419;
+  - ×200: mixed;
+  - with the default collector, seven runs: 658 against 510 MiB, this change lower.
+
+  In those runs the collector ran the same number of times on both sides and counted the same bytes. So the difference, +40–55 MiB, is outside what the interpreter's collector counts. It also follows how the loop is run: loaded from a wrapper, `vmmap` showed this change lower (265 against 340 MiB), and the runs above, the same binary's, have it lower too. It is not explained here.
 - **Linux** (docker, Debian, ruby:4.0.10, clang 19, aarch64; peak RSS from GNU time):
   - `Buffer#read` of 2 MiB from an IO ×100: 94 MB on both. User CPU 0.34–0.44 s on both over five runs each, plus one main run at 0.65 s.
   - The specs, with their random seeds fixed in a copy for the measurement (they pick a new one every run), five runs alternating:
