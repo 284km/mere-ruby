@@ -700,6 +700,75 @@ let iv_rec = fn (oid: int) -> iv_rec_k (oid * 8);
 let iv_rec_free = fn (r: int) ->
   let s = iv_rec_shape r in
   if s > 0 then (let _ = iv_slots_add (0 - sh_len s) in area_free iv_slab iv_free (iv_rec_base r) (iv_rec_cap r)) else ();
+// THE SLAB SQUEEZED: the live areas moved down to its start, and the rest
+// given back. An area given back goes to its size's free list and the slab
+// never shrank: what it once held at its highest stayed. A YAML load of
+// activerecord's citations fixture (65,536 rows, six nodes of a dozen
+// variables a row) left 7M slots, 356 MB, for 133k live objects.
+// - WHEN: the collector calls this after its mark and sweep, where it compacts
+//   the slab's arena (gc_collect, not under "nc"), and the slab is squeezed
+//   only when it is more than twice its live areas and 64K slots besides --
+//   so a squeeze leaves it at half the length that brings the next one.
+// - SAFE THERE, as vec_compact is (note 560 §7.3: a slab compacted outside the
+//   collection segfaulted). A base is kept nowhere but in its record (the
+//   VM's ivar cache keeps a shape and an index, and reads the record); every
+//   door function that takes a base reads or writes the slab before anything
+//   else runs -- they are here, ahead of the evaluator, and call no Ruby; and
+//   a value read out of the slab and held by a stack the collection
+//   interrupted, or a suspended fiber's, pins its block through vec_recycle.
+// - Each area keeps its size class: its record is rewritten with the new base
+//   and the same class and shape, so iv_grow's `n1 <= cap0` and the VM's
+//   `sh_len s1 <= iv_rec_cap r` see the area that is there.
+// (the scratch Vecs are this file's, wound back after each use, each in an
+//  arena of its own. [0]: squeezes made,
+//  [1]: live area slots counted, [2]: the next base)
+// [3]: MERE_RUBY_SLAB_SQUEEZE=1 -- a check, not a setting: squeeze at every
+//  collection that leaves a free slot, so that the corpus under GC_STRESS
+//  moves the areas under everything it runs, fibers suspended included
+// [4]: MERE_RUBY_SLAB_SQUEEZE_MAX=n -- a diagnostic, not a setting: make at
+//  most n squeezes (0, the default: no limit), to see what a run that missed
+//  its later squeezes looks like
+let iv_sq = (let v = vec_new () in let _ = vec_push v 0 in let _ = vec_push v 0 in let _ = vec_push v 0 in
+             let _ = vec_push v (if str_eq (iv_env "MERE_RUBY_SLAB_SQUEEZE") "1" then 1 else 0) in
+             let _ = vec_push v (let s = iv_env "MERE_RUBY_SLAB_SQUEEZE_MAX" in if str_eq s "" then 0 else int_of_str s) in v);
+// (the scratch Vecs get an arena of their own when they are made, as cut_e
+//  and rxv_ls do: a Vec without one fills the default region, which its
+//  vec_recycle cannot give back, so the first big squeeze would stay there)
+let iv_sq_vals = (let v = vec_new () in let _ = vec_compact v in v);
+let iv_sq_recs = (let v = vec_new () in let _ = vec_compact v in v);
+let iv_slab_squeeze = fn (u: unit) ->
+  if vec_get iv_sq 4 > 0 && vec_get iv_sq 0 >= vec_get iv_sq 4 then () else
+  let _ = vec_set iv_sq 1 1 in
+  let _ = map_iter obj_iv (fn (ok: int) -> fn (r: int) ->
+            if r > 0 && iv_rec_shape r > 0 then vec_set iv_sq 1 (vec_get iv_sq 1 + iv_rec_cap r) else ()) in
+  let live = vec_get iv_sq 1 in
+  if (if vec_get iv_sq 3 == 1 then vec_len iv_slab <= live else vec_len iv_slab <= 2 * live + 65536) then ()
+  else
+    (let _ = vec_set iv_sq 2 1 in
+     let _ = map_iter obj_iv (fn (ok: int) -> fn (r: int) ->
+               if r > 0 && iv_rec_shape r > 0 then
+                 (let b = iv_rec_base r in
+                  let cap = iv_rec_cap r in
+                  let rec cp = fn (i: int) -> if i >= cap then () else (let _ = vec_push iv_sq_vals (vec_get iv_slab (b + i)) in cp (i + 1)) in
+                  let _ = cp 0 in
+                  let nb = vec_get iv_sq 2 in
+                  let _ = vec_push iv_sq_recs ok in
+                  let _ = vec_push iv_sq_recs (iv_mk_rec nb cap (iv_rec_shape r)) in
+                  vec_set iv_sq 2 (nb + cap))
+               else ()) in
+     let _ = vec_recycle iv_slab in
+     let _ = vec_push iv_slab VNil in
+     let n = vec_len iv_sq_vals in
+     let rec back = fn (i: int) -> if i >= n then () else (let _ = vec_push iv_slab (vec_get iv_sq_vals i) in back (i + 1)) in
+     let _ = back 0 in
+     let m = vec_len iv_sq_recs in
+     let rec recs = fn (i: int) -> if i >= m then () else (let _ = iv_rec_put (vec_get iv_sq_recs i) (vec_get iv_sq_recs (i + 1)) in recs (i + 2)) in
+     let _ = recs 0 in
+     let rec unfree = fn (k: int) -> if k >= vec_len iv_free then () else (let _ = vec_set iv_free k (0 - 1) in unfree (k + 1)) in
+     let _ = unfree 0 in
+     let _ = vec_recycle iv_sq_vals in
+     let _ = vec_recycle iv_sq_recs in
+     vec_set iv_sq 0 (vec_get iv_sq 0 + 1));
 // the slots of shape s in order, as (slot, name number)
 let iv_shape_slots = fn (s: int) ->
   (let rec go = fn (t: int) -> fn (acc: (int * int) list) ->
