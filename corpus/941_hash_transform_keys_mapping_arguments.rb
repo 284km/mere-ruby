@@ -119,3 +119,92 @@ def s.to_hash = {a: :A}
     p [e.class, e.message]
   end
 end
+
+# Array subclass overrides also receive keys before native index coercion.
+class KeyedArray941 < Array
+  attr_reader :writes
+  def []=(key, value)
+    @writes ||= []
+    @writes.replace([key, value])
+    :writer_return
+  end
+  def [](key) = [:read, key]
+  def fetch(key) = [:fetch, key]
+end
+keyed941 = KeyedArray941.new
+p [:assignment, (keyed941['file.txt'] = 'body'), keyed941.writes]
+p [:read, keyed941['file.txt'], keyed941.fetch('file.txt')]
+native_write941 = Array.instance_method(:[]=).bind(keyed941)
+index941 = Object.new
+def index941.to_int = 0
+p [:native_write, native_write941.call(index941, 7), Array.instance_method(:[]).bind_call(keyed941, 0)]
+keyed941.freeze
+p [:frozen_override, (keyed941['other'] = 8)]
+class ForwardIndexArray941 < Array
+  def []=(*args)
+    super
+  end
+  def [](*args)
+    super
+  end
+end
+forward941 = ForwardIndexArray941.new
+p [:native_super, (forward941[index941] = 9), forward941[index941]]
+
+# An overriding reader/fetch receives the original object, without to_int.
+class OriginalIndex941
+  attr_reader :calls
+  def initialize = @calls = 0
+  def to_int
+    @calls += 1
+    0
+  end
+end
+class OriginalIndexArray941 < Array
+  def [](index) = index
+  def fetch(index) = index
+  def at(index) = index
+  def rotate(index) = index
+  def delete_at(index) = index
+end
+original_index941 = OriginalIndex941.new
+original_array941 = OriginalIndexArray941.new
+p [:original_index, [:[], :fetch, :at, :rotate, :delete_at].map { |name|
+  original_array941.public_send(name, original_index941).equal?(original_index941)
+}, original_index941.calls]
+singleton_array941 = []
+def singleton_array941.[](index) = index
+p [:singleton_original_index, singleton_array941[original_index941].equal?(original_index941), original_index941.calls]
+
+# Invalid native calls reject arity before nil/index coercion or to_int hooks.
+class NativeArityArray941 < Array
+  alias_method :saved_at, :at
+  alias_method :saved_flatten, :flatten
+end
+class NativeAritySuper941 < Array
+  def at(*args) = super
+  def flatten(*args) = super
+end
+index941 = OriginalIndex941.new
+[NativeArityArray941[1, 2, 3], NativeAritySuper941[1, 2, 3]].each do |array|
+  operations = array.is_a?(NativeArityArray941) ? [:saved_at, :saved_flatten] : [:at, :flatten]
+  operations.each do |name|
+    [nil, index941].each do |index|
+      begin
+        array.public_send(name, index, 1)
+      rescue ArgumentError, TypeError => error
+        p [:native_wrong_arity, name, error.class, error.message, index941.calls]
+      end
+    end
+  end
+end
+[:at, :flatten].each do |name|
+  method941 = Array.instance_method(name).bind(NativeArityArray941[1, 2, 3])
+  [nil, index941].each do |index|
+    begin
+      method941.call(index, 1)
+    rescue ArgumentError, TypeError => error
+      p [:retained_wrong_arity, name, error.class, error.message, index941.calls]
+    end
+  end
+end
