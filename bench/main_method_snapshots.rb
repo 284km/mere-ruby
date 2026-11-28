@@ -15,6 +15,15 @@ elsif kind == 'capture'
     sum += main_snapshot_cost
   end
   sum += retained.size
+elsif kind == 'discard'
+  count.times do |i|
+    captured = method(:main_snapshot_cost)
+    def main_snapshot_cost = 7
+    sum += main_snapshot_cost
+    captured = nil
+    GC.start if (i + 1) % 128 == 0
+  end
+  10.times { GC.start }
 else
   raise ArgumentError, kind
 end

@@ -895,6 +895,10 @@ let rec gc_owner_refinement = fn (key: str) -> fn (start: int) ->
   else if gc_prefix_at key "(sng:" start then gc_owner_refinement key (start + 5)
   else false;
 let gc_class_owner = fn (k0: str) ->
+  // A saved definition is owned by its live Method objects, independently
+  // of the class that currently publishes the method name. Reuse the
+  // metadata graph for these exact keys; class names never contain chr 5.
+  if map_len snap_meths > 0 && map_has snap_meths k0 then k0 else
   // Registered bare identities and their method rows dominate metadata.
   // Resolve those forms before parsing wrappers and qualified namespaces.
   let first = (if str_len k0 > 0 then ord (char_at k0 0) else 0) in
@@ -1078,6 +1082,24 @@ let gc_live_count = fn live ->
     else go (i + 1) (count + ones (vec_get words i) 0) in
   go 0 0;
 
+// Copies/binds keep their original era in an internal ivar. Follow the same
+// boundary as msnap_src, so dropping an intermediate snapshot cannot move a
+// surviving Method onto a newer definition.
+let gc_method_snapshot = fn (id: int) -> fn (name: Val) -> fn (owner: Val) ->
+  if map_len snap_bounds == 0 then () else
+  let rec kind = fn (cls: str) ->
+    if str_eq cls "Method" || str_eq cls "UnboundMethod" then cls
+    else if map_has cls_sup cls then kind (map_get cls_sup cls) else "Method" in
+  let unbound = str_eq (kind (map_get obj_cls id)) "UnboundMethod" in
+  let prefix = (if unbound then "~um_" else "~m_") in
+  let cls = method_text_or (method_text owner) (iv_get_or ivars_g id (prefix ++ "dk") VNil) in
+  let key = cls ++ "#" ++ method_text name in
+  if map_has snap_bounds key then
+    (let era = (match iv_get_or ivars_g id (prefix ++ "era") VNil with VInt n -> n | _ -> id) in
+     let bound = msnap_bound_above (map_get snap_bounds key) era in
+     if bound < 0 then () else gc_class_mark (msnap_key key bound))
+  else ();
+
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = id * 8 in
@@ -1085,6 +1107,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                   (let _ = (if map_has obj_cls id then gc_class_mark (map_get obj_cls id) else ()) in
                    let _ = (if map_has method_cores id then
                      (let (name, owner, receiver, extra) = map_get method_cores id in
+                      let _ = gc_method_snapshot id name owner in
                       let _ = gc_mark_val live name in
                       let _ = gc_mark_val live owner in
                       let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
@@ -1622,6 +1645,14 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = (if map_len gc_live_cls > 0 || vec_len gc_cls_pend > 0 || map_len gc_ref_live > 0
               || vec_len gc_ref_pend > 0 || vec_len gc_obj_pend > 0
            then gc_pend_release () else ()) in
+  // A temporarily installed snapshot must survive even if reflection drops
+  // the Ruby Method while the native reader is still borrowing its tables.
+  let _ = (if map_len msnap_inst == 0 then () else
+    map_iter msnap_inst (fn (key: str) -> fn _v ->
+      if map_has snap_bounds key then
+        list_iter (str_split (map_get snap_bounds key) ";") (fn (bound: str) ->
+          if str_len bound == 0 then () else gc_class_mark (key ++ chr 5 ++ bound))
+      else ())) in
   // (Ruby's C API: the VALUEs C registered, and -- while a call into C is in
   //  progress -- the ones on this stack, which is C's local variables. A
   //  stopped stack's are read with its handles, below.)
@@ -1981,6 +2012,15 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
         let _ = (if str_starts_with name yblk_marker && str_len name > 9
                  then gc_owned_meta_add metadata live k (VProc (int_of_str (substring name 9 (str_len name)))) else ()) in params rest in
     match m with Meth (ps9, _, _) -> params ps9) in
+  let _ = (if map_len snap_meths == 0 then () else
+    map_iter snap_meths (fn (k: str) -> fn (m: Meth) ->
+      match m with Meth (ps, _, _) ->
+        let rec params = fn (xs: str list) -> match xs with
+          | Nil -> ()
+          | Cons (name, rest) ->
+            let _ = (if str_starts_with name yblk_marker && str_len name > 9
+              then gc_owned_meta_add metadata live k (VProc (int_of_str (substring name 9 (str_len name)))) else ()) in
+            params rest in params ps)) in
   let _ = map_iter bind_store (fn (k: str) -> fn (benv) -> gc_mark_env live benv) in
   // the scope-chain parents: env maps linked by id, each holding Vals
   // (...and the parent links of a suspended fiber's active blocks, likewise)
@@ -2155,6 +2195,32 @@ let gc_sweep_class_table = fn tbl -> fn (key_kind: int) -> fn (compact: bool) ->
     let _ = gc_drop_s tbl dead in
     if compact && vec_len dead > 0 then (let _ = map_compact tbl in true) else false
   };
+// Keep only boundaries selected by reachable Method/UnboundMethod objects.
+// Remove them after all per-definition tables have classified their owners.
+let gc_sweep_method_snapshots = fn (compact: bool) ->
+  if map_len snap_meths == 0 then () else
+  region MSG {
+    let changed = vec_new () in
+    let _ = map_iter snap_bounds (fn (key: str) -> fn (bounds: str) ->
+      let kept = strbuf_new () in
+      let rec scan = fn (xs: str list) -> fn (removed: bool) ->
+        match xs with
+        | Nil -> removed
+        | Cons (bound, rest) ->
+          if str_len bound == 0 then scan rest removed
+          else if map_has gc_live_cls (key ++ chr 5 ++ bound) then
+            (let _ = strbuf_push kept bound in let _ = strbuf_push kept ";" in scan rest removed)
+          else scan rest true in
+      if scan (str_split bounds ";") false then vec_push changed (key, strbuf_to_str kept) else ()) in
+    let rec update = fn (i: int) ->
+      if i >= vec_len changed then () else
+      (let (key, bounds) = vec_get changed i in
+       let _ = (if str_len bounds == 0 then map_delete snap_bounds key else map_set snap_bounds key bounds) in
+       update (i + 1)) in
+    let _ = update 0 in
+    let _ = gc_sweep_class_table snap_meths 0 compact in
+    if compact && vec_len changed > 0 then map_compact snap_bounds else ()
+  };
 let gc_sweep_classes = fn (nc: bool) ->
   // Deletion queues and reference-tag indexes belong to this sweep. Without
   // a lexical region, their mutable stores retain every dead identity in
@@ -2266,7 +2332,6 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table mro_local_epoch 0 compact in
   let _ = gc_sweep_class_table mro_external 0 compact in
   let _ = gc_sweep_class_table meth_obj_seen 0 compact in
-  let _ = gc_sweep_class_table snap_meths 0 compact in
   let _ = gc_sweep_class_table snap_bounds 0 compact in
   let _ = gc_sweep_class_table msnap_inst 0 compact in
   // Only method-position IDs cross Fiber switches. Other saved callers keep
@@ -2313,6 +2378,7 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = (if compact && vec_len dead_refs > 0 then map_compact ref_snaps else ()) in
   // Keep identity records while the final module rows are classified.
   let _ = gc_sweep_class_table modules 0 compact in
+  let _ = gc_sweep_method_snapshots compact in
   // The identity registry must outlive owner parsing of every metadata table.
   let dead_identities = vec_new () in
   let _ = map_iter anonymous_classes (fn (name: str) -> fn (_kind: int) ->
@@ -52570,13 +52636,6 @@ and msnap_carry = fn world -> fn (id: int) -> fn (ocl: str) -> fn (nid: int) -> 
   //  NOW, which after a remove_method is a superclass's)
   if iv_has iv9 id dk9 then iv_set iv9 nid nk9 (iv_get iv9 id dk9)
   else if iv_has iv9 nid nk9 then iv_del iv9 nid nk9 else ()
-// the first bound above era in "B1;B2;...", or -1
-and msnap_bound_above = fn (bs: str) -> fn (era: int) ->
-  let rec go = fn (xs: str list) ->
-    (match xs with
-     | Nil -> 0 - 1
-     | Cons (x, t) -> (if str_eq x "" then go t else (let b = int_of_str x in if b > era then b else go t))) in
-  go (str_split bs ";")
 // the copy an object's definition was saved under, or "" when its name still
 // has it (or while that copy is installed: msnap_with)
 and msnap_src = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> fn (name: str) ->

@@ -140,3 +140,44 @@ GC.start
 p removed.call(19), undefined.call(20)
 
 p old_top[21], old_top.(22), old_top === 23
+
+# Removing unused boundaries must preserve the original era of a surviving
+# copy, including an UnboundMethod with its own singleton class.
+def successive_top1141 = :first
+first = method(:successive_top1141)
+def successive_top1141 = :middle
+middle = method(:successive_top1141)
+middle_copy = middle.dup.unbind
+def middle_copy.tag = :tag
+def successive_top1141 = :last
+first = nil
+middle = nil
+6.times { GC.start }
+p [middle_copy.bind(self).call, middle_copy.tag, successive_top1141]
+
+# A discarded Method must release its saved define_method closure. The
+# current definition is installed in another frame so it cannot capture the
+# old argument. Conservative collection may keep some targets, but not all.
+$released_snapshot1141 = []
+def snapshot_finalizer1141
+  proc { |id| $released_snapshot1141 << id }
+end
+def publish_discarded_snapshot1141(value)
+  Object.send(:define_method, :discarded_top1141) { value }
+  method(:discarded_top1141)
+end
+def reset_discarded_snapshot1141
+  Object.class_eval { def discarded_top1141 = :current }
+end
+Fiber.new do
+  20.times do
+    value = Object.new
+    ObjectSpace.define_finalizer(value, snapshot_finalizer1141)
+    publish_discarded_snapshot1141(value)
+    reset_discarded_snapshot1141
+  end
+  nil
+end.resume
+12.times { GC.start }
+raise 'discarded Method retained every old closure' if $released_snapshot1141.empty?
+p [:discarded_snapshots_released, discarded_top1141]
