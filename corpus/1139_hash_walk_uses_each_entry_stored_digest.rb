@@ -145,3 +145,71 @@ p [nested[[other, :tail]], nested[[:tail, other]]]
 p stored_hash1139({}, :empty)[{}.compare_by_identity]
 p [stored_hash1139({a: 1}, :integer)[{a: 1.0}],
    stored_hash1139({a: 1.0}, :float)[{a: 1.0}]]
+
+# Many overwrites preserve key identity, order, snapshots and collection.
+keys = Array.new(64) { |i| [i] }
+many = {}
+keys.each_with_index { |k, i| many[k] = i }
+3.times do |round|
+  keys.each_with_index { |k, i| many[k] = [round, i] }
+  GC.start
+end
+p [many.size, many.keys == keys, keys.map { |k| many[k] }, many.dup.values]
+strings = Array.new(64) { |i| "mixed-#{i}" }
+mixed = {[:mutable] => :initial}
+strings.each_with_index { |k, i| mixed[k] = i }
+strings.each_with_index { |k, i| mixed[k.dup] = i + 100 }
+p [mixed.size, strings.map { |k| mixed[k.dup] }, mixed.values.drop(1)]
+
+# Removing earlier entries must not make later deferred values alias a new
+# insertion. A historical digest shared by two entries keeps insertion order.
+first = [0]
+ordered = stored_hash1139(first, :first)
+first << 1
+ordered[[0]] = :second
+first.pop
+ordered[first] = :changed_first
+p [ordered[first], ordered.values.compact]
+ordered.delete(0)
+p [ordered[first], ordered.values.compact]
+ordered.delete(first)
+ordered[[2]] = :new_after_delete
+ordered[[0]] = :changed_second
+GC.start
+p [ordered[[0]], ordered[[2]], ordered.values.compact, ordered.dup.values.compact]
+
+# Equal content digests do not imply identity-mode Hash key equality.
+normal = {a: 1, b: 2}
+identity = {b: 2, a: 1}.compare_by_identity
+literal = {normal => :normal, identity => :identity}
+p [literal.size, literal[normal], literal[identity]]
+separate = {}
+separate[normal] = :normal
+separate[identity] = :identity
+p [separate.delete(identity), separate.values]
+p [{normal => 1, identity => 2}.delete(normal)]
+left_key = +'left'
+right_key = +'right'
+left = {left_key => 1, right_key => 2}.compare_by_identity
+reversed = {right_key => 2, left_key => 1}.compare_by_identity
+other_objects = {left_key.dup => 1, right_key.dup => 2}.compare_by_identity
+mixed_modes = {left => :left, reversed => :reversed, other_objects => :other}
+p [left.eql?(reversed), left.eql?(other_objects), mixed_modes.size,
+   mixed_modes[left], mixed_modes[reversed], mixed_modes[other_objects]]
+p [mixed_modes.delete(other_objects), mixed_modes.values]
+empty_normal = {}
+empty_identity = {}.compare_by_identity
+empty_keys = {empty_normal => :first, empty_identity => :last}
+p [empty_keys.size, empty_keys[empty_normal], empty_keys[empty_identity]]
+# Ruby Hash#hash stays content based when the identity mode changes or an
+# identity key is replaced by a different object with equal content.
+changing = {a: 1, b: 2}
+outer = stored_hash1139(changing, :mode_kept)
+changing.compare_by_identity
+p outer[changing]
+changing_key = +'same'
+changing = {changing_key => 1}.compare_by_identity
+outer = stored_hash1139(changing, :contents_kept)
+changing.delete(changing_key)
+changing[changing_key.dup] = 1
+p outer[changing]
