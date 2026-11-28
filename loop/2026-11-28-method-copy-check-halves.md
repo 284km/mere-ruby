@@ -30,7 +30,7 @@ Every sample of five runs on Linux (arm64, in docker, main 491cc5ca), in MB. All
 - The limit is 1.3, where it was 2.0. The limit is on a different ratio now, and 1.3 is where the numbers below put it.
 - `--leak-every N` keeps every Nth class in a global Array. It is a negative control: the check must fail with it. It does not run in CI.
 
-One run of the check, both sides, takes 25 s on Linux, where it took about 6.
+One run of the check, both sides, takes 25 s on Linux, where it took about 6. The wall limit is per run, so the worst case is six runs of 600 s each.
 
 ## Numbers
 
@@ -44,7 +44,7 @@ Linux (arm64, docker), main 491cc5ca, the check itself:
 
 So a leak of 3.2 MB a batch fails it, close to the limit. One of 5.3 MB fails it with room to spare.
 
-The growth with no leak (1.1 MB a batch, batch 1 to batch 30) is the climb of the first batches, not a slope. The second half's peak stays at the first half's.
+With no leak, mere's RSS still grows by 1.1 to 1.2 MB a batch, from batch 1 to batch 30, where ruby's is flat. The second half's peak stays at the first half's, so the check reads it as the climb of the first batches. It may also be a small retention of mere's own that the halves do not see. It is left for later, with the VM's case below.
 
 Before the change, with the same program over 30 batches and no leak, three runs on each engine gave the ratio of halves:
 

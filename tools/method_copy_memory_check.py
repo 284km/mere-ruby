@@ -19,9 +19,9 @@ GC_TIGHT did not steady it: it lowers the start and raised the ratio to 2.0.
     tools/method_copy_memory_check.py --reference ruby --output DIR
     tools/method_copy_memory_check.py ... --leak-every 10    a negative control
 
---leak-every N keeps every Nth class in a global Array: about 3 MB a batch at
-10. The check must fail with it (the ratio was 1.33 to 1.41 on Linux), and
-does not run in CI.
+--leak-every N keeps every Nth class in a global Array, and does not run in
+CI. At 5, about 5.4 MB a batch on Linux, the check must fail (a median of
+1.46). At 10, about 3.3 MB a batch, it failed at 1.34, close to the limit.
 """
 import argparse
 import hashlib
