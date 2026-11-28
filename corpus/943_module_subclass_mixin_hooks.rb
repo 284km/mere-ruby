@@ -84,3 +84,35 @@ p trace
 ordinary_mixin943(:after_backing)
 GC.start
 ordinary_mixin943(:after_collection)
+
+# Singleton classes of modules and classes are Class instances too. A
+# prepended Class method resumes in their metaclass chain when it calls super.
+module ClassSubclasses943
+  def subclasses(*args)
+    [defined?(super), super]
+  end
+end
+Class.prepend(ClassSubclasses943)
+singleton_classes943 = [Object.new.singleton_class, Module.new.singleton_class,
+                       Class.new.singleton_class, String.singleton_class,
+                       Module.new.singleton_class.singleton_class,
+                       Class.new.singleton_class.singleton_class]
+p singleton_classes943.map(&:subclasses)
+module SingletonModule943
+  class << self
+    p [:module_singleton_body, subclasses]
+  end
+end
+class SingletonClass943
+  class << self
+    p [:class_singleton_body, subclasses]
+  end
+end
+parent943 = Class.new
+child943 = Class.new(parent943)
+p [:ordinary_class, parent943.subclasses == ['super', [child943]]]
+begin
+  singleton_classes943[1].subclasses(:extra)
+rescue ArgumentError => error
+  p [:singleton_arity, error.class, error.message]
+end
