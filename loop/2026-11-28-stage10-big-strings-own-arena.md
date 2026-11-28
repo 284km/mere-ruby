@@ -22,6 +22,20 @@ A String of `str_big_min` bytes (256 KB) or more is kept in a Vec of its own, wi
 - `vec_recycle` gives back the arena's growth and keeps one 256-byte block. It moves to a fresh arena where a suspended stack points into a block, and retires the old one.
 - `str_bytes` counts the big Strings' bytes, so the pressure sees them.
 
+### Counted until it is given back (review, Major)
+
+A replaced or dead big String's Vec waits in `str_big_dead` for the sweep. Its bytes were taken off `str_big_tot` at once, so the pressure no longer saw them. A String replaced again and again by one that is already there makes no new handle, and nothing else asked for a collection: each replace counted one copy while every copy stayed. The bytes now stay in `str_big_tot` until the sweep recycles the Vec.
+
+A big String written over another is bytes made, as `mkstr` counts them, so `sput` adds them to `str_pg_add`. The safepoint asks for the pressure once 16 MB have been made (#389). Main did not count them either: its page kept every replaced copy, and asked for no collection.
+
+`src = "a" * 1_048_576; s = +"x"; 128.times { s.replace(src) }`, from one `GC.start` to the loop's end:
+
+| | evaluator: collections | RSS | VM: collections | RSS |
+|---|---|---|---|---|
+| main | 0 | 68 → 198 MB | 0 | 69 → 199 MB |
+| this change, as reviewed | 0 | 68 → 199 MB | 0 | 69 → 200 MB |
+| this change | 4 | 68 → 115 MB | 2 | 69 → 153 MB |
+
 ### Why 256 KB
 
 | threshold | `loop_rss` cases of 32 KB Strings, VM, from the tree | a loop of 20 KB Strings: instructions |
@@ -66,7 +80,7 @@ The look into `str_big` costs 0.3 to 0.4% on small Strings. Big Strings cost 0.8
 
 ### tools/loop_rss_check.rb
 
-Two new cases, from the tree:
+Three new cases, from the tree. The third makes no new handle, so nothing else asks for a collection: it is the review's case.
 
 | case | engine | main | this change | both |
 |---|---|---|---|---|
@@ -74,6 +88,8 @@ Two new cases, from the tree:
 | | VM | 5.15 (FAIL) | 4.23 (FAIL) | 1.03 |
 | a big String replaced, 2,000 times | evaluator | 1.35 | 1.00 | 1.00 |
 | | VM | 1.39 | 1.03 | 1.04 |
+| a big String replaced by another, both kept, 512 times | evaluator | 5.36 (FAIL) | | 1.02 |
+| | VM | 5.33 (FAIL) | | 1.13 |
 
 The first needs #393 too: `sub!`'s StrBuf was the default region's.
 

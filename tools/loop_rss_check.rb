@@ -103,6 +103,10 @@ CASES = {
   # needs sub!'s StrBuf in a region of its own too, #393.)
   "big Strings" => ->(d) { s = "a" * 300_000; (2_000 / d).times { t = s + "b"; t << "c"; t.sub!("a", "d") } },
   "a big String replaced" => ->(d) { s = +"x"; (2_000 / d).times { |i| s.replace("a" * 300_000); s << i.to_s } },
+  # ...and by one that is already there, again and again: no new handle is
+  # made, so nothing else asks for a collection, and the replaced copies have
+  # to be counted until the sweep recycles them (#400's review)
+  "a big String replaced by another, both kept" => ->(d) { src = "a" * 1_048_576; s = +"x"; (512 / d).times { s.replace(src) } },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))
