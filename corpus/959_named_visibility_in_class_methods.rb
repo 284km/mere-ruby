@@ -141,3 +141,57 @@ ExtendedVisibility959.freeze
 [:run_private959, :run_public959, :run_protected959].each do |name|
   p [:extended_override, name, ExtendedVisibility959.send(name) { :caller_block }]
 end
+
+# AMQP keeps a collection of method classes in its own .methods. Reflection
+# must not replace that Ruby method with a list of Symbols.
+class ReflectionOverride959
+  def self.methods(all = true)
+    [:own_methods, all, block_given?]
+  end
+
+  def self.public_methods(all = true) = [:own_public_methods, all]
+  def self.private_methods(all = true) = [:own_private_methods, all]
+  def self.protected_methods(all = true) = [:own_protected_methods, all]
+end
+class InheritedReflection959 < ReflectionOverride959; end
+[:methods, :public_methods, :private_methods, :protected_methods].each do |name|
+  p [:reflection_override, name, ReflectionOverride959.send(name, false)]
+  p [:inherited_reflection, name, InheritedReflection959.send(name)]
+end
+p [:reflection_block, ReflectionOverride959.methods(false) { :caller_block }]
+
+module ReflectionMixin959
+  def methods(all = true) = [:extended_methods, all]
+end
+module ExtendedReflection959
+  extend ReflectionMixin959
+end
+p [:extended_reflection, ExtendedReflection959.methods(false)]
+
+class ReflectionSuper959
+  def self.marker959 = :marker
+  NATIVE_METHODS = method(:methods)
+  class << self
+    alias native_methods959 methods
+  end
+
+  def self.methods(all = true)
+    [:own_super, super(all).include?(:marker959)]
+  end
+end
+p [:reflection_super, ReflectionSuper959.methods(false)]
+p [:retained_reflection, ReflectionSuper959::NATIVE_METHODS.call(false).include?(:marker959)]
+p [:aliased_reflection, ReflectionSuper959.native_methods959(false).include?(:marker959)]
+
+class PrivateReflection959
+  class << self
+    private
+    def methods = [:private_methods_override]
+  end
+end
+begin
+  PrivateReflection959.methods
+rescue NoMethodError => error
+  p [:private_reflection, error.class, error.name]
+end
+p [:private_reflection_send, PrivateReflection959.send(:methods)]
