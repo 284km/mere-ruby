@@ -52,6 +52,13 @@ An offset was reached by reading the bytes before it (fifth review, Major). `rea
 - A length of 0 reads nothing and is "", at any offset, past the end too. A regular file read with a length of 0 at or past its end answered nil, on main (6d2cb190) as well.
 - A regular file with a size is read the same way when a length is given, so a few bytes of a big file no longer read all of it.
 
+A file that cannot be read answered as if it were empty (sixth review, Major). `read_path_at` took a failed open for an empty read, so `File.read(path, 1)` of a file with mode 0 answered nil, and a length of 0 answered "" without trying to open it. ruby raises Errno::EACCES; main raised a StandardError. Now:
+
+- The open's errno is raised as its Errno. A length of 0 opens the path and seeks too, and then reads nothing.
+- The order is ruby's, asked of the reference. binread refuses an unreadable file before anything else. read refuses it after the offset's refusals (a negative offset, a String) and before the length's.
+
+Binread's offset is an off_t, and on Linux an off_t is a long, so its String refusal is "no implicit conversion of String into Integer" there (sixth review, Minor). The Float arm already chose "long long" this way. The Linux build job failed on corpus 838's two lines of this.
+
 A File reopened onto another path kept what it had read of the old one as a stream (third review, Major). Read over a pipe and then reopened onto a file, it answered the pipe's "old\n" again. `__f_reopen` now drops `__f_whole`, the bytes and the mark that the path was not a stream alike.
 
 A File over a pipe whose writer keeps it open waits for the writer to close it at its first read, since that read takes the whole of it. ruby's `gets` there answers as each line arrives. Before, the second line was lost.
@@ -78,6 +85,7 @@ Corpus 838 covers:
 - lengths and offsets that are not Integers: a Float, an object with `#to_int` (answering -1, 2, and a String), a String, nil and a Bignum;
 - Floats that have no long, as a length and as an offset, for `File` and `IO`, `read` and `binread`, and for `#read`, `#readpartial`, `#sysread`, `#read_nonblock`, `#gets`, `#seek` and `#sysseek`: the two infinities, NaN, 1e100, -1e100, 9.3e18 and 2**63;
 - a length of 0 and a length of 3 at offsets 0, 16 and 2**40 of `/dev/urandom` and `/dev/zero`, and lengths of 0 and 2 near, at and past the end of a regular file, for `File.read`, `File.binread`, `IO.binread` and `IO.read`, and `File#pread` at 2**40;
+- a file with mode 0, for `File` and `IO`, `read` and `binread`: no length, lengths of 0, 1 and -1, with offsets, a String length or offset, an infinite length, and `File.readlines` and `File.foreach` of it;
 - a File read over a pipe and then reopened onto a file;
 - a Tempfile written and read back, a log opened empty and appended to twice while open, `w+` written and read back;
 - line, length and `eof?` reads mixed on one File, and a seek from the end.
@@ -117,3 +125,4 @@ On 391b560e:
 - After the third review fix, merged with main ad289755: `run_corpus.sh` 1027/1027, `vm_corpus.sh` all 1027 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
 - After the fourth review fix, on 8b1c2ed5: `run_corpus.sh` 1027/1027, `vm_corpus.sh` all 1027 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, and `tools/loop_rss_check.sh` (14/14).
 - After the fifth review fix, merged with main 491cc5ca: `run_corpus.sh` 1032/1032, `vm_corpus.sh` all 1032 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, `tools/loop_rss_check.sh` (15/15) and `tools/class_watermark_check.sh`.
+- After the sixth review fix, on main 491cc5ca: `run_corpus.sh` 1032/1032, `vm_corpus.sh` all 1032 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, `tools/loop_rss_check.sh` (15/15) and `tools/class_watermark_check.sh`. Corpus 838 also matches ruby under GC stress on both engines.
