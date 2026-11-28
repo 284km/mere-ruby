@@ -113,3 +113,4 @@ On 6ab7818d, which is main e47a4bb3 (with #393) and this change:
 - `tools/loop_rss_check.sh` 28/28: "big Strings" at 1.01 and "a big String replaced" at 1.00.
 - `tools/class_watermark_check.sh`.
 - Corpus 1150 under GC stress on both engines.
+- After the review fix, on f69302fa (main e47a4bb3 and this change): `run_corpus.sh` 1034/1034, `vm_corpus.sh` all 1034 on the VM with 0 fallback and 0 FAIL, vm_check 246/246, the root check, `tools/loop_rss_check.sh` 29/29 (the review's case at 1.02) and `tools/class_watermark_check.sh`. Corpus 1150 under GC stress on both engines.
