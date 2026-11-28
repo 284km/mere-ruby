@@ -29,6 +29,7 @@ struct mr_mirror {
     unsigned long head_epoch;   /* when flags and klass were last asked */
     unsigned long body_epoch;   /* when the bytes / elements were last fetched */
     uint64_t hash;              /* of the body as fetched or last written back */
+    long synced;                /* a String's length as fetched or last written back, plus 1 (0: not known) -- MR_STR_CAT */
     long version;               /* an Array's version at the last fetch */
     long capa;                  /* elements an Array's buffer holds */
     char *own;                  /* a String's buffer when its bytes are not in the struct */
@@ -98,8 +99,12 @@ static inline uint64_t mix(uint64_t h, uint64_t k) {
     h = (h ^ k) * 0xFF51AFD7ED558CCDULL;
     return h ^ (h >> 32);
 }
-static void hash_start(struct hash_lanes *s, size_t n, uint64_t seed) {
-    uint64_t h = seed ^ (n * 0x9E3779B97F4A7C15ULL);
+/* (the length goes in at the end, hash_end, not here: so the lanes after the
+ *  first bytes are those of any longer hash of the same bytes, and a String
+ *  C appended to has the hash of what it was and of what it is in one pass
+ *  -- hash_two) */
+static void hash_start(struct hash_lanes *s, uint64_t seed) {
+    uint64_t h = seed;
     s->lane[0] = h;
     s->lane[1] = h ^ 0x6A09E667F3BCC908ULL;
     s->lane[2] = h ^ 0xBB67AE8584CAA73BULL;
@@ -113,9 +118,9 @@ static inline void hash_block(struct hash_lanes *s, const unsigned char *p) {
     s->lane[2] = mix(s->lane[2], k[2]);
     s->lane[3] = mix(s->lane[3], k[3]);
 }
-/* (the last n < 32 bytes) */
-static uint64_t hash_end(struct hash_lanes *s, const unsigned char *p, size_t n) {
-    uint64_t h = mix(mix(mix(s->lane[0], s->lane[1]), s->lane[2]), s->lane[3]);
+/* (the last n < 32 bytes of `total`) */
+static uint64_t hash_end(struct hash_lanes *s, const unsigned char *p, size_t n, size_t total) {
+    uint64_t h = mix(mix(mix(mix(s->lane[0], s->lane[1]), s->lane[2]), s->lane[3]), total * 0x9E3779B97F4A7C15ULL);
     while (n >= 8) {
         uint64_t k;
         memcpy(&k, p, 8);
@@ -140,10 +145,22 @@ static inline __attribute__((always_inline)) uint64_t hash_short(const unsigned 
 }
 static uint64_t hash_long(const unsigned char *s, size_t n, uint64_t seed) {
     struct hash_lanes h;
-    hash_start(&h, n, seed);
+    hash_start(&h, seed);
     size_t i = 0;
     for (; i + 32 <= n; i += 32) hash_block(&h, s + i);
-    return hash_end(&h, s + i, n - i);
+    return hash_end(&h, s + i, n - i, n);
+}
+/* hash_bytes(s, n, seed), and through *first hash_bytes(s, had, seed), in one
+ * pass (32 <= had < n) */
+static uint64_t hash_two(const unsigned char *s, size_t had, size_t n, uint64_t seed, uint64_t *first) {
+    struct hash_lanes h;
+    hash_start(&h, seed);
+    size_t i = 0, cut = had & ~(size_t)31;
+    for (; i < cut; i += 32) hash_block(&h, s + i);
+    struct hash_lanes at = h;
+    *first = hash_end(&at, s + cut, had - cut, had);
+    for (; i + 32 <= n; i += 32) hash_block(&h, s + i);
+    return hash_end(&h, s + i, n - i, n);
 }
 static inline __attribute__((always_inline)) uint64_t hash_bytes(const void *p, size_t n, uint64_t seed) {
     return n < 32 ? hash_short(p, n, seed) : hash_long(p, n, seed);
@@ -158,7 +175,7 @@ static uint64_t copy_hash(unsigned char *dst, const unsigned char *src, size_t n
         return hash_short(src, n, seed);
     }
     struct hash_lanes h;
-    hash_start(&h, n, seed);
+    hash_start(&h, seed);
     int ch = *changed;
     size_t i = 0;
     for (; i + 32 <= n; i += 32) {
@@ -170,7 +187,7 @@ static uint64_t copy_hash(unsigned char *dst, const unsigned char *src, size_t n
     if (rest && !ch && memcmp(dst + i, src + i, rest)) ch = 1;
     if (rest && ch) memcpy(dst + i, src + i, rest);
     *changed = ch;
-    return hash_end(&h, src + i, rest);
+    return hash_end(&h, src + i, rest, n);
 }
 /* ---- the slot a String's struct is allocated in ------------------------------ */
 /* CRuby allocates a String's struct in a slot of one of five sizes -- 40, 80,
@@ -509,19 +526,50 @@ static void touch(struct mr_mirror *m, VALUE obj) {
 }
 
 /* Write one struct back when C changed it. Answers whether it did. */
+/* (a String C appends to is written back as its tail once what the interpreter
+ *  has of it is this long: below it, all of it, as before) */
+#define CAT_FROM_BYTES (64 * 1024)
 static int write_back(struct mr_mirror *m, VALUE obj) {
     if (!m->body) return 0;
-    uint64_t now = body_hash(m);
+    /* (a String C may have appended to: its hash now, and of the part it
+     *  last synced, in one pass) */
+    long had = m->body == T_STRING ? m->synced - 1 : -1;
+    int appended = had >= CAT_FROM_BYTES && m->as.string.len > had;
+    uint64_t first = 0;
+    uint64_t now = appended ? hash_two((const unsigned char *)str_ptr(m), (size_t)had, (size_t)m->as.string.len, 1, &first)
+                            : body_hash(m);
     if (now == m->hash) return 0;
+    uint64_t before = m->hash;
     struct mr_transit saved;
     mr_transit_save(&saved, -1);
     m->hash = now;
     if (m->body == T_STRING) {
         str_adopt(m);
-        if (m->as.string.len < 0 || m->as.string.len > str_capacity(m, str_term(m)))
+        long len = m->as.string.len;
+        if (len < 0 || len > str_capacity(m, str_term(m)))
             mr_fatal("a String's length was set past its capacity");
-        mr_put_bytes(str_ptr(m), m->as.string.len);
-        mr_up1(MR_STR_SET, obj);
+        /* Only what C appended, when the String it last synced is big and
+         * is still how this buffer starts (its hash: `before`, the hash
+         * then). MR_STR_CAT refuses it unless the interpreter's String is
+         * that long. A write Ruby made since is in the buffer already:
+         * rb_mere_string fetches the String again after any call into Ruby,
+         * and RSTRING, RSTRING_PTR, rb_str_set_len and the rest go through
+         * it. (Only a struct C kept across such a call and wrote the length
+         * of skips the fetch; ruby's String is then Ruby's bytes with C's
+         * after them, and so is this one.) msgpack's Buffer#read appends
+         * 32 KiB at a time between IO reads; sending all of it at each read
+         * made the whole of it again in the interpreter every time. */
+        int sent = 0;
+        if (appended && first == before) {
+            mr_put_bytes(str_ptr(m) + had, len - had);
+            sent = (int)mr_up2(MR_STR_CAT, obj, (VALUE)had);
+        }
+        if (!sent) {
+            mr_put_bytes(str_ptr(m), len);
+            mr_up1(MR_STR_SET, obj);
+        }
+        m->synced = len + 1;
+        if (sent) { mr_transit_restore(&saved); return 2; }
     }
     else {
         if (m->as.array.as.heap.len < 0 || m->as.array.as.heap.len > m->capa) mr_fatal("an Array's length was set past its capacity");
@@ -584,6 +632,7 @@ static void str_take(struct mr_give_to *to, const char *bytes, long len) {
     m->hash = copy_hash((unsigned char *)str_ptr(m), (const unsigned char *)bytes, (size_t)len, 1, &changed);
     if (changed) memset(str_ptr(m) + len, 0, (size_t)term);
     m->as.string.len = len;
+    m->synced = len + 1;
     m->body = T_STRING;
 }
 
@@ -593,8 +642,13 @@ void *rb_mere_string(VALUE obj) {
     if (m->body == T_STRING && m->body_epoch == mr_epoch) return &m->as.string;
     if (m->body == T_STRING) str_adopt(m);
     /* What C wrote through a pointer it kept across a call is not lost to
-     * the fetch: it goes back first, and is then what the interpreter has. */
-    if (m->body == T_STRING && write_back(m, obj)) {
+     * the fetch: it goes back first, and is then what the interpreter has
+     * -- when it went whole. When only its tail went (write_back answers 2),
+     * the interpreter's String is its own first bytes and that tail, which
+     * differ from the struct's when Ruby wrote them while C kept the struct
+     * (mirror.c MR_STR_CAT): the String is fetched, as below. */
+    int wrote = m->body == T_STRING ? write_back(m, obj) : 0;
+    if (wrote == 1) {
         m->body_epoch = mr_epoch;
         touch(m, obj);
         return &m->as.string;
@@ -640,6 +694,7 @@ VALUE mr_string_new_zeroed(long len, int enc) {
     m->as.string.len = len;
     m->body = T_STRING;
     m->hash = body_hash(m) ^ 1;
+    m->synced = 0 + 1;  /* (the interpreter has it empty) */
     m->body_epoch = mr_epoch;
     touch(m, obj);
     return obj;

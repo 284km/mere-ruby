@@ -320,7 +320,7 @@ static const char *dmark_refusal(int op, VALUE b, VALUE flags) {
         [MR_RAT_RAW] = "a Rational allocation", [MR_NOTIMPL] = "rb_f_notimplement",
         [MR_SYM_STATE] = "a Symbol's state", [MR_IVAR_READ] = "an ivar read",
         [MR_SAFEPOINT] = "a safepoint", [MR_FREEZE] = "a freeze", [MR_ARY_APPEND] = "an Array write",
-        [MR_MIXIN] = "native module insertion" };
+        [MR_MIXIN] = "native module insertion", [MR_STR_CAT] = "a String write" };
     const char *tail = "only a header, a String, an Array and an ivar can be read then";
     if (op == MR_SEND) {
         long len = 0;
@@ -366,7 +366,7 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
     if (mr_vbig_live) {
         a = mr_vbig_out(a); b = mr_vbig_out(b); c = mr_vbig_out(c); d = mr_vbig_out(d); e = mr_vbig_out(e);
     }
-    if (!reads_only(op) && op != MR_STR_SET && op != MR_ARY_SET) mr_mirrors_flush();
+    if (!reads_only(op) && op != MR_STR_SET && op != MR_STR_CAT && op != MR_ARY_SET) mr_mirrors_flush();
     /* A safepoint before the requests that make something -- a String's
      * bytes fetched, a call, a new String -- so that a long C call that only
      * calls back through the C API is collected in as it goes: puma's HTTP
@@ -376,7 +376,7 @@ VALUE mr_up(int op, VALUE a, VALUE b, VALUE c, VALUE d, VALUE e) {
      * method C calls: this stack is read for VALUEs (its C frames, the outer
      * calls'), an Array's fetched elements and a dmark's are asked, and
      * C's own writes were put back just above. What this request has put in
-     * transit is set aside around it. (Not for MR_STR_SET / MR_ARY_SET: those
+     * transit is set aside around it. (Not for MR_STR_SET / MR_STR_CAT / MR_ARY_SET: those
      * are the write-back itself, in the middle of a flush; nor while a
      * collection is marking, whose dmark asked this.) */
     /* (The interpreter answers the safepoint with how many of them to pass

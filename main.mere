@@ -193,6 +193,9 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // 2u: declare locals as nil if not yet bound — Ruby defines the
           // targets of an assignment even when a guard skips executing it.
           | SDeclare of str list
+          // Parser-owned summary of a branch's local targets. It declares
+          // nothing on entry: run_if retains text-order declaration timing.
+          | SBranchTargets of str list
           // G2: require / require_relative (bool = relative), path expr.
           | SRequire of bool * Expr
           // G2: low-precedence `stmt and stmt` / `stmt or stmt`.
@@ -403,6 +406,7 @@ import "m_sbcs.mere";
 import "m_eucjis2004.mere";
 import "m_emoji.mere";
 import "m_codec.mere";
+let fn branch_targets_cache: Stmt list -> Stmt list;
 import "m_parse.mere";
 // ---- evaluator -----------------------------------------------------------
 // Ruby truthiness: only nil and false are falsy. 0 and "" are truthy.
@@ -895,6 +899,10 @@ let rec gc_owner_refinement = fn (key: str) -> fn (start: int) ->
   else if gc_prefix_at key "(sng:" start then gc_owner_refinement key (start + 5)
   else false;
 let gc_class_owner = fn (k0: str) ->
+  // A saved definition is owned by its live Method objects, independently
+  // of the class that currently publishes the method name. Reuse the
+  // metadata graph for these exact keys; class names never contain chr 5.
+  if map_len snap_meths > 0 && map_has snap_meths k0 then k0 else
   // Registered bare identities and their method rows dominate metadata.
   // Resolve those forms before parsing wrappers and qualified namespaces.
   let first = (if str_len k0 > 0 then ord (char_at k0 0) else 0) in
@@ -1078,6 +1086,24 @@ let gc_live_count = fn live ->
     else go (i + 1) (count + ones (vec_get words i) 0) in
   go 0 0;
 
+// Copies/binds keep their original era in an internal ivar. Follow the same
+// boundary as msnap_src, so dropping an intermediate snapshot cannot move a
+// surviving Method onto a newer definition.
+let gc_method_snapshot = fn (id: int) -> fn (name: Val) -> fn (owner: Val) ->
+  if map_len snap_bounds == 0 then () else
+  let rec kind = fn (cls: str) ->
+    if str_eq cls "Method" || str_eq cls "UnboundMethod" then cls
+    else if map_has cls_sup cls then kind (map_get cls_sup cls) else "Method" in
+  let unbound = str_eq (kind (map_get obj_cls id)) "UnboundMethod" in
+  let prefix = (if unbound then "~um_" else "~m_") in
+  let cls = method_text_or (method_text owner) (iv_get_or ivars_g id (prefix ++ "dk") VNil) in
+  let key = cls ++ "#" ++ method_text name in
+  if map_has snap_bounds key then
+    (let era = (match iv_get_or ivars_g id (prefix ++ "era") VNil with VInt n -> n | _ -> id) in
+     let bound = msnap_bound_above (map_get snap_bounds key) era in
+     if bound < 0 then () else gc_class_mark (msnap_key key bound))
+  else ();
+
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = id * 8 in
@@ -1085,6 +1111,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                   (let _ = (if map_has obj_cls id then gc_class_mark (map_get obj_cls id) else ()) in
                    let _ = (if map_has method_cores id then
                      (let (name, owner, receiver, extra) = map_get method_cores id in
+                      let _ = gc_method_snapshot id name owner in
                       let _ = gc_mark_val live name in
                       let _ = gc_mark_val live owner in
                       let _ = gc_mark_val live receiver in gc_mark_val live extra) else ()) in
@@ -1622,6 +1649,14 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
   let _ = (if map_len gc_live_cls > 0 || vec_len gc_cls_pend > 0 || map_len gc_ref_live > 0
               || vec_len gc_ref_pend > 0 || vec_len gc_obj_pend > 0
            then gc_pend_release () else ()) in
+  // A temporarily installed snapshot must survive even if reflection drops
+  // the Ruby Method while the native reader is still borrowing its tables.
+  let _ = (if map_len msnap_inst == 0 then () else
+    map_iter msnap_inst (fn (key: str) -> fn _v ->
+      if map_has snap_bounds key then
+        list_iter (str_split (map_get snap_bounds key) ";") (fn (bound: str) ->
+          if str_len bound == 0 then () else gc_class_mark (key ++ chr 5 ++ bound))
+      else ())) in
   // (Ruby's C API: the VALUEs C registered, and -- while a call into C is in
   //  progress -- the ones on this stack, which is C's local variables. A
   //  stopped stack's are read with its handles, below.)
@@ -1981,6 +2016,15 @@ let gc_mark_roots = fn metadata -> fn env -> fn live ->
         let _ = (if str_starts_with name yblk_marker && str_len name > 9
                  then gc_owned_meta_add metadata live k (VProc (int_of_str (substring name 9 (str_len name)))) else ()) in params rest in
     match m with Meth (ps9, _, _) -> params ps9) in
+  let _ = (if map_len snap_meths == 0 then () else
+    map_iter snap_meths (fn (k: str) -> fn (m: Meth) ->
+      match m with Meth (ps, _, _) ->
+        let rec params = fn (xs: str list) -> match xs with
+          | Nil -> ()
+          | Cons (name, rest) ->
+            let _ = (if str_starts_with name yblk_marker && str_len name > 9
+              then gc_owned_meta_add metadata live k (VProc (int_of_str (substring name 9 (str_len name)))) else ()) in
+            params rest in params ps)) in
   let _ = map_iter bind_store (fn (k: str) -> fn (benv) -> gc_mark_env live benv) in
   // the scope-chain parents: env maps linked by id, each holding Vals
   // (...and the parent links of a suspended fiber's active blocks, likewise)
@@ -2155,6 +2199,32 @@ let gc_sweep_class_table = fn tbl -> fn (key_kind: int) -> fn (compact: bool) ->
     let _ = gc_drop_s tbl dead in
     if compact && vec_len dead > 0 then (let _ = map_compact tbl in true) else false
   };
+// Keep only boundaries selected by reachable Method/UnboundMethod objects.
+// Remove them after all per-definition tables have classified their owners.
+let gc_sweep_method_snapshots = fn (compact: bool) ->
+  if map_len snap_meths == 0 then () else
+  region MSG {
+    let changed = vec_new () in
+    let _ = map_iter snap_bounds (fn (key: str) -> fn (bounds: str) ->
+      let kept = strbuf_new () in
+      let rec scan = fn (xs: str list) -> fn (removed: bool) ->
+        match xs with
+        | Nil -> removed
+        | Cons (bound, rest) ->
+          if str_len bound == 0 then scan rest removed
+          else if map_has gc_live_cls (key ++ chr 5 ++ bound) then
+            (let _ = strbuf_push kept bound in let _ = strbuf_push kept ";" in scan rest removed)
+          else scan rest true in
+      if scan (str_split bounds ";") false then vec_push changed (key, strbuf_to_str kept) else ()) in
+    let rec update = fn (i: int) ->
+      if i >= vec_len changed then () else
+      (let (key, bounds) = vec_get changed i in
+       let _ = (if str_len bounds == 0 then map_delete snap_bounds key else map_set snap_bounds key bounds) in
+       update (i + 1)) in
+    let _ = update 0 in
+    let _ = gc_sweep_class_table snap_meths 0 compact in
+    if compact && vec_len changed > 0 then map_compact snap_bounds else ()
+  };
 let gc_sweep_classes = fn (nc: bool) ->
   // Deletion queues and reference-tag indexes belong to this sweep. Without
   // a lexical region, their mutable stores retain every dead identity in
@@ -2266,7 +2336,6 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = gc_sweep_class_table mro_local_epoch 0 compact in
   let _ = gc_sweep_class_table mro_external 0 compact in
   let _ = gc_sweep_class_table meth_obj_seen 0 compact in
-  let _ = gc_sweep_class_table snap_meths 0 compact in
   let _ = gc_sweep_class_table snap_bounds 0 compact in
   let _ = gc_sweep_class_table msnap_inst 0 compact in
   // Only method-position IDs cross Fiber switches. Other saved callers keep
@@ -2313,6 +2382,7 @@ let gc_sweep_classes = fn (nc: bool) ->
   let _ = (if compact && vec_len dead_refs > 0 then map_compact ref_snaps else ()) in
   // Keep identity records while the final module rows are classified.
   let _ = gc_sweep_class_table modules 0 compact in
+  let _ = gc_sweep_method_snapshots compact in
   // The identity registry must outlive owner parsing of every metadata table.
   let dead_identities = vec_new () in
   let _ = map_iter anonymous_classes (fn (name: str) -> fn (_kind: int) ->
@@ -2752,6 +2822,9 @@ let gc_collect = fn env -> fn world ->
     //  compacted, which drops what replaced strings left behind -- the last
     //  page is still being filled and is never wound back)
     let _ = str_pages_sweep gc_str_surv sk nc in
+    // (the big Strings' own Vecs that died or were replaced since the last
+    //  sweep: recycled off the program's stack only, as a compaction is)
+    let _ = (if nc then () else str_big_sweep ()) in
     let dE = vec_new () in
     let _ = map_iter str_enc (fn (k: int) -> fn (v: int) ->
       if gc_live_has live (k * 8 + 1) then () else vec_push dE k) in
@@ -5350,7 +5423,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // method binding knows it came from `key: value` syntax (not a positional {}).
   | EKwHash items ->
     (match hstored_seed env world (mkhash (hash_merge Nil (hsh_eval_items env world blk items))) with
-     | VHsh id -> let _ = mark_kw id in VHsh id
+     | VHsh id -> let _ = mark_kw_fresh id in VHsh id
      | v -> v)
   | EUn (op, a) ->
     if str_eq op "!" then
@@ -7350,7 +7423,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
        (match hderef id with
         | Nil -> (let r9 = eval_args env world blk t in let _ = arg_empty_set () in r9)
         | pairs -> (match mkhash pairs with
-                    | VHsh nid -> let _ = mark_kw nid in Cons (VHsh nid, eval_args env world blk t)
+                    | VHsh nid -> let _ = mark_kw_fresh nid in Cons (VHsh nid, eval_args env world blk t)
                     | v -> Cons (v, eval_args env world blk t)))
      | other -> Cons (other, eval_args env world blk t))
   // An empty keyword packet is not a call argument.
@@ -7359,7 +7432,7 @@ and eval_args_go = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
      match pairs9 with
      | Nil -> (let r9 = eval_args env world blk t in let _ = arg_empty_set () in r9)
      | _ -> (match hstored_seed env world (mkhash pairs9) with
-             | VHsh id9 -> (let _ = mark_kw id9 in Cons (VHsh id9, eval_args env world blk t))
+             | VHsh id9 -> (let _ = mark_kw_fresh id9 in Cons (VHsh id9, eval_args env world blk t))
              | v9 -> Cons (v9, eval_args env world blk t)))
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
@@ -9035,6 +9108,32 @@ and capi_up = fn env -> fn cenv -> fn world -> fn (r: CapiReq) ->
      //  given, a frozen literal in its tests, and the write-back raised
      //  FrozenError out of the parse.)
      | VStr h -> let _ = sset h (str_of_bytes (mr_capi_bytes ())) in 0
+     | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
+  else if r.op == 38 then
+    (match capi_in r.a with
+     // MR_STR_CAT: what C appended to a String its struct last synced at r.b
+     // bytes, which still start the struct (C checked). Appended (1) when the
+     // String is that long; otherwise refused (0), and C sends all of it
+     // (MR_STR_SET). A write Ruby made since is in those r.b bytes: C reads
+     // the String through rb_mere_string, which fetches it again after any
+     // call into Ruby, and so do RSTRING, rb_str_set_len and the rest. Only
+     // a struct pointer C kept across such a call and then wrote the length
+     // through skips that fetch -- and then the String is Ruby's bytes with
+     // C's tail after them, as in ruby (whose buffer the same pointer is).
+     | VStr h ->
+       // Appended where it is, not through str_push's queue: C fetches the
+       // String again after each call into Ruby (msgpack reads RSTRING_LEN
+       // after every readpartial), and that fetch would fold the queue in
+       // at every crossing anyway. The String's two cached answers are kept
+       // as str_push keeps them (str_append_answers): dropping them made the
+       // next fetch rescan all of it for ASCII. The bytes count as String
+       // bytes made, as mkstr's do (gc_body_tick).
+       if str_blen h == r.b then
+         (let t = str_of_bytes (mr_capi_bytes ()) in
+          let _ = vec_set str_pg_add 0 (vec_get str_pg_add 0 + str_len t) in
+          let _ = str_append_answers h t in
+          let _ = sput h (sget h ++ t) in 1)
+       else 0
      | _ -> let _ = raise_exc world "TypeError" "C API: not a String" in 0)
   else if r.op == 4 then
     (match capi_in r.a with
@@ -10850,6 +10949,7 @@ and list_last_e = fn (xs: Expr list) ->
 and deep_targets = fn (body: Stmt list) ->
   match body with
   | Nil -> Nil
+  | Cons (SBranchTargets names, _) -> names
   | Cons (s, rest) -> list_append_str (stmt_targets s) (deep_targets rest)
 
 and stmt_targets = fn (s: Stmt) ->
@@ -11042,10 +11142,14 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
                  || (if str_eq (block_param_name params0) "" then false else true)
                  || ps_any_default bdefaults params in
   let want_kw = (match kws with Nil -> (if str_eq dsname "" then false else true) | _ -> true) in
-  let (argvals0, kwhash) = if want_kw then
-    (let peeled9 = peel_kw_hash argvals0 in
-     let _ = unmark_kwargs argvals0 in peeled9)
-    else (argvals0, (Nil : Val list)) in
+  let keyword_input9 = argvals0 in
+  let (argvals0, kwhash) = if want_kw then peel_kw_hash argvals0
+                         else (argvals0, (Nil : Val list)) in
+  // Acquire the callee's rest before callbacks, then retire call origin.
+  // Keep local binding at its original position after keyword validation.
+  let keyword_rest9 = (if str_eq dsname "" || str_eq dsname "nil" then VNil
+                       else kwrest_packet keyword_input9 kwhash (kw_names_of kws)) in
+  let _ = (if want_kw then unmark_kwargs keyword_input9 else ()) in
   // ...and a BLOCK declares it the same way: `proc { |**nil| }` refuses too.
   let _ = (if str_eq dsname "nil" && (match kwhash with Nil -> false | _ -> true)
            then (let _ = raise_exc world "ArgumentError" "no keywords accepted" in ())
@@ -11058,7 +11162,8 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
            | _ -> (if str_eq dsname "" && kw_has_unknown (kw_names_of kws) kwhash
                    then (let _ = raise_exc world "ArgumentError" (kw_refusal "unknown" (kw_unknown_keys (kw_names_of kws) kwhash)) in ())
                    else ())) in
-  let _ = if str_eq dsname "" || str_eq dsname "nil" then () else map_set cenv dsname (mkhash (kwhash_drop kwhash (kw_names_of kws))) in
+  let _ = if str_eq dsname "" || str_eq dsname "nil" then ()
+          else map_set cenv dsname keyword_rest9 in
   // auto-splat: a block with 2+ params given a single value destructures
   // an Array directly, or an object via to_ary. Lambdas do NOT auto-splat —
   // a single argument stays a single argument (with strict arity).
@@ -14885,13 +14990,13 @@ and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
   if (match init with
       | VStr ih -> (if prim_user_has world init "+" then false else true) && all_same_enc9 (enc_canon_name (senc_get ih))
       | _ -> false) then
-    (let b9 = strbuf_new () in
+    region ARR_SUM_W_B { (let b9 = strbuf_new () in
      let _ = (match init with VStr ih -> strbuf_push b9 (sget ih) | _ -> ()) in
      let rec put9 = fn (zs: Val list) -> (match zs with Cons (VStr h9, t9) -> (let _ = strbuf_push b9 (sget h9) in put9 t9) | _ -> ()) in
      let _ = put9 xs in
      let r9 = mkstr (strbuf_to_str b9) in
      let _ = (match (r9, init) with (VStr rh, VStr ih) -> senc_set rh (senc_get ih) | _ -> ()) in
-     r9)
+     r9) }
   else
   if (match init with VInt _ -> false | VFlt _ -> false | VBig _ -> false
                     | VRat (_, _) -> false | VCpx (_, _) -> false | _ -> true) then
@@ -16470,6 +16575,7 @@ and obj_ivar_dump_sel = fn env -> fn world -> fn (oid: int) -> fn (cls: str) -> 
 
 
 and ivar_dump_go = fn env -> fn world -> fn iv -> fn (oid: int) -> fn (names: str list) -> fn (acc: str) ->
+  region IVAR_DUMP_GO_B {
   let b = strbuf_new () in
   let _ = strbuf_push b acc in
   // the VALUES are taken first too: an ivar's #inspect may remove the
@@ -16489,7 +16595,7 @@ and ivar_dump_go = fn env -> fn world -> fn iv -> fn (oid: int) -> fn (names: st
         go t vt false)
      | _ -> ()) in
   let _ = go names vals (str_eq acc "") in
-  strbuf_to_str b
+  strbuf_to_str b }
 
 and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> fn (acc: str) ->
   match ms with
@@ -16516,6 +16622,10 @@ and struct_mem_plain = fn (m: str) -> fn (i: int) ->
 //   40,000-element Array took 4 GB, and every assertion message test/unit
 //   builds goes through here.
 and join_inspect_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
+  // (the buffer in a region of its own: one made outside a region block is
+  //  the default region's, which nothing gives back -- a buffer of the
+  //  result's size stayed for the rest of the run, every call)
+  region JOIN_INS {
   let b = strbuf_new () in
   let _ = strbuf_push b acc in
   let rec go = fn (ys: Val list) -> fn (first: bool) ->
@@ -16527,9 +16637,13 @@ and join_inspect_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
         let _ = strbuf_push b x in
         go t false)) in
   let _ = go xs (str_eq acc "") in
-  strbuf_to_str b
+  strbuf_to_str b }
 
 and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
+  // (the buffer in a region of its own: one made outside a region block is
+  //  the default region's, which nothing gives back -- a buffer of the
+  //  result's size stayed for the rest of the run, every call)
+  region JOIN_PRS {
   let b = strbuf_new () in
   let _ = strbuf_push b acc in
   let rec go = fn (ys: Val list) -> fn (first: bool) ->
@@ -16541,7 +16655,7 @@ and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
         go t false)
      | _ -> ()) in
   let _ = go xs (str_eq acc "") in
-  strbuf_to_str b
+  strbuf_to_str b }
 
 // "wrong number of arguments (given N, expected R)" if the builtin under this
 // name takes a different count -- "" when it is fine, when no row covers it,
@@ -19061,6 +19175,12 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
         //   what is there -- its length and whether it is all ASCII -- kept as
         //   pieces arrive. `acc ++ piece` copied the whole result per element
         //   (and enc_all7 rescanned it), so joining 40,000 numbers took 10 GB.
+        // ⚠ ...in a region of its own, which hands out only the text and its
+        //   encoding. A StrBuf made outside a region block is the default
+        //   region's, which nothing gives back: every join kept a buffer of
+        //   the result's size for the rest of the run (50 joins of up to 4 MB
+        //   kept 130 MB after the collector had let every result go).
+        let (txt, tenc0) = region JOIN {
         let jb = strbuf_new () in
         let jst = vec_new () in
         let _ = vec_push jst 0 in
@@ -19159,7 +19279,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
               if v2 == ver then tjoin t (i + 1) ver e1 false
               else tjoin (val_drop (deref id0) (i + 1)) (i + 1) v2 e1 false)) in
         let tenc0 = tjoin (deref id0) 0 (arr_ver id0) "" true in
-        let txt = strbuf_to_str jb in
+        (strbuf_to_str jb, tenc0) } in
         let tenc = (if str_eq tenc0 "" then "US-ASCII" else tenc0) in
         let h9 = mkstr txt in
         let _ = (match h9 with VStr sh9 -> senc_set sh9 tenc | _ -> ()) in
@@ -26931,7 +27051,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
     else if str_eq c "ObjectSpace" && str_eq name "__dump_json" then
       (match args with
        | Cons (VStr h9, _) ->
-         (let s9 = sget h9 in let n9 = str_len s9 in
+         region OS_DUMP_JSON { (let s9 = sget h9 in let n9 = str_len s9 in
           let b9 = strbuf_new () in
           let _ = strbuf_push b9 "\"" in
           let flush9 = fn (a9: int) -> fn (z9: int) ->
@@ -26944,7 +27064,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                      scan9 (i9 + 1) (i9 + 1))
                   else scan9 a9 (i9 + 1)) in
           let _ = scan9 0 0 in let _ = strbuf_push b9 "\"" in
-          mkstr (strbuf_to_str b9))
+          mkstr (strbuf_to_str b9)) }
        | _ -> raise_exc world "TypeError" "dump JSON requires a String")
     else if str_eq c "ObjectSpace" && str_eq name "__dump_class_info" then
       (let (_, supers9, _, _) = world in
@@ -27323,7 +27443,7 @@ and invoke_val_c0_inner = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn 
                  || (let tagged9 = hng_key v9 in
                      let class9 = (if str_len tagged9 > 0 && map_has hng_store tagged9 then map_get hng_store tagged9 else base9) in
                      obj_is_a world class9 want9)
-              then vec_push objs9 v9 else () in
+              then (let _ = borrow_kw_value v9 in vec_push objs9 v9) else () in
             let _ = (if visit9 "Array" then map_iter arr_store (fn (id9: int) -> fn _values9 ->
               if map_has arr_metadata id9 then () else addv9 (VArr id9) "Array") else ()) in
             let _ = (if visit9 "Hash" then map_iter hash_store (fn (id9: int) -> fn _values9 -> addv9 (VHsh id9) "Hash") else ()) in
@@ -33025,7 +33145,7 @@ and ip_slots_known_stmts = fn (ss: Stmt list) ->
   match ss with Nil -> true | Cons (s, rest) -> ip_slots_known_stmt s && ip_slots_known_stmts rest
 and ip_slots_known_stmt = fn (s: Stmt) ->
   match s with
-  | SNodeIds _ -> true | SLine _ -> true | SLineQ _ -> true | SFile _ -> true | SDeclare _ -> true
+  | SLine _ -> true | SLineQ _ -> true | SFile _ -> true | SDeclare _ -> true | SBranchTargets _ -> true | SNodeIds _ -> true
   // (the ISeq VM's block: its implicit parameters are among its parameters)
   | SVm (_, _) -> true
   | SExpr e -> ip_slots_known_expr e
@@ -37843,9 +37963,10 @@ and fmt_ascii_guard = fn world -> fn (enc: str) ->
   if str_eq e9 "" || enc_ascii_compat e9 then ()
   else (let _ = raise_exc world "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e9) in ())
 and eucsjis_tx = fn (s: str) -> fn (e2s: bool) ->
+  region EUCSJIS_TX_B {
   let b9 = strbuf_new () in
   let st9 = (if e2s then e2s_go s 0 b9 else s2e_go s 0 b9) in
-  (strbuf_to_str b9, st9)
+  (strbuf_to_str b9, st9) }
 // the source a regexp refusal names, its bytes past ASCII written as \xNN
 // (the message is the pattern as written, not its bytes)
 and rx_src_esc = fn (s: str) -> fn (i: int) ->
@@ -39318,11 +39439,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         // StrBuf whose length and ASCII-ness the negotiation reads as they
         // grow (as Array#join's does): `acc ++ piece` per match copied the
         // result so far, and `("x" * 40000).gsub("x", "yz")` took 2.6 GB.
-        let gb = strbuf_new () in
         // (0, 1: the result's length and ASCII-ness; 2: a match was found;
         //  3-5: the last match's span and group count -- gs_take, m_state)
         let gst = gs_take () in
         let _ = vec_set gst 1 1 in
+        let late9 = (match repv with VStr _ -> true | _ -> false) in
+        // ⚠ ...and the StrBuf in a region of its own, which hands out only the
+        //   text and its encoding: one made outside a region block is the
+        //   default region's, which nothing gives back, and every sub and gsub
+        //   kept a buffer of its result's size for the rest of the run.
+        let (r, re) = region GSUB {
+        let gb = strbuf_new () in
         let put9 = fn (piece: str) ->
           (let _ = strbuf_push gb piece in
            let _ = vec_set gst 0 (vec_get gst 0 + str_len piece) in
@@ -39343,7 +39470,6 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         //   of the 25 Strings `"aaaaaaaaaaa".gsub(/a/, "")` made (note 308).
         //   A Hash's default proc can read $~, so a Hash keeps the per-match
         //   publish, as a block does.
-        let late9 = (match repv with VStr _ -> true | _ -> false) in
         let rec go = fn (i: int) -> fn (ae: str) -> fn (found: bool) ->
           (match (if found || i != 0 then rxv_search_e pat pf s0 i e0 else first) with
            | RNoHit ->
@@ -39387,8 +39513,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              else
                (if all then go en ae2 true
                 else fin (app ae2 (substring s0 en n) e0))) in
-        match go 0 e0 false with
-        | (r, re) ->
+        go 0 e0 false } in
           (let _ = (if late9 && vec_get gst 2 == 1
                     then rx_publish_at world s0 (vec_get gst 3) (vec_get gst 4) (vec_get gst 5) (senc_get h)
                     else ()) in
@@ -41346,6 +41471,23 @@ and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val li
 // (the last argument is found by a loop and the list rebuilt only when it
 // changes: this rebuilt every list on the way down, one C frame per argument,
 // and test_method's `rest(*(1..10_000_000))` ran out of stack here)
+and borrow_kw_tail = fn (args9: Val list) -> borrow_kw_value (vlast args9)
+and borrow_kw_value = fn (value9: Val) ->
+  match value9 with
+  | VHsh id9 ->
+    (let key9 = str_of_int id9 in
+     if map_has kwarg_marks key9 && (match map_get kwarg_marks key9 with VBool true -> true | _ -> false)
+     then mark_kw id9 else ())
+  | _ -> ()
+and kwrest_packet = fn (args9: Val list) -> fn (pairs9: Val list) -> fn (names9: str list) ->
+  match (names9, vlast args9) with
+  | (Nil, VHsh id9) ->
+    (let key9 = str_of_int id9 in
+     if map_has kwarg_marks key9 && not (map_has r2k_marks key9)
+        && (match map_get kwarg_marks key9 with VBool true -> true | _ -> false)
+     then (let _ = map_delete kwarg_marks key9 in VHsh id9)
+     else mkhash pairs9)
+  | _ -> mkhash (kwhash_drop pairs9 names9)
 // The native bound entry is shared by public Method#call and Method#to_proc.
 // A generated Proc never performs public lookup of its Method object's call.
 and method_call_native = fn env -> fn world -> fn blk -> fn (id: int) -> fn (args: Val list) ->
@@ -41413,7 +41555,11 @@ and method_call_native = fn env -> fn world -> fn blk -> fn (id: int) -> fn (arg
             do_eval env world blk args
           else
          match mrecv with
-          | VMain -> (if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args else invoke_val_c env world blk VMain mnm args false)
+          | VMain ->
+            (if msnap_held world id "Method" mown mnm then
+               msnap_call world blk VMain id "Method" mown mnm args
+             else if (let (m8, _, _, _) = world in map_has m8 mnm) then call_method (env_as_main env) world blk mnm args
+             else invoke_val_c env world blk VMain mnm args false)
           // a binary operator on a primitive is not in the method table -- it
           // is arith_bin -- so `1.method(:+)` has to route there, the same way
           // an alias to a builtin operator does.
@@ -49299,13 +49445,13 @@ and rb_fmt_one = fn env -> fn world -> fn state9 -> fn (flags: str) -> fn (width
             && (if enc_ascii_compat enc9 && enc_all7 text9 then false else true)
          then
            (let escaped9 = (if str_eq enc9 "ASCII-8BIT" then
-              (let buffer9 = strbuf_new () in
+              region RB_FMT_ONE_B { (let buffer9 = strbuf_new () in
                let rec bytes9 = fn (index9: int) ->
                  (if index9 >= str_len text9 then strbuf_to_str buffer9
                   else (let byte9 = ord (char_at text9 index9) in
                         let _ = strbuf_push buffer9
                           (if byte9 < 128 then chr byte9 else chr 92 ++ "x" ++ hex2 byte9) in
-                        bytes9 (index9 + 1))) in bytes9 0)
+                        bytes9 (index9 + 1))) in bytes9 0) }
               else enc_escape_txt enc9 text9) in
             (escaped9, "US-ASCII"))
          else (text9, enc9)) in
@@ -51053,7 +51199,7 @@ and rnd_urandom = fn env -> fn world -> fn (args: Val list) ->
               if fd < 0 then ""
               else
                 (let result = try_or (fn (u: unit) ->
-                   (let out = strbuf_new () in
+                   region RND_URANDOM_B { (let out = strbuf_new () in
                     let rec read = fn (left: int) ->
                       if left <= 0 then strbuf_to_str out
                       else
@@ -51061,7 +51207,7 @@ and rnd_urandom = fn env -> fn world -> fn (args: Val list) ->
                          let got = fd_read fd arena want in
                          if got <= 0 || got > want then ""
                          else (let _ = strbuf_push out (mem_to_str arena got) in read (left - got))) in
-                    read n)) "" in
+                    read n) }) "" in
                  let _ = fd_close fd in result))) "" in
            if str_len bytes != n then raise_exc world "RuntimeError" "failed to get urandom"
            else mkstr_e bytes "ASCII-8BIT"))
@@ -52635,13 +52781,6 @@ and msnap_carry = fn world -> fn (id: int) -> fn (ocl: str) -> fn (nid: int) -> 
   //  NOW, which after a remove_method is a superclass's)
   if iv_has iv9 id dk9 then iv_set iv9 nid nk9 (iv_get iv9 id dk9)
   else if iv_has iv9 nid nk9 then iv_del iv9 nid nk9 else ()
-// the first bound above era in "B1;B2;...", or -1
-and msnap_bound_above = fn (bs: str) -> fn (era: int) ->
-  let rec go = fn (xs: str list) ->
-    (match xs with
-     | Nil -> 0 - 1
-     | Cons (x, t) -> (if str_eq x "" then go t else (let b = int_of_str x in if b > era then b else go t))) in
-  go (str_split bs ";")
 // the copy an object's definition was saved under, or "" when its name still
 // has it (or while that copy is installed: msnap_with)
 and msnap_src = fn world -> fn (id: int) -> fn (ocl: str) -> fn (cls: str) -> fn (name: str) ->
@@ -57424,6 +57563,7 @@ and univ_take = fn (raw: str) -> fn (p: int) -> fn (n: int) -> fn (code: int) ->
   let w = (if code == 1 then 1 else if code <= 3 then 2 else 4) in
   let be = (code == 3 || code == 5) in
   let lf = (if w == 1 then "\n" else if be then str_repeat (chr 0) (w - 1) ++ "\n" else "\n" ++ str_repeat (chr 0) (w - 1)) in
+  region UNIV_TAKE_B {
   let b = strbuf_new () in
   let total = str_len raw in
   let rec go = fn (i: int) -> fn (out: int) ->
@@ -57436,7 +57576,7 @@ and univ_take = fn (raw: str) -> fn (p: int) -> fn (n: int) -> fn (code: int) ->
         else if u < 0 then (let _ = strbuf_push b (substring raw i total) in total)
         else (let _ = strbuf_push b (substring raw i (i + w)) in go (i + w) (out + w)))) in
   let e = go p 0 in
-  (strbuf_to_str b, e)
+  (strbuf_to_str b, e) }
 // the code above for a File: what the prelude recorded (@__f_univ, 0 = off),
 // else a "t" in the mode's access part, in the mode's external encoding; never
 // once the stream is binary
@@ -57466,7 +57606,7 @@ and file_read_range = fn (path: str) -> fn (pos: int) -> fn (count: int) ->
        (let moved9 = fd_seek fd9 pos 0 in
         if moved9 < 0 then (let _ = fd_close fd9 in (false, ""))
         else
-          (let buf9 = strbuf_new () in
+          region FILE_READ_RANGE_B { (let buf9 = strbuf_new () in
            let arena9 = tcp_arena () in
            let rec read9 = fn (left9: int) ->
              if left9 <= 0 then true
@@ -57479,7 +57619,7 @@ and file_read_range = fn (path: str) -> fn (pos: int) -> fn (count: int) ->
                       read9 (left9 - got9))) in
            let ok9 = read9 count in
            let _ = fd_close fd9 in
-           (ok9, strbuf_to_str buf9))))
+           (ok9, strbuf_to_str buf9)) }))
 and file_write_at = fn world -> fn (id: int) -> fn (piece: str) ->
   let (_, _, _, iv9) = world in
   let k9 = str_of_int id in
@@ -63355,7 +63495,8 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   // forward a `key:` hash's keyword-ness faithfully.
   let _ = if want_kw then ()
           else if str_list_has params1 "*__fwd" then
-            map_set frame "__fwd~kw" (VBool (is_kw_hash (vlast args0)))
+            (let _ = map_set frame "__fwd~kw" (VBool (is_kw_hash (vlast args0))) in
+             borrow_kw_tail args0)
           else if map_has frame "__r2k" then () else unmark_kwargs args0 in
   // a ruby2_keywords METHOD that keeps a `key:` hash gives it the permanent
   // mark too: that hash IS ruby's "keywords hash", and Hash.ruby2_keywords_hash?
@@ -63368,11 +63509,12 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   // the mark alone cannot, and using it for both made the direct call raise.
   // One bootstraptest pair pins the splat case.)
   let (args, kwhash) = if want_kw then
-    (let peeled9 = peel_kw_hash args0 in let _ = unmark_kwargs args0 in peeled9)
+    (let peeled9 = peel_kw_hash args0 in
+     let _ = (if str_eq dsname "" || str_eq dsname "nil" then ()
+              else (match peeled9 with (_, pairs9) ->
+                      map_set frame dsname (kwrest_packet args0 pairs9 (kw_names_of kws)))) in
+     let _ = unmark_kwargs args0 in peeled9)
     else (args0, (Nil : Val list)) in
-  // (`**nil` binds nothing: it is not a local named nil)
-  let _ = if str_eq dsname "" || str_eq dsname "nil" then ()
-          else map_set frame dsname (mkhash (kwhash_drop kwhash (kw_names_of kws))) in
   // keyword arity: a required keyword missing, or (without **kwrest) an
   // unexpected keyword, raises ArgumentError.
   // ⚠ `**nil` DECLARES that no keyword is accepted. It parses as a kwrest
@@ -67068,6 +67210,7 @@ and vm_body_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (gen: int) 
 and run_stmts_result = fn env -> fn world -> fn blk -> fn (prog: Stmt list) -> fn (discard_result: bool) ->
   match prog with
   | Nil -> FNext VNil
+  | Cons (SBranchTargets _, rest) -> run_stmts_result env world blk rest discard_result
   // (a scope's mark, lvd_head: the locals the rest of its body assigns, for
   //  Binding#local_variables)
   | Cons (SDeclare (Cons (m9, Nil)), rest) when str_len m9 == 3 && str_eq m9 lvdecl_mark ->
@@ -67988,6 +68131,7 @@ and lex_pack_env = fn env ->
   else lex_pack ()
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   match s with
+  | SBranchTargets _ -> FNext VNil
   // A line marker: remember where we are, and answer VNil. The parser puts it
   // BEFORE its statement, so it is never the last statement of a body -- which
   // matters, because the last statement is the body's value.
@@ -69821,6 +69965,7 @@ and ub_stmt = fn (s: Stmt) ->
   // (the parser's notes on a body -- the locals it assigns, for a Binding,
   //  in a source that says `binding` anywhere: lvd_head -- use no block)
   | SDeclare _ -> false
+  | SBranchTargets _ -> false
   | SMultiAssign (_, es) -> ub_exprs es
   | SAndThen (a, b) -> ub_stmt a || ub_stmt b
   | SOrElse (a, b) -> ub_stmt a || ub_stmt b
@@ -74977,14 +75122,25 @@ and mac_decompose = fn (cps: int list) ->
 and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> fn (has_else: bool) -> fn (els: Stmt list) -> fn (single: bool) ->
   match clauses with
   | Nil ->
-    if has_else then run_stmts env world blk els
+    if has_else then
+      (let f = run_stmts env world blk els in
+       let _ = declare_nils env (deep_targets els) in f)
     else let _ = pm_raise env world v single in FNext VNil
   | Cons (cl, rest) ->
     let (pat, guard, body) = cl in
     // the guard is only evaluated when the pattern matched (&& short-circuits).
     if pat_match env world blk pat v && (truthy (eval_e env world blk guard) || pm_fail "guard clause does not return true")
-    then run_stmts env world blk body
-    else run_case_in env world blk v rest has_else els single
+    then
+      (let f = run_stmts env world blk body in
+       let _ = declare_nils env (list_append_str (expr_pat_vars guard) (deep_targets body)) in
+       let _ = (match rest with Nil -> () | _ -> declare_nils env (clausesin_targets rest)) in
+       let _ = (match els with Nil -> () | _ -> declare_nils env (deep_targets els)) in
+       f)
+    else
+      // A skipped body still declares its locals before the next branch's
+      // blocks run, as in run_case and run_if. Each body is scanned once.
+      (let _ = declare_nils env (list_append_str (expr_pat_vars guard) (deep_targets body)) in
+       run_case_in env world blk v rest has_else els single)
 
 and deco_key = fn (v: Val) -> "d:" ++ hng_key v ++ (match v with VObj oid -> "obj:" ++ str_of_int oid | _ -> "")
 // a new match begins: forget the last one's reasons and #deconstruct, and
@@ -78262,6 +78418,7 @@ and rxv_tc_kind = fn (enc: str) -> fn (pat: str) -> fn (fl: str) ->
 // end's) and mo (each original offset's UTF-8 one); false when a character
 // does not decode
 and rxv_tc_subject = fn (s: str) -> fn (enc: str) -> fn m8 -> fn mo ->
+  region RXV_TC_SUBJECT_B {
   let b9 = strbuf_new () in
   let n = str_len s in
   let rec go = fn (i: int) -> fn (o: int) ->
@@ -78280,7 +78437,7 @@ and rxv_tc_subject = fn (s: str) -> fn (enc: str) -> fn m8 -> fn mo ->
           go (i + l) (o + str_len u))
        | _ -> false) in
   let ok = go 0 0 in
-  (ok, strbuf_to_str b9)
+  (ok, strbuf_to_str b9) }
 // an ASCII-compatible pattern as UTF-8. The text is read as bytes, an
 // escape \xHH above 127 standing for its byte; a character that starts with
 // a byte above 127 is cut by the encoding's own length (a GBK or Shift_JIS
@@ -78292,7 +78449,9 @@ and rxv_tc_pattern = fn (pat: str) -> fn (enc: str) ->
   let hx = fn (k: int) -> (if k < n then hexval (char_at pat k) else 0 - 1) in
   // bytes, and a flag per byte: r (raw, may be read in the encoding), c (an
   // ASCII character), e (part of an escape, copied as it is)
+  region RXV_TCP_RB {
   let rb = strbuf_new () in
+  region RXV_TCP_FB {
   let fb = strbuf_new () in
   let rec scan = fn (i: int) ->
     if i >= n then ()
@@ -78314,6 +78473,7 @@ and rxv_tc_pattern = fn (pat: str) -> fn (enc: str) ->
   let r = strbuf_to_str rb in
   let f = strbuf_to_str fb in
   let m = str_len r in
+  region RXV_TCP_OUT {
   let b9 = strbuf_new () in
   let rec ok_span = fn (k: int) -> fn (e: int) -> if k >= e then true else (if str_eq (char_at f k) "e" then false else ok_span (k + 1) e) in
   let rec emit = fn (i: int) ->
@@ -78328,7 +78488,7 @@ and rxv_tc_pattern = fn (pat: str) -> fn (enc: str) ->
        | _ -> (let _ = strbuf_push b9 ("\\x" ++ hex2_of (ord (char_at r i))) in emit (i + 1)))
     else (let _ = strbuf_push b9 (char_at r i) in emit (i + 1)) in
   let _ = emit 0 in
-  strbuf_to_str b9
+  strbuf_to_str b9 } } }
 and hex2_of = fn (v: int) ->
   let d = "0123456789ABCDEF" in
   char_at d (v / 16) ++ char_at d (v - (v / 16) * 16)
@@ -78908,10 +79068,14 @@ and rx_scan_all2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -
     Cons (item, rx_scan_all2 pat fl s nexti)
 
 and rx_gsub_go2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn (acc: str) ->
+  // (the buffer in a region of its own: one made outside a region block is
+  //  the default region's, which nothing gives back -- a buffer of the
+  //  result's size stayed for the rest of the run, every call)
+  region RX_GSUB {
   let b = strbuf_new () in
   let _ = strbuf_push b acc in
   let _ = rx_gsub_go2b pat fl s rep i all b in
-  strbuf_to_str b
+  strbuf_to_str b }
 and rx_gsub_go2b = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn b ->
   let n = str_len s in
   match rxv_search pat fl s i with
@@ -78947,6 +79111,15 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
   // (into a StrBuf, with the length and ASCII-ness the negotiation reads
   // kept as pieces arrive -- as Array#join does; `acc ++ piece` per match
   // copied the result so far)
+  // (the buffer in a region of its own, which hands out the text and its
+  //  encoding: one made outside a region block is the default region's,
+  //  which nothing gives back)
+  // (the block's own "no block", made once: a new empty map each match, made
+  //  outside a region block, was the default region's, which nothing gives
+  //  back -- `("ab" * 500_000).gsub(/a/) { "c" }` kept 50 MB of them. As
+  //  everywhere else, it holds an env that is already there.)
+  let nb = (match newblk with (_, _, _, be) -> (false, (Nil : str list), (Nil : Stmt list), be)) in
+  region GSBK {
   let gb = strbuf_new () in
   let gst = vec_new () in
   let _ = vec_push gst 0 in
@@ -78967,7 +79140,6 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
      | RBadPat -> (rx_gsub_blk world newblk pat s all i (senc_get sid) (strbuf_to_str gb), ae)
      | RNoHit -> fin (app ae (substring s i n) e0)
      | RHit (st, en, saves) ->
-       let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
        let ng2 = rx_ng_of fl pat in
        let _ = rxv_export_caps saves ng2 in
        let m = substring s st en in
@@ -78992,7 +79164,7 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
        else
          (if all then go en ae2
           else fin (app ae2 (substring s en n) e0))) in
-  go 0 e0
+  go 0 e0 }
 
 // String#scan with a block: walk matches from cursor `i`, yielding each to
 // the block (the capture array when the pattern has groups, else the matched
@@ -79184,6 +79356,7 @@ and out_print_checked = fn world -> fn (s: str) ->
   out_check world
 // every LF of s as rep
 and nl_expand = fn (s: str) -> fn (rep: str) ->
+  region NL_EXPAND_B {
   let b9 = strbuf_new () in
   let n9 = str_len s in
   let rec go = fn (i: int) -> fn (from: int) ->
@@ -79191,7 +79364,7 @@ and nl_expand = fn (s: str) -> fn (rep: str) ->
      else if str_eq (char_at s i) "\n" then (let _ = strbuf_push b9 (substring s from i) in let _ = strbuf_push b9 rep in go (i + 1) (i + 1))
      else go (i + 1) from) in
   let _ = go 0 0 in
-  strbuf_to_str b9
+  strbuf_to_str b9 }
 and out_check = fn world ->
   let e = (if out_errno_ok then proc_out_errno () else 0) in
   if e == 0 then () else out_refused world e
@@ -79361,6 +79534,11 @@ and puts_each_in = fn world -> fn (seen: int list) -> fn (xs: Val list) ->
 // and the load-path dir. run_prog reads a file and delegates here; a Wasm/browser
 // host can call run_src with source handed in as a string.
 // the file that was loading when the error was raised, else the entry script.
+let branch_targets_cache = fn (body: Stmt list) ->
+  match body with
+  | Nil -> Nil
+  | Cons (SBranchTargets _, _) -> body
+  | _ -> Cons (SBranchTargets (deep_targets body), body);
 let hkey_obj_ident_fwd = fn (k: Val) -> (if key_has_user_hash (fb_world ()) k then false else true);
 import "m_driver.mere";
 
