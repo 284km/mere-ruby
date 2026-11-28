@@ -9,7 +9,12 @@ ROOT = Path(__file__).resolve().parent.parent
 MERE = os.environ.get("MERE", str(ROOT / ".mere-compiler/_build/default/bin/mere.exe"))
 source = (ROOT / "main.mere").read_text()
 start = source.index("let gc_live_new =")
-end = source.index("let rec gc_mark_val =", start)
+# This standalone probe compiles packed membership and owner parsing, not
+# object tracing (which requires Val, method payloads and the full world).
+# Keep the boundary before any Method-specific tracing helper as well.
+boundaries = [source.find(marker, start) for marker in
+              ("let gc_method_snapshot =", "let rec gc_mark_val =")]
+end = min(index for index in boundaries if index >= 0)
 helpers = source[start:end]
 owner_helpers = source[source.index("let rec gc_class_base ="):source.index("let gc_source_owner =")]
 state = (ROOT / "m_state.mere").read_text()
@@ -18,7 +23,8 @@ digit_helper = state[digit_start:state.index(";\n", digit_start) + 2]
 singleton_start = source.index("let sng_key_id =")
 singleton_helper = source[singleton_start:source.index("// ruby's ARY_MAX_SIZE", singleton_start)]
 identity_helper = state[state.index("let rec is_anon_cls ="):state.index("// name_anon (")]
-owner_header = """let anonymous_classes = map_new ();
+owner_header = """let snap_meths = map_new ();
+let anonymous_classes = map_new ();
 let _ = map_set anonymous_classes "AnonClass_1" 1;
 let _ = map_set anonymous_classes "AnonModule_2" 2;
 let _ = map_set anonymous_classes "Struct_3" 3;
@@ -115,6 +121,24 @@ let _ = ensure (is_anon_cls "AnonClass_1::Nested");
 let _ = ensure (is_anon_cls "Refine_M::R_0::Nested");
 let _ = ensure (if is_anon_cls "AnonClass_User" then false else true);
 let _ = ensure (if is_anon_cls "Refine_User" then false else true);
+// A registered saved definition owns its metadata independently of its
+// permanent or anonymous class. Merely spelling a snapshot suffix does not.
+let permanent_snapshot = "Object#answer" ++ chr 5 ++ "100";
+let anonymous_snapshot = "AnonClass_1#answer" ++ chr 5 ++ "101";
+let _ = check_owner permanent_snapshot "";
+let _ = check_owner anonymous_snapshot "AnonClass_1";
+let _ = map_set snap_meths permanent_snapshot 1;
+let _ = map_set snap_meths anonymous_snapshot 1;
+let _ = check_owner permanent_snapshot permanent_snapshot;
+let _ = check_owner anonymous_snapshot anonymous_snapshot;
+let _ = check_owner "Object#answer" "";
+let _ = check_owner "AnonClass_1#answer" "AnonClass_1";
+let _ = check_owner ("Object#missing" ++ chr 5 ++ "100") "";
+let _ = check_owner ("AnonClass_1#missing" ++ chr 5 ++ "101") "AnonClass_1";
+let _ = map_delete snap_meths permanent_snapshot;
+let _ = map_delete snap_meths anonymous_snapshot;
+let _ = check_owner permanent_snapshot "";
+let _ = check_owner anonymous_snapshot "AnonClass_1";
 '''
 with tempfile.TemporaryDirectory(prefix="mere-gc-marks-") as folder:
     folder = Path(folder)
