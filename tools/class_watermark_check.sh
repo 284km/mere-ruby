@@ -26,14 +26,14 @@ RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"; export RUBYOPT
 mr="${MR_BIN:-$root/mere-ruby}"
 fail=0
 for f in 559_native_class_roots.rb 561_anonymous_class_graph_roots.rb 839_classes_made_mid_statement_survive_a_collection.rb; do
-  want="$(ruby "$f" 2>&1)"
+  want="$("$REF_RUBY_BIN" "$f" 2>&1)"
   for vm in 0 1; do
     got="$(MERE_RUBY_VM=$vm MERE_RUBY_GC_DBG=8 "$mr" "$f" 2>&1)"
     if [ "$got" = "$want" ]; then echo "ok   $f vm=$vm (no class-name scan)"
     else echo "FAIL $f vm=$vm (no class-name scan)"; fail=1; fi
   done
 done
-want="$(ruby 559_native_class_roots.rb 2>&1)"
+want="$("$REF_RUBY_BIN" 559_native_class_roots.rb 2>&1)"
 got="$(MERE_RUBY_VM=0 MERE_RUBY_GC_DBG=10 "$mr" 559_native_class_roots.rb 2>&1)"
 if [ "$got" = "$want" ]; then echo "FAIL control: 559 kept its class with no scan and no watermarks -- the check above sees nothing"; fail=1
 else echo "ok   control: 559 loses its class with no scan and no watermarks"; fi

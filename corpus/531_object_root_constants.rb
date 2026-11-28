@@ -80,7 +80,7 @@ end
 p RootMissing.read
 
 # A lexical autoload is still checked before Object's fallback.
-path = File.expand_path(__FILE__ + ".autoload.rb")
+path = File.expand_path(__FILE__ + ".#{$$}.autoload.rb")
 begin
   File.write(path, "module RootAutoload; ROOT_ORDER = :autoload; end\n")
   module RootAutoload

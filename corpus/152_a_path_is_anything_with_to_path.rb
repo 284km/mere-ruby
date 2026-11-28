@@ -6,14 +6,18 @@
 # open a file has no ruby exception of its own.
 require "pathname"
 dir = Pathname.new("corpus")
-pn = dir + "zzz_to_path.txt"
+# The name carries the process id: two corpus runs in one tree at once would
+# otherwise write and delete each other's file. It is printed with the id
+# taken out, so the output does not depend on it.
+pn = dir + "zzz_to_path_#{$$}.txt"
+nopid = ->(s) { s.sub("_#{$$}", "") }
 
-p [pn.class, pn.to_s, pn.respond_to?(:to_path)]
+p [pn.class, nopid.(pn.to_s), pn.respond_to?(:to_path)]
 File.open(pn, "wb") { |f| f.puts("written through a Pathname") }
 p File.read(pn)
 p File.exist?(pn)
 p File.size(pn)
-p File.basename(pn)
+p nopid.(File.basename(pn))
 p File.extname(pn)
 File.write(pn, "written by File.write\n")
 p File.readlines(pn)
