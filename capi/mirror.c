@@ -99,8 +99,12 @@ static inline uint64_t mix(uint64_t h, uint64_t k) {
     h = (h ^ k) * 0xFF51AFD7ED558CCDULL;
     return h ^ (h >> 32);
 }
-static void hash_start(struct hash_lanes *s, size_t n, uint64_t seed) {
-    uint64_t h = seed ^ (n * 0x9E3779B97F4A7C15ULL);
+/* (the length goes in at the end, hash_end, not here: so the lanes after the
+ *  first bytes are those of any longer hash of the same bytes, and a String
+ *  C appended to has the hash of what it was and of what it is in one pass
+ *  -- hash_two) */
+static void hash_start(struct hash_lanes *s, uint64_t seed) {
+    uint64_t h = seed;
     s->lane[0] = h;
     s->lane[1] = h ^ 0x6A09E667F3BCC908ULL;
     s->lane[2] = h ^ 0xBB67AE8584CAA73BULL;
@@ -114,9 +118,9 @@ static inline void hash_block(struct hash_lanes *s, const unsigned char *p) {
     s->lane[2] = mix(s->lane[2], k[2]);
     s->lane[3] = mix(s->lane[3], k[3]);
 }
-/* (the last n < 32 bytes) */
-static uint64_t hash_end(struct hash_lanes *s, const unsigned char *p, size_t n) {
-    uint64_t h = mix(mix(mix(s->lane[0], s->lane[1]), s->lane[2]), s->lane[3]);
+/* (the last n < 32 bytes of `total`) */
+static uint64_t hash_end(struct hash_lanes *s, const unsigned char *p, size_t n, size_t total) {
+    uint64_t h = mix(mix(mix(mix(s->lane[0], s->lane[1]), s->lane[2]), s->lane[3]), total * 0x9E3779B97F4A7C15ULL);
     while (n >= 8) {
         uint64_t k;
         memcpy(&k, p, 8);
@@ -141,10 +145,22 @@ static inline __attribute__((always_inline)) uint64_t hash_short(const unsigned 
 }
 static uint64_t hash_long(const unsigned char *s, size_t n, uint64_t seed) {
     struct hash_lanes h;
-    hash_start(&h, n, seed);
+    hash_start(&h, seed);
     size_t i = 0;
     for (; i + 32 <= n; i += 32) hash_block(&h, s + i);
-    return hash_end(&h, s + i, n - i);
+    return hash_end(&h, s + i, n - i, n);
+}
+/* hash_bytes(s, n, seed), and through *first hash_bytes(s, had, seed), in one
+ * pass (32 <= had < n) */
+static uint64_t hash_two(const unsigned char *s, size_t had, size_t n, uint64_t seed, uint64_t *first) {
+    struct hash_lanes h;
+    hash_start(&h, seed);
+    size_t i = 0, cut = had & ~(size_t)31;
+    for (; i < cut; i += 32) hash_block(&h, s + i);
+    struct hash_lanes at = h;
+    *first = hash_end(&at, s + cut, had - cut, had);
+    for (; i + 32 <= n; i += 32) hash_block(&h, s + i);
+    return hash_end(&h, s + i, n - i, n);
 }
 static inline __attribute__((always_inline)) uint64_t hash_bytes(const void *p, size_t n, uint64_t seed) {
     return n < 32 ? hash_short(p, n, seed) : hash_long(p, n, seed);
@@ -159,7 +175,7 @@ static uint64_t copy_hash(unsigned char *dst, const unsigned char *src, size_t n
         return hash_short(src, n, seed);
     }
     struct hash_lanes h;
-    hash_start(&h, n, seed);
+    hash_start(&h, seed);
     int ch = *changed;
     size_t i = 0;
     for (; i + 32 <= n; i += 32) {
@@ -171,7 +187,7 @@ static uint64_t copy_hash(unsigned char *dst, const unsigned char *src, size_t n
     if (rest && !ch && memcmp(dst + i, src + i, rest)) ch = 1;
     if (rest && ch) memcpy(dst + i, src + i, rest);
     *changed = ch;
-    return hash_end(&h, src + i, rest);
+    return hash_end(&h, src + i, rest, n);
 }
 /* ---- the slot a String's struct is allocated in ------------------------------ */
 /* CRuby allocates a String's struct in a slot of one of five sizes -- 40, 80,
@@ -515,7 +531,13 @@ static void touch(struct mr_mirror *m, VALUE obj) {
 #define CAT_FROM_BYTES (64 * 1024)
 static int write_back(struct mr_mirror *m, VALUE obj) {
     if (!m->body) return 0;
-    uint64_t now = body_hash(m);
+    /* (a String C may have appended to: its hash now, and of the part it
+     *  last synced, in one pass) */
+    long had = m->body == T_STRING ? m->synced - 1 : -1;
+    int appended = had >= CAT_FROM_BYTES && m->as.string.len > had;
+    uint64_t first = 0;
+    uint64_t now = appended ? hash_two((const unsigned char *)str_ptr(m), (size_t)had, (size_t)m->as.string.len, 1, &first)
+                            : body_hash(m);
     if (now == m->hash) return 0;
     uint64_t before = m->hash;
     struct mr_transit saved;
@@ -537,9 +559,8 @@ static int write_back(struct mr_mirror *m, VALUE obj) {
          * after them, and so is this one.) msgpack's Buffer#read appends
          * 32 KiB at a time between IO reads; sending all of it at each read
          * made the whole of it again in the interpreter every time. */
-        long had = m->synced - 1;
         int sent = 0;
-        if (had >= CAT_FROM_BYTES && len > had && hash_bytes(str_ptr(m), (size_t)had, 1) == before) {
+        if (appended && first == before) {
             mr_put_bytes(str_ptr(m) + had, len - had);
             sent = (int)mr_up2(MR_STR_CAT, obj, (VALUE)had);
         }
