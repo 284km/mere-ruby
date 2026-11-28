@@ -154,3 +154,17 @@ size = File.size(__FILE__)
 end
 t("File#pread urandom 0 2**40") { File.open("/dev/urandom") { |f| f.pread(0, 2**40) } }
 t("File#pread zero 2 2**40")    { File.open("/dev/zero") { |f| f.pread(2, 2**40) } }
+
+# a file that cannot be read is EACCES, with a length of 0 too: binread opens
+# before anything, read after its offset's refusals and before its length's
+Dir.mktmpdir do |d|
+  f = File.join(d, "u.txt"); File.write(f, "secret"); File.chmod(0, f)
+  [[File, :read], [File, :binread], [IO, :read], [IO, :binread]].each do |k, m|
+    [[], [0], [1], [1, 2], [-1], [1, -1], ["x"], [1, "x"], [Float::INFINITY]].each do |a|
+      t("#{k}.#{m} unreadable #{a.inspect}") { k.send(m, f, *a) }
+    end
+  end
+  t("readlines unreadable") { File.readlines(f) }
+  t("foreach unreadable") { File.foreach(f).to_a }
+  File.chmod(0o600, f)
+end
