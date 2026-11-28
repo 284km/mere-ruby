@@ -81,10 +81,10 @@ CASES = {
   # interval too, every class and module the loop made was kept until it
   # ended -- TestModule#test_iclass_memory_leak (Bug #19550), 10 s for 6
   "a module included in a new class" => ->(d) { (300_000 / d).times { mod = Module.new; Class.new { include mod } } },
-  # A String of 256 KB or more is kept in a Vec of its own: in the page in use,
-  # a dead one stayed until the page's arena had doubled, since a compaction
-  # is refused while the program's stack points into that page (note: the
-  # first needs Array#join's and sub's buffers out of the default region too)
+  # A String of 256 KB or more is kept in a Vec of its own. In the page in use,
+  # a dead one stayed until the page's arena had doubled: a compaction is
+  # refused while the program's stack points into that page. (The first case
+  # needs sub!'s StrBuf in a region of its own too, #393.)
   "big Strings" => ->(d) { s = "a" * 300_000; (2_000 / d).times { t = s + "b"; t << "c"; t.sub!("a", "d") } },
   "a big String replaced" => ->(d) { s = +"x"; (2_000 / d).times { |i| s.replace("a" * 300_000); s << i.to_s } },
 }
