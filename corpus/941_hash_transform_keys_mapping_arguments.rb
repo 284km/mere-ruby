@@ -175,3 +175,36 @@ p [:original_index, [:[], :fetch, :at, :rotate, :delete_at].map { |name|
 singleton_array941 = []
 def singleton_array941.[](index) = index
 p [:singleton_original_index, singleton_array941[original_index941].equal?(original_index941), original_index941.calls]
+
+# Invalid native calls reject arity before nil/index coercion or to_int hooks.
+class NativeArityArray941 < Array
+  alias_method :saved_at, :at
+  alias_method :saved_flatten, :flatten
+end
+class NativeAritySuper941 < Array
+  def at(*args) = super
+  def flatten(*args) = super
+end
+index941 = OriginalIndex941.new
+[NativeArityArray941[1, 2, 3], NativeAritySuper941[1, 2, 3]].each do |array|
+  operations = array.is_a?(NativeArityArray941) ? [:saved_at, :saved_flatten] : [:at, :flatten]
+  operations.each do |name|
+    [nil, index941].each do |index|
+      begin
+        array.public_send(name, index, 1)
+      rescue ArgumentError, TypeError => error
+        p [:native_wrong_arity, name, error.class, error.message, index941.calls]
+      end
+    end
+  end
+end
+[:at, :flatten].each do |name|
+  method941 = Array.instance_method(name).bind(NativeArityArray941[1, 2, 3])
+  [nil, index941].each do |index|
+    begin
+      method941.call(index, 1)
+    rescue ArgumentError, TypeError => error
+      p [:retained_wrong_arity, name, error.class, error.message, index941.calls]
+    end
+  end
+end
