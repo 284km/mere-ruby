@@ -150,3 +150,28 @@ class ForwardIndexArray941 < Array
 end
 forward941 = ForwardIndexArray941.new
 p [:native_super, (forward941[index941] = 9), forward941[index941]]
+
+# An overriding reader/fetch receives the original object, without to_int.
+class OriginalIndex941
+  attr_reader :calls
+  def initialize = @calls = 0
+  def to_int
+    @calls += 1
+    0
+  end
+end
+class OriginalIndexArray941 < Array
+  def [](index) = index
+  def fetch(index) = index
+  def at(index) = index
+  def rotate(index) = index
+  def delete_at(index) = index
+end
+original_index941 = OriginalIndex941.new
+original_array941 = OriginalIndexArray941.new
+p [:original_index, [:[], :fetch, :at, :rotate, :delete_at].map { |name|
+  original_array941.public_send(name, original_index941).equal?(original_index941)
+}, original_index941.calls]
+singleton_array941 = []
+def singleton_array941.[](index) = index
+p [:singleton_original_index, singleton_array941[original_index941].equal?(original_index941), original_index941.calls]
