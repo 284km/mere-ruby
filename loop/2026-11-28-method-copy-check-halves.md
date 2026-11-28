@@ -32,6 +32,19 @@ Every sample of five runs on Linux (arm64, in docker, main 491cc5ca), in MB. All
 
 One run of the check, both sides, takes 25 s on Linux, where it took about 6. The wall limit is per run, so the worst case is six runs of 600 s each.
 
+### The check as it was, kept (review, Major)
+
+Other tools read the old program and the old result:
+
+- `rss_native_probe.py` imports `PROGRAM` and pins its SHA-256 and its 21 samples.
+- `method_copy_retention.py` imports it and asks for one `20.times do |batch|`.
+- `cache_compiler_compare.py` runs the check and prints each side's `post_gc_peak_to_initial`. The Cache compiler RSS comparison workflow runs it when this file changes.
+- `iclass_resource_replay.py` reads the same field. `iclass_resource_assess.py` reads `samples_kb`, `execution` and the old bounds.
+
+So `PROGRAM` is the 20-batch program, byte for byte: its SHA-256 is still 9bb9dd80…, which `rss_native_probe.py` pins. The new one is `HALVES_PROGRAM`, and its result has new fields (`runs`, `median`, `second_half_peak_to_first`).
+
+`--legacy` runs `PROGRAM` once and writes the old result, judged by max / batch 0 against 2.0. `cache_compiler_compare.py` asks for it. `iclass_resource_replay.py` asks for it where the root's check has it; a root from before had it as its only mode. A legacy ratio is the old metric, and is not read as the new one.
+
 ## Numbers
 
 Linux (arm64, docker), main 491cc5ca, the check itself:
@@ -60,6 +73,12 @@ On the VM the new ratio was 0.95 to 1.03 with no leak, and 1.33 to 1.49 with a l
 **The VM's Method copies, left for later.** The VM's RSS over these batches is below the evaluator's, but it saws further. By the old ratio it is over 2.0 on main as well: 2.13 to 2.42 over five runs. Nothing here says that it leaks. Its ratio of halves over 30 batches is about 1.0. But one run of five reached 175 MB at batch 16 from 148 at batch 13. Looking at that is not part of this change.
 
 ## Checked
+
+- `--legacy` on an O2 build (macOS): `method_copy.rb` is the pinned program, 21 samples, and `post_gc_peak_to_initial` is there for `cache_compiler_compare.py`'s print (reference 1.08, mere 1.90).
+- `rss_native_probe.py` and `method_copy_retention.py` import, and the pin of `PROGRAM` holds. A build that is not O2 is still refused with exit 2 and "an O2 build is required", in both modes, as `clone_rss_heap.py` and `rss_native_probe.py` ask.
+- `tools/cache_compiler_compare_check.py` (16), `tools/iclass_resource_replay_check.py` (18), `tools/clone_rss_heap_check.py`, `tools/rss_native_probe_check.py` and `tools/rss_page_probe_check.py`: OK.
+- The default mode on macOS: a median of 1.013, which passes.
+- The full collector, with its pinned compilers and runtimes, runs in the Cache compiler RSS comparison workflow, which this change starts.
 
 - The check and its two negative controls on Linux, as above.
 - `--leak-every 5` and `--leak-every 10` exit 1. No leak exits 0.
