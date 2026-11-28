@@ -224,8 +224,21 @@ that fail on the VM alone.
 
 ## Settings in the environment
 
-These are mere-ruby's own; the harnesses drop any inherited `MERE_RUBY_*`
-and pass only what they are asked to.
+These are mere-ruby's own. Some harnesses give mere-ruby a cleaned
+environment and drop any `MERE_RUBY_*` the caller has set: CI's CRuby,
+bootstrap, basic and tool measurements (`unittest/ci.py` and the
+`measure.py` scripts built on it), `mspec/run_spec.sh` (an `env -i`
+allowlist), the C API checks (`tools/capi_check.py`, `capi_gem_check.py`,
+`capi_spec_check.py`, `capi_mkmf_check.py`; `--vm` asks for the VM), and
+`railstest/measure.py` and `railstest/framework/run.py` (`--mere-env` passes
+one on explicitly). Others inherit the caller's settings: `run_corpus.sh`
+runs the candidate with whatever the caller exported (`--both` only clears
+`MERE_RUBY_NO_HASH_INDEX` for its first pass), so an exported
+`MERE_RUBY_VM`, `MERE_RUBY_GC_TIGHT` or `MERE_RUBY_GC_STRESS` changes what the
+corpus comparison measures. `tools/iseq/vm_corpus.sh`, `unittest/run.sh` and
+`unittest/try.sh` inherit them the same way (`vm_corpus.sh` sets
+`MERE_RUBY_VM` itself, and `unittest/vm_compare.sh` sets or unsets it per
+pass).
 
 | variable | |
 |---|---|
