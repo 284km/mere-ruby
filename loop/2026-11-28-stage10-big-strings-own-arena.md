@@ -88,4 +88,12 @@ Corpus 1150 does with Strings of 300 KB what a program does with any String, and
 
 ## Checked
 
-CHECKED
+On 6ab7818d, which is main e47a4bb3 (with #393) and this change:
+
+- `run_corpus.sh` 1034/1034, corpus 1150 included. `strbuf_region_check.py` read a fresh `mr.c`.
+- `vm_corpus.sh`: all 1034 on the VM, 0 fallback, 0 FAIL.
+- vm_check 246/246.
+- The collector's root check.
+- `tools/loop_rss_check.sh` 28/28: "big Strings" at 1.01 and "a big String replaced" at 1.00.
+- `tools/class_watermark_check.sh`.
+- Corpus 1150 under GC stress on both engines.
