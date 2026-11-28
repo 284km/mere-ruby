@@ -71,7 +71,9 @@ enum mr_op {
     MR_FREEZE = 34,     /* a: object -> 1 frozen, 2 a String frozen now, 0 not a String/Array/Hash (send #freeze) */
     MR_ARY_APPEND = 35, /* a: Array, b: index, c: value -> 1 stored at the end, 0 (send #[]=) */
     MR_MIXIN = 36,     /* a: target, b: module, c: 0 include, 1 prepend, 2 extend; no Ruby hooks */
-    MR_THREAD = 37     /* a: 0 -> Thread.current; 1 (b: a Thread, c: a Symbol) -> its thread-local, 0 (send #[]) */
+    MR_THREAD = 37,    /* a: 0 -> Thread.current; 1 (b: a Thread, c: a Symbol) -> its thread-local, 0 (send #[]) */
+    MR_STR_CAT = 38    /* a: String, b: the length it had at the last write-back; bytes: what C appended since
+                        * -> 1 appended, 0 refused (it was written since, or is not that long: send MR_STR_SET) */
 };
 enum mr_send_flag { MR_SEND_PUBLIC = 1, MR_SEND_KW = 2, MR_SEND_PASS_BLOCK = 4, MR_SEND_SUPER = 8,
     /* (16: the receiver is the current one)
