@@ -119,7 +119,11 @@ def main():
         root = roots[label]
         folder = out / ('method-' + label)
         with (out / ('method-' + label + '-driver.log')).open('w') as log:
-            status = subprocess.run(['python3', str(root / 'tools/method_copy_memory_check.py'), '--binary', str(root / 'mere-ruby'), '--reference', str(reference), '--output', str(folder)], stdout=log, stderr=subprocess.STDOUT).returncode
+            # (--legacy where the root's check has it: the 20-batch program and
+            #  the result read below; a root from before it ran that by default)
+            driver9 = root / 'tools/method_copy_memory_check.py'
+            legacy9 = ['--legacy'] if '--legacy' in driver9.read_text() else []
+            status = subprocess.run(['python3', str(driver9), '--binary', str(root / 'mere-ruby'), '--reference', str(reference), '--output', str(folder), *legacy9], stdout=log, stderr=subprocess.STDOUT).returncode
         value = json.loads((folder / 'result.json').read_text())
         record['method'][label] = dict(driver_exit=status, result=value, program_sha256=ci.digest(folder / 'method_copy.rb'))
         ci.save(out / 'result.json', record)
