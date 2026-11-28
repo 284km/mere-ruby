@@ -52,8 +52,10 @@ fallback1009 = [BadIdentityHash1009.new].join
 p [:native_hash_identity, fallback1009.match?(/\A#<BadIdentityHash1009:0x[0-9a-f]+>\z/),
    fallback1009.encoding.name, $join_identity_calls1009]
 
-class MauvaisÉHash1009 < BadJoinHash1009; end
-fallback1009 = [MauvaisÉHash1009.new].join
+# Keep the Unicode class name while avoiding Ruby 4.0.10's disasm encoding
+# error for this file's static class definition and constant reference.
+unicode_hash1009 = Object.const_set("MauvaisÉHash1009", Class.new(BadJoinHash1009))
+fallback1009 = [unicode_hash1009.new].join
 p [:unicode_hash_fallback, fallback1009.match?(/\A#<MauvaisÉHash1009:0x[0-9a-f]+>\z/), fallback1009.encoding.name]
 
 # The internal string conversion in join does not inherit the caller's

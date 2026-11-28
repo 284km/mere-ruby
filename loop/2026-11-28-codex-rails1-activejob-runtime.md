@@ -90,3 +90,22 @@ Evidence: `railstest/framework/records/activejob-protocols.json`.
 The six framework tooling/dependency files are a separate PR. Final component-wide
 measurements and the AMQP interpreter follow-up are separate from these three fixes.
 Owner merges after the bot reviews the exact publication head.
+
+
+## Corpus reference disassembly follow-up
+
+CI396 job140873301577 stopped in clean referenceRuby4.0.10's ISeq#disasm
+on corpus1009's static Unicode subclass and constant reference. Normal Ruby
+execution was correct. The same named subclass is now made by Object.const_set
+and Class.new, then used through its local variable. The name/parent/fallback
+and encoding assertions remain; the original and updated outputs are identical.
+All8 evaluator/VM/hash/GC32 comparisons match; whole-file ISeq comparison is
+1031/1031same,zero refused/diff/format/errors,without a harness skip.
+
+Corpus--both1031/1031; VM1031/0fallback/0FAIL/0list differences;12gates pass.
+The exact O2 runtime42 binary is reused, with identical runtime/build inputs
+and a freshly emitted byte-identical C. A prior source-age-gate refusal is
+retained as pre-corpus failure; no mtime gate or resource bound was bypassed.
+Original core/Rails/RSS evidence remains applicable to that unchanged runtime,
+and is explicitly reused. This does not clear the separate hostedLinux Module
+timeouts or396 Method-copy memory failure/global merge hold. Re-review exacthead.
