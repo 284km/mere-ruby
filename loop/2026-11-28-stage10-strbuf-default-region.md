@@ -117,6 +117,8 @@ What this branch still keeps is bounded. `Array#join` over 2,000, 4,000 and 8,00
 - `encode_cps_go`: likewise, under `encode_cps`'s `region ENCB`.
 - `pt_q`, `pt_e_inline` and `cli_parsetree`: `--dump=parsetree`, once a run. Its printers share one StrBuf type.
 
+`unittest/harness_check.py` and `tools/runtime_load_path_check.py` copy `run_corpus.sh` into a repository of their own, with the source checks as stubs. They have a stub of this one too (review, Major): without it `run_corpus.sh` stopped before the corpus, and their corpus tests failed.
+
 It reads the spelling, not the meaning: a function called from inside a region block is in that region at run time, and is still reported. Such a function goes in the allowed list, with its caller named.
 
 ## What is left
@@ -136,3 +138,4 @@ On cb532798, which is main 491cc5ca and this branch:
 - `tools/loop_rss_check.sh`: 26/26, the eleven new cases included.
 - `tools/class_watermark_check.sh`.
 - `tools/strbuf_region_check.py` reports a StrBuf made outside a region block in a file of its own, and nothing in one made inside.
+- After the review fix: `python3 unittest/harness_check.py -v` (21 tests, `test_corpus_uses_selected_reference_and_both_index_modes` included) and `python3 tools/runtime_load_path_check.py -v` (8 tests, the corpus ones included), both OK.
