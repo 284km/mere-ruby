@@ -914,6 +914,11 @@ check(ok && r.encoding == Encoding::UTF_8)
 # (from a String Ruby made, and from an unfrozen dup of a frozen one)
 check(cat_run.(6, -1, :none, 3, :lshift, +('f' * 70000))[0])
 check(cat_run.(6, -1, :none, 2, :aset, +('g' * 70000).freeze)[0])
+# C appends through the struct and buffer it kept across a call in which
+# Ruby changed a byte: Ruby's byte stays, and C's bytes follow it
+kept = 'k' * 100000
+A.cat_kept(kept, ->(s) { s.setbyte(5, 90) })
+check(kept.bytesize == 104096 && kept.getbyte(5) == 90 && kept.getbyte(4) == 107 && kept.end_with?('t' * 4096) && kept.byteslice(99999, 2) == 'kt')
 # a data object's String, appended to in calls with collections between
 zc = A.cat_holder(20)
 3.times { GC.start; 'x' * 1000 }

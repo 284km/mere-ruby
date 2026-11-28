@@ -121,6 +121,23 @@ static VALUE cat_steps(VALUE self, VALUE str, VALUE steps, VALUE peek, VALUE at,
     }
     return s;
 }
+/* C keeps the String's struct and buffer across a call into Ruby (`peek`,
+ * which changes a byte of it in place), then appends 4 KiB through them and
+ * sets the length in the struct itself, with no function to fetch it again.
+ * In ruby the buffer is the one Ruby wrote: its byte stays, and C's bytes
+ * follow it. (Room is made first, so that neither side moves the buffer.) */
+static VALUE cat_kept(VALUE self, VALUE str, VALUE peek) {
+    (void)self;
+    rb_str_modify_expand(str, 4096);
+    struct RString *r = RSTRING(str);
+    char *p = RSTRING_PTR(str);
+    long len = RSTRING_LEN(str);
+    rb_funcall(peek, rb_intern("call"), 1, str);
+    memset(p + len, 't', 4096);
+    p[len + 4096] = '\0';
+    r->len = len + 4096;
+    return str;
+}
 /* ...and one a data object holds alone, marked by its dmark, appended to
  * in later calls */
 static VALUE cat_holder(VALUE self, VALUE n) {
@@ -734,6 +751,7 @@ void Init_api_fixture(void) {
     rb_define_singleton_method(mod, "zeroed_holder", zeroed_holder, 2);
     rb_define_singleton_method(mod, "zeroed_held", zeroed_held, 1);
     rb_define_singleton_method(mod, "cat_steps", cat_steps, 5);
+    rb_define_singleton_method(mod, "cat_kept", cat_kept, 2);
     rb_define_singleton_method(mod, "cat_holder", cat_holder, 1);
     rb_define_singleton_method(mod, "cat_held_more", cat_held_more, 3);
     rb_define_singleton_method(mod, "big_fill", big_fill, 2);

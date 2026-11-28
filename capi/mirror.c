@@ -526,12 +526,17 @@ static int write_back(struct mr_mirror *m, VALUE obj) {
         long len = m->as.string.len;
         if (len < 0 || len > str_capacity(m, str_term(m)))
             mr_fatal("a String's length was set past its capacity");
-        /* Only what C appended, when the String it last synced is big, is
-         * still how this buffer starts (its hash: `before`, the hash then),
-         * and the interpreter has not written it since (MR_STR_CAT answers
-         * that, and refuses otherwise). msgpack's Buffer#read appends 32 KiB
-         * at a time between IO reads; sending all of it at each read made
-         * the whole of it again in the interpreter every time. */
+        /* Only what C appended, when the String it last synced is big and
+         * is still how this buffer starts (its hash: `before`, the hash
+         * then). MR_STR_CAT refuses it unless the interpreter's String is
+         * that long. A write Ruby made since is in the buffer already:
+         * rb_mere_string fetches the String again after any call into Ruby,
+         * and RSTRING, RSTRING_PTR, rb_str_set_len and the rest go through
+         * it. (Only a struct C kept across such a call and wrote the length
+         * of skips the fetch; ruby's String is then Ruby's bytes with C's
+         * after them, and so is this one.) msgpack's Buffer#read appends
+         * 32 KiB at a time between IO reads; sending all of it at each read
+         * made the whole of it again in the interpreter every time. */
         long had = m->synced - 1;
         int sent = 0;
         if (had >= CAT_FROM_BYTES && len > had && hash_bytes(str_ptr(m), (size_t)had, 1) == before) {
