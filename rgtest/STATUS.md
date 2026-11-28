@@ -1,5 +1,12 @@
 # rgtest — RubyGems' own tests under mere-ruby
 
+⚠ **This is a historical record (2026-08-30, against ruby 3.2.2) and is not
+refreshed.** RubyGems' tests are now measured in full, with their real test
+helper, as part of CRuby's `test/` in CI ([unittest/README.md](../unittest/README.md)):
+on main `0f0413c5` (2026-11-28, ruby 4.0.10) the 150 `test/rubygems` units
+hold 2,795 tests, of which 2,765 MATCH, 26 RED, 3 BOTH and 1 EXTRA. The
+known gaps listed below are as they were on 2026-08-30; read them as history.
+
 `./run.sh <path/to/rubygems>` runs a rubygems test file under BOTH `ruby` and
 `mere-ruby`, with `helper.rb` (a minitest-lite stand-in for rubygems' 1705-line
 test helper) installed in place of the real one, and compares the tallies. Like
