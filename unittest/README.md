@@ -158,7 +158,7 @@ a separate measurement from listing it.
 
 The separate [tool measurement](../tooltest/README.md) executes the 12
 `tool/test` candidate bodies through their original runner, including their
-CLI and parallel fixtures. CI publishes four `tool-shard-*` artifacts and a
+CLI and parallel fixtures. CI publishes one `tool-shard-0` artifact and a
 `tool-report`; these cases are not added to the `test/` totals above.
 
 ## Checking the harness
@@ -188,7 +188,8 @@ turn a case into MATCH.
 Pull requests, pushes to `main`, the weekly schedule and manual dispatch run
 the full `test/` candidate inventory. For the pinned Ruby 4.0.10 this is 758 files: 757
 matching the naming rules and the audited standalone body
-`rubygems/bundler_test_gem.rb` in `extra_files.txt`. This includes the 16 files
+`rubygems/bundler_test_gem.rb` in `extra_files.txt`. With `test_ast.rb` split
+in four (`splits.tsv`), the plan has 761 execution units. This includes the 16 files
 excluded from the historical default and the encoding subdirectory. Recursive
 directory selections include audited extra bodies in that directory; the
 historical default stays unchanged. A missing audited body is an error.
@@ -478,7 +479,7 @@ parent credentials and GitHub session variables
 are not inherited. This is important for whole Test::Unit failure reports:
 multiline hashes and arrays can expose environment values that a line-oriented
 mask cannot remove reliably. The environment policy is recorded in each shard
-and mixed policies are rejected during collection. A real Ruby 4.0.9 Test::Unit
+and mixed policies are rejected during collection. A real Ruby 4.0.10 Test::Unit
 fixture exercises both renderings through the artifact publication path.
 
 The Actions summary reports the named-test totals and incomplete-file count.
@@ -506,7 +507,7 @@ resource cleanup and diagnostic masking with small controlled fixtures.
 The process-family checks use real processes, including new sessions/groups,
 empty exec environments, fast double-forks and multiline argv. They require
 permission to inspect processes with ps. The CI harness job also runs a real
-Ruby 4.0.9 Test::Unit fixture for multiline environment diagnostics.
+Ruby 4.0.10 Test::Unit fixture for multiline environment diagnostics.
 The collection checks compare parent and mask-process peak RSS for 8 MiB and
 64 MiB logs without newlines, exercise output expansion and UTF-8 truncation,
 and check both silent and continuously noisy mask timeouts.
@@ -514,6 +515,42 @@ The transcript checks also compare peak RSS while recovering from 8/128 MiB
 unterminated input. Collection tests stop real workers after the reference has
 finished, including a mere-ruby fixture that prints an early summary and then
 stalls, to verify retained RED counts and the absence of false matches.
+
+## The latest full run
+
+[Run 46101446305](https://github.com/284km/mere-ruby/actions/runs/46101446305)
+on main `0f0413c5` (2026-11-28), Mere `9dec2ff6`, Ruby source `a704b7cd`
+(4.0.10): 761 units planned, none missing, 37 incomplete or zero-test.
+34,634 named tests: **33,068 MATCH, 1,427 RED, 117 BOTH, 22 EXTRA**, and 60
+tests excluded on both sides. The 26 reference ZERO files are the
+`reference_conditions.tsv` classes above. The top-level
+[README](../README.md#where-it-stands) sorts the RED by file.
+
+Four files account for most of the RED that is not the JIT:
+`ruby/test_array.rb` reaches MEMORY_LIMIT (491 RED), `ruby/test_time.rb` and
+`ruby/test_sprintf.rb` reach WALL_LIMIT (88 and 35), and
+`json/json_parser_test.rb` ends without a summary (53). The first three have
+done so in every main run since the reference moved to 4.0.10 (they completed
+on `79f287ae`, 2026-11-24, against 4.0.9); the JSON file completed on
+`85da98fb` (2026-11-26). `unittest/STATUS.md` is a local `run.sh` record of a
+subset, against 4.0.9; it is not this run.
+
+## The evaluator against the ISeq VM
+
+`vm_compare.sh <ruby-src> [--list FILE] [path ...]` runs `run.sh` twice,
+once on the evaluator and once with `MERE_RUBY_VM=1`, and compares the two
+records test by test (`vm_compare.py`). A file whose results differ is run
+again on both, and only what differs both times is reported: VM_ONLY (fails
+on the VM alone, exit 1), EVAL_ONLY, and VM_FILE (a file the evaluator
+completes and the VM does not, exit 1). `VM_COMPARE_OUT=<dir>` keeps the
+records.
+
+CI's `unittest-vm` job runs it over the 22 files of `vm_compare_files.txt` on
+the weekly schedule and on manual dispatch only, and publishes
+`unittest-vm-compare`. The last run over all of `test/ruby` (167 files, main
+`d5869476`, 2026-11-25, recorded in
+`loop/2026-11-25-stage10-test-ruby-whole.md`) gave VM_ONLY 2, EVAL_ONLY 1,
+VM_FILE 0.
 
 ## Classified baseline gaps
 

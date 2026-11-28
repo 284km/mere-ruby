@@ -17,6 +17,10 @@ Measured against **ruby 4.0.9** (tools/ref_ruby.sh). The reference is part
 of the subject: a row measured against another release is not comparable with the
 ones around it, and the difference reads as movement in mere-ruby.
 
+(Last swept 2026-11-11. `tools/ref_ruby.sh` has named ruby 4.0.10 since 2026-11-24;
+this record has not been swept against it yet, so every row here is 4.0.9's. The
+spec tree named on the last line is ruby's v4.0.9 commit.)
+
 ⚠ **The shim is part of the subject too.** From 2026-09-29 it runs what mspec runs:
 shared examples (`it_behaves_like`, 1781 lines that used to run nothing), the
 platform / version / feature guards, mspec's before/after order, and its raise
