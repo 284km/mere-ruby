@@ -21,6 +21,13 @@ by the same list.
 It reads the spelling, not the meaning: a function that is CALLED from inside a
 region block, and makes its StrBuf there, is in that region at run time and is
 still reported here. Such a function goes in ALLOWED, with the caller named.
+So after a build it also reads the emitted C (mr.c), where the meaning is: a
+function whose StrBuf is `mere_strbuf_new((&__lang_default_region))` there has
+to be in ALLOWED too.
+
+It fails, too, when it read no file or no function, when an allowance is no
+longer taken, and when a file's braces or quotes do not balance by its end: a
+check that read nothing, or read a file wrong, would pass everything.
 """
 import os
 import re
@@ -36,9 +43,6 @@ ALLOWED = {
     # in `region DSTR`: a function's StrBuf of a region parameter is made in
     # the region its caller passes, not the default one
     ("m_parse.mere", "lex_dstr_buf"): "lex_dstr_t's region DSTR",
-    # its one-character buffers are passed back to itself where its `b` goes,
-    # so they are typed as `b`, which encode_cps makes in `region ENCB`
-    ("m_codec.mere", "encode_cps_go"): "encode_cps's region ENCB",
     # --dump=parsetree, once per run, and its printers share one StrBuf type
     ("m_driver.mere", "pt_q"): "--dump=parsetree, once",
     ("m_driver.mere", "pt_e_inline"): "--dump=parsetree, once",
@@ -81,17 +85,19 @@ def strip(line, in_str):
     return "".join(out), in_str
 
 
-def scan(path):
+def scan(path, used, counts):
     rel = os.path.relpath(path, ROOT)
     bad = []
     stack = []
     func = "(top level)"
     in_str = False
+    counts["files"] += 1
     with open(path, encoding="utf-8") as fh:
         for no, raw in enumerate(fh, 1):
             m = DEF.match(raw)
             if m and not in_str:
                 func = m.group(3)
+                counts["functions"] += 1
             code, in_str = strip(raw.rstrip("\n"), in_str)
             # walk the line in order: region openers, other braces, closers,
             # and the StrBufs between them
@@ -103,8 +109,11 @@ def scan(path):
                     pos = rm.end()
                     continue
                 if code.startswith("strbuf_new", pos) and (pos == 0 or not (code[pos - 1].isalnum() or code[pos - 1] == "_")):
-                    if "region" not in stack and (rel, func) not in ALLOWED:
-                        bad.append("%s:%d (%s)" % (rel, no, func))
+                    if "region" not in stack:
+                        if (rel, func) in ALLOWED:
+                            used.add((rel, func))
+                        else:
+                            bad.append("%s:%d (%s)" % (rel, no, func))
                     pos += len("strbuf_new")
                     continue
                 c = code[pos]
@@ -114,7 +123,32 @@ def scan(path):
                     if stack:
                         stack.pop()
                 pos += 1
+    # (a brace read wrong would leave the rest of the file inside or outside a
+    #  region: the depth has to be back at 0 at its end)
+    if stack or in_str:
+        bad.append("%s: the braces or quotes do not balance by its end (%d open%s)"
+                   % (rel, len(stack), ", in a string" if in_str else ""))
     return bad
+
+
+C_DEFAULT = "mere_strbuf_new((&__lang_default_region))"
+C_FUNC = re.compile(r"^static [^;(]*\bmu_([A-Za-z0-9_']+?)(?:__direct)?\(")
+
+
+def scan_emitted(path):
+    """The functions whose StrBuf the emitted C makes in the default region:
+    the meaning, where the source scan reads the spelling. A function given a
+    region parameter by its caller is not among them."""
+    found = set()
+    func = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = C_FUNC.match(line)
+            if m:
+                func = m.group(1)
+            if C_DEFAULT in line:
+                found.add(func or "(top level)")
+    return found
 
 
 def main():
@@ -128,16 +162,36 @@ def main():
             if f.endswith(".mere"):
                 files.append(os.path.join(dirpath, f))
     bad = []
+    used = set()
+    counts = {"files": 0, "functions": 0}
     for f in sorted(files):
-        bad.extend(scan(f))
+        bad.extend(scan(f, used, counts))
+    # ...and it has to have read something, and every allowance has to be
+    # one that is still taken: a check that read nothing passes everything
+    if counts["files"] == 0 or counts["functions"] == 0:
+        bad.append("read %d files and %d functions: nothing to check" % (counts["files"], counts["functions"]))
+    for key in sorted(set(ALLOWED) - used):
+        bad.append("%s (%s): allowed, but makes no StrBuf outside a region any more" % key)
+    # ...and, after a build, what the C backend made of it: every function
+    # whose StrBuf is the default region's in mr.c has to be one allowed
+    emitted = os.path.join(ROOT, "mr.c")
+    seen_c = None
+    if os.path.exists(emitted):
+        seen_c = scan_emitted(emitted)
+        allowed_fns = {fn for _, fn in ALLOWED}
+        for fn in sorted(seen_c - allowed_fns):
+            bad.append("mr.c: mu_%s makes a StrBuf in the default region" % fn)
     if bad:
-        print("strbuf region: a StrBuf is made outside every region block, so it is the default region's:")
+        print("strbuf region: a StrBuf outside every region block is the default region's, which nothing gives back:")
         for b in bad:
             print("  " + b)
         print("Put it in a region of its own (`region NAME { let b = strbuf_new () in ...; strbuf_to_str b }`),"
               " or add its function to ALLOWED in tools/strbuf_region_check.py with the reason it may stay.")
         return 1
-    print("strbuf region: every StrBuf is made inside a region block, or allowed")
+    print("strbuf region: every StrBuf is made inside a region block, or allowed (%d files, %d functions; %s)"
+          % (counts["files"], counts["functions"],
+             "mr.c: %d functions with one in the default region, all allowed" % len(seen_c) if seen_c is not None
+             else "no mr.c to read"))
     return 0
 
 

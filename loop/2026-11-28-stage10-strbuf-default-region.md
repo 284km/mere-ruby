@@ -103,7 +103,13 @@ Eleven new cases. Each makes a 32 KB result 4,000 times: `gsub` with a block, `g
 | | main | this branch |
 |---|---|---|
 | evaluator | 2.08 to 4.01, all FAIL | 0.61 to 1.46 |
-| VM | 1.97 to 3.98, all FAIL | 1.25 to 1.44 |
+| VM | 1.97 to 3.98, all FAIL | 1.11 to 1.86 |
+
+These cases are held on the evaluator, which is what `tools/loop_rss_check.sh` runs. CI does not run that script; the gate does.
+
+On the VM the numbers depend on where the binary is run from. Run from `/tmp`, all eleven were 1.25 to 1.44. Run from the tree (`./mere-ruby`, with `lib/` beside it), three were over the bound, in the file's order, five times out of five (review): `gsub` with a String and `sub` at 1.86, and `Array#join` at 1.79. What started differs, and so does where the String pages fall.
+
+It is not a leak. `gsub` with a String over 2,000, 4,000, 8,000 and 16,000 turns gave 1.39, 1.86, 1.58 and 1.19. Main gave 307, 440 and 683 MB as the turns grew; this branch gave 166, 158 and 119 MB. What the VM keeps is the current page (below), whose size depends on where a collection falls. So the VM is not watched by these cases until the current page is dealt with.
 
 What this branch still keeps is bounded. `Array#join` over 2,000, 4,000 and 8,000 turns added 43, 41 and 49 MB. That is the current String page (below), and it is why the ratios are 1.4 and not 1.0.
 
@@ -114,12 +120,23 @@ What this branch still keeps is bounded. `Array#join` over 2,000, 4,000 and 8,00
 `run_corpus.sh` runs it next to `iv_door_check.sh`. It reads the source, skipping comments and string literals, and keeps a stack of the `region NAME {` blocks open at each point. A `strbuf_new` with none open is reported, unless its function is allowed with a reason. Allowed:
 
 - `lex_dstr_buf`: its StrBufs are typed as the one it is handed, which `lex_dstr_t` makes in `region DSTR`. A StrBuf of a region parameter is made in the region the caller passes.
-- `encode_cps_go`: likewise, under `encode_cps`'s `region ENCB`.
 - `pt_q`, `pt_e_inline` and `cli_parsetree`: `--dump=parsetree`, once a run. Its printers share one StrBuf type.
 
 `unittest/harness_check.py` and `tools/runtime_load_path_check.py` copy `run_corpus.sh` into a repository of their own, with the source checks as stubs. They have a stub of this one too (review, Major): without it `run_corpus.sh` stopped before the corpus, and their corpus tests failed.
 
 It reads the spelling, not the meaning: a function called from inside a region block is in that region at run time, and is still reported. Such a function goes in the allowed list, with its caller named.
+
+So, after a build, it reads the emitted C too. Every function whose StrBuf is `mere_strbuf_new((&__lang_default_region))` in `mr.c` has to be an allowed one. There are three now: the `--dump=parsetree` printers. The lexer's StrBufs take the region their caller passes.
+
+That is how a wrong allowance showed (review). `encode_cps_go` was allowed as "typed as `b`, under `region ENCB`", but the C made its one-character StrBufs, two of them, in the default region. They asked for EUC-JP's bytes of one character, for the EUC-JIS-2004 and stateless-ISO-2022-JP arms. That character's bytes are now a function of their own, `jis_family_char`, which the JIS family's arm uses too, and no StrBuf is made.
+
+It fails as well:
+
+- when it read no file or no function;
+- when an allowance is no longer taken;
+- when a file's braces or quotes do not balance by its end.
+
+A check that read nothing, or read a file wrong, would pass everything.
 
 ## What is left
 
