@@ -76,6 +76,11 @@ CASES = {
   # preloaded)
   "Module#constants" => ->(d) { (20_000 / d).times { Process.constants.size } },
   "clock_gettime with a CLOCK_ number" => ->(d) { (100_000 / d).times { Process.clock_gettime(Process::CLOCK_MONOTONIC) } },
+  # the loop that runs this body without a block call (range_metadata_each)
+  # kept times' interval open from the first turn, and once a class had an
+  # interval too, every class and module the loop made was kept until it
+  # ended -- TestModule#test_iclass_memory_leak (Bug #19550), 10 s for 6
+  "a module included in a new class" => ->(d) { (300_000 / d).times { mod = Module.new; Class.new { include mod } } },
 }
 
 name, body = CASES.to_a.fetch(Integer(ARGV.fetch(0)))

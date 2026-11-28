@@ -7,15 +7,21 @@ order. The summary executes no Ruby statement and is omitted from parse-tree/war
 accounting.
 
 Native sampling of the unchanged Addrinfo Marshal sequence identified recurring
-deep_targets/whens_targets work. This removes about 16% of Marshal instructions on both
-engines. The original 1000-warmup/20000-load resource test STILL times out on main and
-candidate at its unchanged bound: this is an analysis-cost improvement, not a completed
-timeout or leak cure. That remaining result is explicitly retained below.
+deep_targets/whens_targets work. The matching-main instruction and wall-time
+measurements are shown below. The original 1000-warmup/20000-load resource test STILL
+times out on main and candidate at its unchanged bound: this is an analysis-cost
+improvement, not a completed timeout or leak cure. That remaining result is explicitly
+retained below.
 
 Corpus 1140 and 974 preserve conditional/eval local declaration timing and branch values
 on all four engine/index configurations. Pattern-case parsing/execution is unchanged. An
 independent control also reproduces an evaluator-only case/in unexecuted-local gap on
 main while its VM matches Ruby; that separate parser/AST issue remains recorded.
+
+Validation main 491cc5ca is merged, including the eval-node, native-argument and GC
+changes. Both SBranchTargets and SNodeIds remain known nonexecuting metadata in the
+shared parser/implicit-parameter paths. Corpus 1004 from that merge also matches Ruby in
+all four engine/index configurations.
 
 The review regression is fixed: SBranchTargets is recognized as a known nonexecuting
 statement by ip_slots_known_stmt. Cached metadata no longer causes the fallback that
@@ -30,11 +36,11 @@ Hash index on/off, under both normal and tight GC. The reviewed head still fails
 evaluator retention check; matching main and its VM pass.
 
 Clean Ruby 4.0.10 through `tools/ref_ruby.sh`; matching main
-`e433affa596f582782b1c6932811a6461619faca`. Corpus 1140 and the related fixtures compare
+`491cc5cab7e727606e1b00a141607e4742194d0a`. Corpus 1140 and the related fixtures compare
 stdout, stderr and exit status directly.
 
-- `sh run_corpus.sh --both`: **1030/1030 PASS**, exit 0.
-- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: **1030/1030 PASS**, exit 0.
+- `sh run_corpus.sh --both`: **1032/1032 PASS**, exit 0.
+- `MERE_RUBY_VM=1 sh run_corpus.sh --both`: **1032/1032 PASS**, exit 0.
 
 Original CRuby comparisons below retain the original files, assertions, counts and
 budgets. Runs use parsed `--seed=1` and `MERE_RUBY_GC_TIGHT=1`. No full unit or Rails
@@ -51,10 +57,10 @@ RSS is the measured `/usr/bin/time -l` test-driver maximum in bytes.
 
 | Driver max RSS bytes | Ruby | Main evaluator | Candidate evaluator | Main VM | Candidate VM |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| socket/test_addrinfo.rb / /test_marshal\z/ | 22495232 | 156893184 | 157319168 | 159154176 | 159842304 |
-| socket/test_addrinfo.rb / /test_marshal_memory_leak\z/ | 22757376 | 156844032 | 157204480 | 159072256 | 159629312 |
-| ruby/test_allocation.rb / /test_(array_literal&#124;hash_literal)\z/ | 77922304 | 312737792 | 320307200 | 317145088 | 319045632 |
-| ruby/test_proc.rb / /test_implicit_parameters_for_(numparams&#124;it&#124;it_complex&#124;it_and_numparams)\z/ | 23904256 | 163807232 | 164282368 | 197902336 | 198754304 |
+| socket/test_addrinfo.rb / /test_marshal\z/ | 22659072 | 157089792 | 157663232 | 159416320 | 159973376 |
+| socket/test_addrinfo.rb / /test_marshal_memory_leak\z/ | 22773760 | 157155328 | 163725312 | 159350784 | 162004992 |
+| ruby/test_allocation.rb / /test_(array_literal&#124;hash_literal)\z/ | 76988416 | 316243968 | 317734912 | 338411520 | 329285632 |
+| ruby/test_proc.rb / /test_implicit_parameters_for_(numparams&#124;it&#124;it_complex&#124;it_and_numparams)\z/ | 23986176 | 164134912 | 164610048 | 198262784 | 198803456 |
 
 The exact original allocation selectors pass 2 tests / 8 assertions on all five
 executions, including their current 100000-element Array and 100000-key Hash cases. The
@@ -65,21 +71,33 @@ Three alternating matching-main/candidate pairs per workload and engine, O2, tig
 and parsed --seed=1. Instructions and elapsed seconds are medians; RSS is the maximum of
 three. Wall time is diagnostic on the shared machine.
 
+The initial VM 50000-key Hash RSS samples varied materially despite tight GC and fixed
+seed. One bounded supplement of exactly three additional alternating pairs uses the same
+executables, workload and seed. The workload table preserves the original three-pair
+results; the supplement table reports every RSS sample and the maximum across all six
+per executable. No runs were discarded or repeated until a favorable result, and no leak
+cure is claimed.
+
+| VM Hash RSS bytes | Initial three | Additional three | Maximum of all six |
+| --- | --- | --- | ---: |
+| main | 220741632, 217219072, 222838784 | 222691328, 222855168, 219545600 | 222855168 |
+| candidate | 224444416, 282607616, 195641344 | 219299840, 226066432, 214745088 | 282607616 |
+
 | Engine / workload | Instruction change | Main / candidate seconds | Main / candidate max RSS bytes |
 | --- | ---: | --- | --- |
-| Evaluator / marshal | -15.948% | 2.824941 / 2.366505 | 123305984 / 123502592 |
-| Evaluator / array | +0.082% | 0.205081 / 0.195396 | 145080320 / 145424384 |
-| Evaluator / hash | +0.011% | 0.400090 / 0.387504 | 189448192 / 189775872 |
-| Evaluator / implicit | -0.293% | 0.152212 / 0.143201 | 72646656 / 72990720 |
-| Evaluator / explicit | -0.444% | 0.137277 / 0.126076 | 72630272 / 72974336 |
-| VM / marshal | -15.957% | 2.907847 / 2.752451 | 126779392 / 125845504 |
-| VM / array | +0.223% | 0.239305 / 0.240541 | 150798336 / 151224320 |
-| VM / hash | -0.100% | 8.801873 / 9.041113 | 283049984 / 284819456 |
-| VM / implicit | +0.074% | 0.153948 / 0.148155 | 73547776 / 73973760 |
-| VM / explicit | +0.388% | 0.142643 / 0.159003 | 73564160 / 73973760 |
+| Evaluator / marshal | -15.820% | 2.682573 / 2.313710 | 123813888 / 123879424 |
+| Evaluator / array | +0.283% | 0.247602 / 0.227813 | 145129472 / 145440768 |
+| Evaluator / hash | +0.051% | 0.393325 / 0.400801 | 189497344 / 189825024 |
+| Evaluator / implicit | -0.316% | 0.271065 / 0.250767 | 72712192 / 73007104 |
+| Evaluator / explicit | -0.692% | 0.276862 / 0.181071 | 72695808 / 73007104 |
+| VM / marshal | -15.945% | 2.939318 / 2.238504 | 124764160 / 125190144 |
+| VM / array | -0.314% | 0.182801 / 0.189278 | 150913024 / 151207936 |
+| VM / hash | +0.091% | 9.892419 / 10.654297 | 222838784 / 282607616 |
+| VM / implicit | +0.256% | 0.187403 / 0.194430 | 73613312 / 74006528 |
+| VM / explicit | +0.139% | 0.157768 / 0.168252 | 73662464 / 73957376 |
 
 Candidate O2 SHA-256:
-`b866d8a990bf5cbd8513d5bd47f1b13292e9b73a2ab4284a840aa46a47b7cf99`. Compiler 9dec2ff6;
+`2bae4e1f83c2a9ab223ff580b8dcaa7a144e72f3a9b8f5d6bfa767438bd3ea19`. Compiler 9dec2ff6;
 mgz 661a01d8.
 
 Source gates gc_roots, dup_defs, dead_defs, meth_writes, iv_door, name_spec, rx_caps,

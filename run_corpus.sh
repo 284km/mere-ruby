@@ -137,12 +137,17 @@ fi
 # that enumerate ENV compare sizes against themselves rather than absolutely).
 # So the reference side of the second pass was pure repetition.
 #
-# ⚠ It is one PROCESS rather than two on purpose. 13 corpus programs write fixed
-# `/tmp` paths -- `/tmp/mere_ruby_corpus_105.bin`, `/tmp/mrb_al_source.rb` -- so
-# two passes running CONCURRENTLY would delete each other's files and the
-# failure would look exactly like an interpreter bug. That is a trap this
-# project has already been caught by once, with `diff <(a) <(b)`. Sequential in
-# one process keeps the programs' assumptions true.
+# Two runs of this script may go at once, even in one tree. A corpus program
+# that writes a file names it with the process id (`/tmp/mr277_#{$$}.txt`,
+# `corpus/zzz_to_path_#{$$}.txt`) or under Dir.tmpdir with the id, and one that
+# listens asks for port 0. They used to write fixed paths (`/tmp/mrb_al_source.rb`,
+# `corpus/531_object_root_constants.rb.autoload.rb`) and listen on a fixed port
+# (53791), so two runs at once deleted each other's files and refused each
+# other's listener, and the FAIL looked exactly like an interpreter bug. A new
+# program keeps to this: no fixed path it writes, no fixed port it listens on,
+# and nothing it prints that depends on the id. Measured 2026-11-28 by running
+# every program under the reference ruby with writes denied outside a private
+# TMPDIR and outside paths that carry a process id: none wrote anywhere else.
 sb_both=0
 if [ "${1:-}" = "--both" ]; then
   sb_both=1
