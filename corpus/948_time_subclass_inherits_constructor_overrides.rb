@@ -66,3 +66,15 @@ same948 = RangeEndpoint948.new(1)..RangeEndpoint948.new(2)
 other948 = RangeEndpoint948.new(1)..RangeEndpoint948.new(3)
 p [:object_range, [left948] == [same948], [left948] == [other948],
    { range: [left948] } == { range: [same948] }]
+
+# The non-allocating native-value check must still honor tagged Strings.
+class RangeString948 < String
+  def ==(other) = upcase == other.upcase
+end
+lower948 = RangeString948.new('a')..RangeString948.new('c')
+upper948 = RangeString948.new('A')..RangeString948.new('C')
+p [:string_range_override, lower948 == upper948, [lower948] == [upper948],
+   {range: lower948} == {range: upper948}]
+singleton948 = +'same'
+def singleton948.==(other) = false
+p [:singleton_string_override, [singleton948] == ['same']]
