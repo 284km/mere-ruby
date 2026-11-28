@@ -136,11 +136,21 @@ each stack's chain is put aside and taken up again with it. A block that C
 calls with `rb_yield` or `rb_block_call` may suspend its Fiber; another
 Fiber's calls into C run meanwhile.
 
-`rb_thread_call_without_gvl` runs the function: there is no lock to give up
-and nothing else runs meanwhile. While it runs, a signal the program traps
-calls the unblocking function, so a blocking wait in C can be ended; the
-trap itself runs when the C function has returned. `rb_thread_create` makes
-a Ruby Thread whose body is the C function.
+`rb_thread_call_without_gvl` (`nogvl.c`): when no other Ruby thread is
+alive, the function runs right there, on the interpreter's native thread, and
+a signal the program traps calls the unblocking function, so a blocking wait
+in C can be ended; the trap itself runs when the C function has returned.
+When other Ruby threads are alive, or the caller said
+`RB_NOGVL_OFFLOAD_SAFE`, it runs on a worker native thread while the other
+Ruby threads take their turns (nio4r's selector in a thread no longer stops
+Puma), and the calling thread waits for it as for an IO. There the function
+does not see thread-local data C set on the caller's thread. A Thread#kill,
+#raise, Timeout or trap that ends the wait calls the unblocking function
+(`RUBY_UBF_IO` / `RUBY_UBF_PROCESS` interrupt the worker with SIGVTALRM),
+and the exception goes on once the function is done.
+`rb_thread_call_with_gvl` from a worker hands the call back to the waiting
+Ruby thread. `rb_thread_create` makes a Ruby Thread whose body is the C
+function.
 
 ## Loading
 
@@ -155,6 +165,11 @@ behind the name is compared (a different one is a LoadError), its `Init_x`
 is run, and the feature is recorded the way a `.rb` is. On Linux the
 executable is linked with `-rdynamic`: the library finds `rb_*` in the
 interpreter that loads it.
+
+Two of ruby's own extensions are linked into the executable instead, as
+ruby links an extension statically (`static_ext.c`): `erb/escape` and
+`cgi/escape`. `require` of either runs its `Init_` from the executable, and
+the feature is recorded in `$LOADED_FEATURES` as the extension's.
 
 ## Building an extension
 
@@ -208,10 +223,12 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
 
 - `capi/unsupported.c` is the ledger of functions that exist only so that a
   library using them loads: each raises NotImplementedError, naming itself,
-  when called. Its header comment says why each group is not there (CRuby's
-  internal bignum routines by name, TracePoint and the debug inspector from
-  C, profile frames, postponed jobs, the Random interface, encoding
-  converters).
+  when called. Its header comment says why each group is not there
+  (TracePoint and the debug inspector from C, profile frames, postponed
+  jobs, internal thread event hooks, the bug reporter, ISeq loading, the
+  Random interface, encoding converters). CRuby's bignum algorithms by name
+  (`rb_big_mul_karatsuba`, `rb_big2str_generic`, ...) left it: they are
+  CRuby's own `bignum.c`, compiled as it is (`bignum_cruby.c`).
 - A function that is declared in the headers and neither written nor in the
   ledger is an undefined symbol: `require` of a library that uses one raises
   LoadError with the loader's message, which names it. Of the roughly 1,300
@@ -249,9 +266,13 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
   reference's mkmf built must fail.
 - `tools/capi_gem_check.py` (CI, macOS and Linux): fast_blank, redcarpet,
   msgpack, racc, bcrypt, nio4r and nokogiri (from source, on the system's
-  libxml2), at
-  fixed versions, are installed by each ruby with RubyGems' `gem install`
-  from the same .gem files, and `capi/check/gems.rb` uses them on both
+  libxml2); what Rails 8.1's own dependencies build, at the versions
+  `railstest/` locks -- erb, rbs, websocket-driver, puma and sqlite3 (on the
+  system's SQLite); and json, date, bigdecimal, io-console and prism, the
+  default gems Rails' lock pins newer than the interpreter ships. At
+  fixed versions, they are installed by each ruby with RubyGems' `gem install`
+  from the same .gem files (one compiler at a time, `--build-jobs 1`), and
+  `capi/check/gems.rb` uses them on both
   sides and must print the same. mere-ruby pointed at the gems the
   reference built must fail.
 - `tools/capi_spec_check.py` (CI, macOS): ruby/spec's `optional/capi` -- a
@@ -273,12 +294,18 @@ asked of the compiler and passed as `-DHAVE_...`, the way mkmf passes them.
 | `error.c` | `rb_raise`, `rb_protect`, `rb_rescue2`, `rb_ensure`, `rb_catch`/`rb_throw` |
 | `object.c`, `symbol.c`, `globals.c` | classes, methods, ivars, constants, IDs, `rb_c*` / `rb_e*` |
 | `numeric.c`, `bignum.c` | conversions, `rb_integer_pack` / `unpack` |
+| `bignum_cruby.c` | CRuby's `bignum.c` (in `vendor/`) compiled as it is: the algorithms an extension names, and how a Bignum it makes becomes an Integer |
 | `string.c`, `encoding.c`, `sprintf.c` | Strings, encodings, `rb_sprintf` with `PRIsVALUE` |
 | `array.c` | Array, Hash, Range, Struct, Enumerator |
 | `proc.c` | blocks, Procs, `rb_block_call`, `rb_funcall_with_block` |
 | `system.c` | threads, time, IO, utilities |
+| `nogvl.c` | `rb_thread_call_without_gvl` and its kin, on worker native threads |
+| `hidden.c` | constants under names Ruby does not see as constants (`IO::platform_tty`) |
+| `ospath.c` | a file name as macOS hands it back, composed to NFC |
+| `embed.c` | `ruby_setup` / `ruby_init`, as they answer inside a running interpreter |
+| `static_ext.c`, `static_cgi_escape.c` | `erb/escape` and `cgi/escape` linked into the executable |
 | `needed.c` | what real gems asked for and nothing else had: conversions by method name, `rb_memhash`, `rb_ivar_foreach`, the calling frame's last match |
-| `st.c`, `memory_view.c`, `vendor/`, `standin/` | CRuby's `st.c` and `memory_view.c`, compiled unchanged |
+| `st.c`, `memory_view.c`, `vendor/`, `standin/` | CRuby's `st.c`, `memory_view.c`, `bignum.c` and two extensions' `escape.c`, compiled unchanged ([vendor/README.md](vendor/README.md)) |
 | `unsupported.c` | the ledger |
 | `mr_capi.h` | what the files above share; not for extensions |
 | `../m_capi.mere`, `../m_capi_api.mere` | the interpreter's side: the table, and what crosses |
