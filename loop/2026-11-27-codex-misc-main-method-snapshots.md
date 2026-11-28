@@ -97,3 +97,57 @@ Source gates gc_roots, dup_defs, dead_defs, meth_writes, iv_door, name_spec, rx_
 ns_names, name_len, generated-C bracket depth, full and explicit completed
 record_hygiene, and staged/unstaged whitespace: PASS. Code and the completed record are
 pushed together. No workflow change or reference gem installation.
+
+128,000-iteration follow-up for review 6096030206 uses the same committed discard driver,
+MERE_RUBY_GC_TIGHT=1, parsed --seed=1, the matching 491cc5ca main binary and the
+unchanged candidate O2 binary. Three alternating main/candidate pairs per engine;
+instructions are whole-process medians and RSS is the maximum of all three samples.
+One additional clean Ruby 4.0.10 execution checks stdout/stderr/status at this size;
+no Ruby RSS or rejected leaking-head 128,000 measurement is claimed.
+
+| Engine / iterations | Main instructions | Candidate instructions | Total change | Main / candidate max RSS bytes | Candidate RSS samples |
+| --- | ---: | ---: | ---: | --- | --- |
+| Evaluator / 128000 | 38855727592 | 43950305318 | +13.112% | 129482752 / 102449152 | [101957632, 102449152, 101924864] |
+| VM / 128000 | 38245113521 | 42541756619 | +11.234% | 140345344 / 114016256 | [114016256, 110444544, 110084096] |
+
+Subtracting adjacent whole-process medians separates the fixed per-process/setup
+component from the additional iterations. This is a finite difference, not a
+direct counter scoped to an individual Ruby iteration.
+
+| Engine / interval | Main instructions per additional iteration | Candidate instructions per additional iteration | Extra per additional iteration |
+| --- | ---: | ---: | ---: |
+| Evaluator / 2000–8000 | 297013.4 | 334533.4 | 37520.0 |
+| Evaluator / 8000–32000 | 297346.2 | 336650.7 | 39304.6 |
+| Evaluator / 32000–128000 | 294813.8 | 334637.7 | 39823.9 |
+| VM / 2000–8000 | 291935.4 | 327491.5 | 35556.1 |
+| VM / 8000–32000 | 292589.2 | 326263.6 | 33674.4 |
+| VM / 32000–128000 | 290066.5 | 323405.5 | 33339.0 |
+
+The candidate marginal cost stays about 335k instructions per iteration on the
+evaluator and 323k–327k on the VM through 128k. The 32k-to-128k interval adds about
+39.8k / 33.3k instructions per iteration (13.51% / 11.49% over main). The growing
+whole-process percentage reflects dilution of roughly a billion instructions of
+fixed setup/cleanup; these samples support approximately linear work through 128k,
+rather than an accumulating scan of every discarded definition. This remains a
+real CPU cost of snapshot lifetime tracing and sweeping, not a zero-cost claim.
+The sweep rebuilds the surviving boundary list once per collection, after classifying
+metadata owners; the driver collects every 128 iterations, and dead boundaries are
+removed at each collection. These measurements do not establish bounds for every
+possible retained-Method workload.
+
+Hosted CI follow-up: Linux build job 140873965695 and macOS corpus job 140885205494
+failed the packed-GC membership gate. Its source extraction included the new
+gc_method_snapshot object-tracing helper in a standalone probe without Val or the
+runtime world. Restrict extraction to the membership helpers, provide the snapshot
+registry used by the real owner parser, and verify registered/unregistered snapshot
+owners before and after deletion. All existing packed membership and owner assertions
+remain. Matching main passes O2 and ASan/UBSan; the exact old-head gate reproduces
+the hosted parse error; the corrected gate passes both O2 and ASan/UBSan.
+
+This follow-up changes only unittest/gc_marks_check.py and this completed record.
+All 1817 build inputs and the candidate binary SHA-256 still byte-match the prior
+acceptance. The evaluator and MERE_RUBY_VM=1 full run_corpus.sh --both sweeps remain
+1032/1032 PASS on that identical runtime; the original CRuby comparisons above are
+also reused explicitly, not presented as newly rerun. Source gates, generated-C
+bracket depth, full and explicit record_hygiene and whitespace are checked again
+with this completed note. No workflow change or full unit/framework suite.
